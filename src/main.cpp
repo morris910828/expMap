@@ -8,6 +8,7 @@
 #include "Camera.h"
 #include "Shader.h"
 #include "Model.h"
+#include "ExpMap.h"    // ⭐ 新增：ExpMap 計算核心
 
 #include <iostream>
 #include <glm/glm.hpp>
@@ -41,35 +42,34 @@ float lastX = 0, lastY = 0;
 bool firstMouse = true;
 
 bool showTriangles = false;
+bool dragSelecting = false;
+bool dragOrbit = false;
+
+// Selected triangles (for highlight + UV viewer)
+std::vector<SelectedTri> g_selected;
+
+// Flattened triangles from ExpMap
+std::vector<FlattenTri> g_flattened;
+
+// Highlight VAO/VBO
+unsigned int highlightVAO = 0;
+unsigned int highlightVBO = 0;
+
 
 // =====================================================
-// Ray picking
+// Ray picking structures
 // =====================================================
-struct Ray { glm::vec3 origin, direction; };
+struct Ray {
+    glm::vec3 origin;
+    glm::vec3 direction;
+};
 
 struct HitInfo {
     bool hit = false;
     glm::vec3 hitPos;
     int meshIndex = -1;
-    int triIndex = -1;    // f (0-based)
+    int triIndex = -1;
 };
-
-// UV Viewer
-struct UVTriangle {
-    glm::vec2 uv0, uv1, uv2;
-};
-std::vector<UVTriangle> g_uvTriangles;
-
-// Selected triangles
-struct SelectedTri {
-    int meshIndex;
-    unsigned int i0, i1, i2;
-};
-std::vector<SelectedTri> g_selected;
-
-// Highlight
-unsigned int highlightVAO = 0;
-unsigned int highlightVBO = 0;
 
 // =====================================================
 // Ray helpers
@@ -117,6 +117,7 @@ bool RayTri(const Ray& r,
 
     float t = glm::dot(e2, q) * inv;
     if (t > EPS) { tOut = t; return true; }
+
     return false;
 }
 
@@ -130,9 +131,9 @@ bool Raycast(Model* model, const Ray& ray, HitInfo& out)
 
         for (int f = 0; f < mesh.indices.size(); f += 3)
         {
-            glm::vec3 v0 = mesh.vertices[ mesh.indices[f] ].Position;
-            glm::vec3 v1 = mesh.vertices[ mesh.indices[f+1] ].Position;
-            glm::vec3 v2 = mesh.vertices[ mesh.indices[f+2] ].Position;
+            glm::vec3 v0 = mesh.vertices[mesh.indices[f]].Position;
+            glm::vec3 v1 = mesh.vertices[mesh.indices[f + 1]].Position;
+            glm::vec3 v2 = mesh.vertices[mesh.indices[f + 2]].Position;
 
             float t;
             if (RayTri(ray, v0, v1, v2, t))
@@ -151,6 +152,7 @@ bool Raycast(Model* model, const Ray& ray, HitInfo& out)
     return out.hit;
 }
 
+
 // =====================================================
 // Highlight system
 // =====================================================
@@ -164,7 +166,8 @@ void InitHighlightBuffers()
     glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
 
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), 0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(glm::vec3), 0);
 
     glBindVertexArray(0);
 }
@@ -182,17 +185,18 @@ void UpdateHighlightBuffer(Model* model)
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, highlightVBO);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(glm::vec3), verts.data(), GL_DYNAMIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER,
+                 verts.size() * sizeof(glm::vec3),
+                 verts.data(),
+                 GL_DYNAMIC_DRAW);
 }
 
-void DrawHighlight(Shader& fillShader, Shader& lineShader, 
-                   const glm::mat4& view, const glm::mat4& proj)
+void DrawHighlight(Shader& fillShader,
+                   const glm::mat4& view,
+                   const glm::mat4& proj)
 {
     if (g_selected.empty()) return;
 
-    // -------------------------------
-    // 1. 填滿 highlight (綠色)
-    // -------------------------------
     fillShader.use();
     fillShader.setMat4("model", glm::mat4(1.0f));
     fillShader.setMat4("view", view);
@@ -201,56 +205,27 @@ void DrawHighlight(Shader& fillShader, Shader& lineShader,
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(-2.0f, -2.0f);
     glBindVertexArray(highlightVAO);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)g_selected.size() * 3);
+    glDrawArrays(GL_TRIANGLES, 0, g_selected.size() * 3);
     glDisable(GL_POLYGON_OFFSET_FILL);
-
-    // -------------------------------
-    // 2. outline 使用「紅色 shader」
-    // -------------------------------
-    lineShader.use();
-    lineShader.setMat4("model", glm::mat4(1.0f));
-    lineShader.setMat4("view", view);
-    lineShader.setMat4("projection", proj);
-    lineShader.setVec3("lineColor", glm::vec3(1,0,0));
-
-    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-    glLineWidth(1.0f);
-    glDepthFunc(GL_ALWAYS);
-
-    glBindVertexArray(highlightVAO);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)g_selected.size() * 3);
-
-    // restore
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    glDepthFunc(GL_LESS);
 }
 
 
-
 // =====================================================
-// Utilities
+// Utility: check triangle duplication
 // =====================================================
-void mouse_callback(GLFWwindow*, double x, double y)
-{
-    if (!leftMouseDown || ImGui::GetIO().WantCaptureMouse) return;
-
-    if (firstMouse) { lastX = x; lastY = y; firstMouse = false; }
-
-    orbitYaw += (x - lastX) * 0.3f;
-    orbitPitch += (lastY - y) * 0.3f;
-
-    orbitPitch = glm::clamp(orbitPitch, -89.0f, 89.0f);
-
-    lastX = x; lastY = y;
-}
-
-bool IsTriAlreadySelected(int mesh, unsigned int i0, unsigned int i1, unsigned int i2, int& outIndex)
+bool IsTriAlreadySelected(int mesh,
+                          unsigned int i0,
+                          unsigned int i1,
+                          unsigned int i2,
+                          int& outIndex)
 {
     for (int s = 0; s < g_selected.size(); s++)
     {
         auto& t = g_selected[s];
         if (t.meshIndex == mesh &&
-            t.i0 == i0 && t.i1 == i1 && t.i2 == i2)
+            t.i0 == i0 &&
+            t.i1 == i1 &&
+            t.i2 == i2)
         {
             outIndex = s;
             return true;
@@ -259,19 +234,30 @@ bool IsTriAlreadySelected(int mesh, unsigned int i0, unsigned int i1, unsigned i
     return false;
 }
 
-void mouse_button_callback(GLFWwindow* win, int button, int action, int)
+
+// =====================================================
+// Mouse callback
+// =====================================================
+void mouse_callback(GLFWwindow*, double x, double y)
 {
-    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
+    if (!leftMouseDown || ImGui::GetIO().WantCaptureMouse)
+        return;
 
-    if (action == GLFW_PRESS)
+    if (dragOrbit)
     {
-        leftMouseDown = true;
-        firstMouse = true;
+        if (firstMouse) { lastX = x; lastY = y; firstMouse = false; }
 
-        if (!loadedModel) return;
+        orbitYaw   += (x - lastX) * 0.3f;
+        orbitPitch += (lastY - y) * 0.3f;
+        orbitPitch = glm::clamp(orbitPitch, -89.0f, 89.0f);
 
-        double mx, my;
-        glfwGetCursorPos(win, &mx, &my);
+        lastX = x;
+        lastY = y;
+    }
+    else if (dragSelecting)
+    {
+        // Continuous brush selection
+        double mx = x, my = y;
 
         float yawR = glm::radians(orbitYaw);
         float pitR = glm::radians(orbitPitch);
@@ -283,10 +269,12 @@ void mouse_button_callback(GLFWwindow* win, int button, int action, int)
         );
         cam += targetPoint;
 
-        glm::mat4 view = glm::lookAt(cam, targetPoint, glm::vec3(0,1,0));
-        glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(45.0f),
-                                               (float)SCR_WIDTH/SCR_HEIGHT,
-                                               0.1f, 100.0f);
+        glm::mat4 view = glm::lookAt(cam, targetPoint,
+                                     glm::vec3(0,1,0));
+        glm::mat4 proj = glm::perspectiveRH_ZO(
+            glm::radians(45.0f),
+            (float)SCR_WIDTH / SCR_HEIGHT,
+            0.1f, 100.0f);
 
         Ray ray = ScreenRay(mx, my, view, proj, cam);
 
@@ -295,41 +283,99 @@ void mouse_button_callback(GLFWwindow* win, int button, int action, int)
         {
             Mesh& mesh = loadedModel->meshes[hit.meshIndex];
 
-            unsigned int i0 = mesh.indices[ hit.triIndex ];
-            unsigned int i1 = mesh.indices[ hit.triIndex + 1 ];
-            unsigned int i2 = mesh.indices[ hit.triIndex + 2 ];
+            unsigned int i0 = mesh.indices[hit.triIndex];
+            unsigned int i1 = mesh.indices[hit.triIndex + 1];
+            unsigned int i2 = mesh.indices[hit.triIndex + 2];
 
-            int removeIndex = -1;
+            int exist = -1;
 
-            if (IsTriAlreadySelected(hit.meshIndex, i0, i1, i2, removeIndex))
+            if (!IsTriAlreadySelected(hit.meshIndex, i0, i1, i2, exist))
             {
-                g_selected.erase(g_selected.begin() + removeIndex);
-                g_uvTriangles.erase(g_uvTriangles.begin() + removeIndex);
-            }
-            else
-            {
-                g_selected.push_back({ hit.meshIndex, i0, i1, i2 });
+                g_selected.push_back({hit.meshIndex, i0, i1, i2});
+                UpdateHighlightBuffer(loadedModel);
 
-                UVTriangle uv;
-                uv.uv0 = mesh.vertices[i0].TexCoords;
-                uv.uv1 = mesh.vertices[i1].TexCoords;
-                uv.uv2 = mesh.vertices[i2].TexCoords;
-                g_uvTriangles.push_back(uv);
+                // ⭐ ExpMap 重新展開
+                ComputeExpMap(loadedModel,
+                              hit.meshIndex,
+                              g_selected,
+                              g_flattened);
             }
+        }
+    }
+}
 
-            UpdateHighlightBuffer(loadedModel);
+
+// =====================================================
+// Mouse button (click → select or orbit)
+// =====================================================
+void mouse_button_callback(GLFWwindow* win, int button, int action, int)
+{
+    if (button != GLFW_MOUSE_BUTTON_LEFT)
+        return;
+
+    if (action == GLFW_PRESS)
+    {
+        double mx, my;
+        glfwGetCursorPos(win, &mx, &my);
+
+        leftMouseDown = true;
+        firstMouse = true;
+        dragSelecting = false;
+        dragOrbit = false;
+
+        if (!loadedModel) return;
+
+        float yawR = glm::radians(orbitYaw);
+        float pitR = glm::radians(orbitPitch);
+
+        glm::vec3 cam(
+            targetDistance * cos(pitR) * sin(yawR),
+            targetDistance * sin(pitR),
+            targetDistance * cos(pitR) * cos(yawR)
+        );
+        cam += targetPoint;
+
+        glm::mat4 view = glm::lookAt(cam, targetPoint,
+                                     glm::vec3(0,1,0));
+        glm::mat4 proj = glm::perspectiveRH_ZO(
+            glm::radians(45.0f),
+            (float)SCR_WIDTH / SCR_HEIGHT,
+            0.1f,
+            100.0f);
+
+        Ray ray = ScreenRay(mx, my, view, proj, cam);
+
+        HitInfo hit;
+        if (Raycast(loadedModel, ray, hit))
+        {
+            dragSelecting = true;
+        }
+        else
+        {
+            dragOrbit = true;
         }
     }
     else if (action == GLFW_RELEASE)
     {
         leftMouseDown = false;
+        dragSelecting = false;
+        dragOrbit = false;
     }
 }
 
+
+// =====================================================
+// Scroll zoom
+// =====================================================
 void scroll_callback(GLFWwindow*, double, double dy)
 {
-    targetDistance = glm::clamp(targetDistance - (float)dy * 0.5f, 1.0f, 50.0f);
+    targetDistance = glm::clamp(
+        targetDistance - (float)dy * 0.5f,
+        1.0f,
+        50.0f
+    );
 }
+
 
 // =====================================================
 // MAIN
@@ -339,9 +385,12 @@ int main()
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,5);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_PROFILE,
+                   GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* win = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "expmap", 0, 0);
+    GLFWwindow* win =
+        glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT,
+                         "expmap", 0, 0);
     glfwMakeContextCurrent(win);
 
     gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
@@ -363,22 +412,27 @@ int main()
     // ---------------------------------------------------------
     // Shaders
     // ---------------------------------------------------------
-    Shader modelShader("../src/shaders/model.vert", "../src/shaders/model.frag");
-    Shader wireShader ("../src/shaders/wireframe.vert","../src/shaders/wireframe.frag");
-    Shader highlightShader("../src/shaders/highlight.vert","../src/shaders/highlight.frag");
+    Shader modelShader("../src/shaders/model.vert",
+                       "../src/shaders/model.frag");
+
+    Shader wireShader("../src/shaders/wireframe.vert",
+                      "../src/shaders/wireframe.frag");
+
+    Shader highlightShader("../src/shaders/highlight.vert",
+                           "../src/shaders/highlight.frag");
 
     InitHighlightBuffers();
 
     loadedModel = new Model(modelList[currentModelIndex]);
 
-    // ---------------------------------------------------------
-    // Loop
-    // ---------------------------------------------------------
+    // =====================================================
+    // LOOP
+    // =====================================================
     while (!glfwWindowShouldClose(win))
     {
         glfwPollEvents();
 
-        // ---------------- GUI frame ----------------
+        // ---------------- GUI Frame ----------------
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -389,14 +443,20 @@ int main()
         ImGui::Begin("Model Viewer");
 
         const char* preview =
-            useCustomModel ? customModelPath : modelList[currentModelIndex].c_str();
+            useCustomModel ?
+            customModelPath :
+            modelList[currentModelIndex].c_str();
 
         if (ImGui::BeginCombo("Model", preview))
         {
             for (int i = 0; i < modelList.size(); i++)
             {
-                bool selected = (!useCustomModel && currentModelIndex == i);
-                if (ImGui::Selectable(modelList[i].c_str(), selected))
+                bool selected =
+                    (!useCustomModel &&
+                     currentModelIndex == i);
+
+                if (ImGui::Selectable(modelList[i].c_str(),
+                                      selected))
                 {
                     useCustomModel = false;
                     currentModelIndex = i;
@@ -405,14 +465,15 @@ int main()
                     loadedModel = new Model(modelList[i]);
 
                     g_selected.clear();
-                    g_uvTriangles.clear();
+                    g_flattened.clear();
                     UpdateHighlightBuffer(loadedModel);
                 }
                 if (selected) ImGui::SetItemDefaultFocus();
             }
 
             ImGui::Separator();
-            if (ImGui::Selectable("Custom Path", useCustomModel))
+            if (ImGui::Selectable("Custom Path",
+                                  useCustomModel))
                 useCustomModel = true;
 
             ImGui::EndCombo();
@@ -420,14 +481,15 @@ int main()
 
         if (useCustomModel)
         {
-            ImGui::InputText("Path", customModelPath, sizeof(customModelPath));
+            ImGui::InputText("Path", customModelPath,
+                             sizeof(customModelPath));
             if (ImGui::Button("Load"))
             {
                 delete loadedModel;
                 loadedModel = new Model(customModelPath);
 
                 g_selected.clear();
-                g_uvTriangles.clear();
+                g_flattened.clear();
                 UpdateHighlightBuffer(loadedModel);
             }
         }
@@ -437,56 +499,75 @@ int main()
 
 
         // =====================================================
-        // Selected Triangle UVs
+        // ExpMap Flatten Viewer
         // =====================================================
-        ImGui::Begin("Selected Triangle UVs");
+        ImGui::Begin("ExpMap Flattened Patch");
 
-        ImGui::Text("Selected: %d", (int)g_uvTriangles.size());
-        ImGui::Separator();
+        static std::vector<FlattenTri> flat;
+        ComputeExpMap(loadedModel, 0, g_selected, flat);  // meshIndex=0，你可改成 hit.meshIndex
 
-        float scale = 200.0f;
+        // 畫布大小
+        ImVec2 canvasSize = ImGui::GetContentRegionAvail();
+        ImVec2 origin = ImGui::GetCursorScreenPos();
+        ImDrawList* draw = ImGui::GetWindowDrawList();
 
-        for (int idx = 0; idx < g_uvTriangles.size(); idx++)
+        // ------------------------------------------------------------
+        // Compute bounding box of all flattened triangles
+        // ------------------------------------------------------------
+        if (!flat.empty())
         {
-            const UVTriangle& tri = g_uvTriangles[idx];
+            float minX = FLT_MAX, minY = FLT_MAX;
+            float maxX = -FLT_MAX, maxY = -FLT_MAX;
 
-            ImGui::Text("Triangle %d", idx);
-            ImGui::Text("UV0: (%.3f, %.3f)", tri.uv0.x, tri.uv0.y);
-            ImGui::Text("UV1: (%.3f, %.3f)", tri.uv1.x, tri.uv1.y);
-            ImGui::Text("UV2: (%.3f, %.3f)", tri.uv2.x, tri.uv2.y);
-
-            ImVec2 wp = ImGui::GetCursorScreenPos();
-            ImDrawList* draw = ImGui::GetWindowDrawList();
-
-            auto toScreen = [&](glm::vec2 uv)
+            for (auto& t : flat)
             {
-                return ImVec2(
-                    wp.x + uv.x * scale,
-                    wp.y + (1 - uv.y) * scale
-                );
+                minX = std::min({minX, t.a.x, t.b.x, t.c.x});
+                minY = std::min({minY, t.a.y, t.b.y, t.c.y});
+                maxX = std::max({maxX, t.a.x, t.b.x, t.c.x});
+                maxY = std::max({maxY, t.a.y, t.b.y, t.c.y});
+            }
+
+            float w = maxX - minX;
+            float h = maxY - minY;
+
+            // scale 讓 patch 填滿畫布
+            float scale = 0.9f * std::min(canvasSize.x / w, canvasSize.y / h);
+
+            // ------------------------------------------------------------
+            // 畫所有三角形（自動置中 & 放大）
+            // ------------------------------------------------------------
+            auto ToScreen = [&](glm::vec2 v)
+            {
+                float x = (v.x - minX) * scale + origin.x + (canvasSize.x - w * scale) * 0.5f;
+                float y = (v.y - minY) * scale + origin.y + (canvasSize.y - h * scale) * 0.5f;
+                // 注意：ImGui Y 座標向下，因此不需要 invert
+                return ImVec2(x, y);
             };
 
-            ImVec2 p0 = toScreen(tri.uv0);
-            ImVec2 p1 = toScreen(tri.uv1);
-            ImVec2 p2 = toScreen(tri.uv2);
+            ImU32 col = IM_COL32(255, 255, 0, 255);
 
-            draw->AddLine(p0, p1, IM_COL32_WHITE, 2.0f);
-            draw->AddLine(p1, p2, IM_COL32_WHITE, 2.0f);
-            draw->AddLine(p2, p0, IM_COL32_WHITE, 2.0f);
+            for (auto& t : flat)
+            {
+                ImVec2 p0 = ToScreen(t.a);
+                ImVec2 p1 = ToScreen(t.b);
+                ImVec2 p2 = ToScreen(t.c);
 
-            ImGui::Dummy(ImVec2(scale, scale));
-            ImGui::Separator();
+                draw->AddTriangle(p0, p1, p2, col, 2.5f);
+            }
         }
 
+        ImGui::Dummy(canvasSize); // 占位，讓視窗正確呈現
         ImGui::End();
+
 
 
         // =====================================================
         // Render Scene
         // =====================================================
         glViewport(0,0,SCR_WIDTH,SCR_HEIGHT);
-        glClearColor(0.15f,0.15f,0.17f,1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClearColor(0.15f, 0.15f, 0.17f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT |
+                GL_DEPTH_BUFFER_BIT);
 
         if (loadedModel)
         {
@@ -494,16 +575,18 @@ int main()
             float pitR = glm::radians(orbitPitch);
 
             glm::vec3 cam(
-                targetDistance * cos(pitR) * sin(yawR),
-                targetDistance * sin(pitR),
-                targetDistance * cos(pitR) * cos(yawR)
+                targetDistance *
+                    cos(pitR) * sin(yawR),
+                targetDistance *
+                    sin(pitR),
+                targetDistance *
+                    cos(pitR) * cos(yawR)
             );
             cam += targetPoint;
 
-            glm::mat4 view = glm::lookAt(cam, targetPoint, glm::vec3(0,1,0));
-            glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(45.0f),
-                                                   (float)SCR_WIDTH/SCR_HEIGHT,
-                                                   0.1f, 100.0f);
+            glm::mat4 view = glm::lookAt( cam, targetPoint, glm::vec3(0,1,0) );
+
+            glm::mat4 proj = glm::perspectiveRH_ZO( glm::radians(45.0f), (float)SCR_WIDTH / SCR_HEIGHT, 0.1f, 100.0f );
 
             // Main model
             modelShader.use();
@@ -517,13 +600,14 @@ int main()
             {
                 glEnable(GL_POLYGON_OFFSET_LINE);
                 glPolygonOffset(-1.0f, -1.0f);
-                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+                glPolygonMode(GL_FRONT_AND_BACK,
+                              GL_LINE);
 
                 wireShader.use();
+                wireShader.setVec3("lineColor", glm::vec3(1,0,0));
                 wireShader.setMat4("model", glm::mat4(1.0f));
                 wireShader.setMat4("view", view);
                 wireShader.setMat4("projection", proj);
-                wireShader.setVec3("lineColor", glm::vec3(1,0,0));
 
                 loadedModel->Draw(wireShader);
 
@@ -531,14 +615,16 @@ int main()
                 glDisable(GL_POLYGON_OFFSET_LINE);
             }
 
-            // Highlight triangles
-            DrawHighlight(highlightShader, wireShader, view, proj);
-
+            // highlight selected triangles
+            DrawHighlight(highlightShader,
+                          view, proj);
         }
 
-        // End ImGui
+        // End Draw ImGui
         ImGui::Render();
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        ImGui_ImplOpenGL3_RenderDrawData(
+            ImGui::GetDrawData()
+        );
         glfwSwapBuffers(win);
     }
 
