@@ -1,11 +1,10 @@
 #version 450 core
 
-out vec4 FragColor;
+uniform vec3 lineColor;   // main.cpp 會傳入 (1,0,0)
 
-uniform vec3 lineColor;        // 顏色
-uniform float intensity;       // 亮度倍率（你可以控制）
+out vec4 FragColor;
 
 void main()
 {
-    FragColor = vec4(lineColor * intensity, 1.0);
+    FragColor = vec4(lineColor, 1.0);
 }
