@@ -185,24 +185,46 @@ void UpdateHighlightBuffer(Model* model)
     glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(glm::vec3), verts.data(), GL_DYNAMIC_DRAW);
 }
 
-
-void DrawHighlight(Shader& shader, const glm::mat4& view, const glm::mat4& proj)
+void DrawHighlight(Shader& fillShader, Shader& lineShader, 
+                   const glm::mat4& view, const glm::mat4& proj)
 {
     if (g_selected.empty()) return;
 
-    shader.use();
-    shader.setMat4("model", glm::mat4(1.0f));   // ★ 你原來少了這行
-    shader.setMat4("view", view);
-    shader.setMat4("projection", proj);
+    // -------------------------------
+    // 1. 填滿 highlight (綠色)
+    // -------------------------------
+    fillShader.use();
+    fillShader.setMat4("model", glm::mat4(1.0f));
+    fillShader.setMat4("view", view);
+    fillShader.setMat4("projection", proj);
 
-    glDisable(GL_DEPTH_TEST);  // 確保浮在 wireframe 上
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-2.0f, -2.0f);
+    glBindVertexArray(highlightVAO);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)g_selected.size() * 3);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+
+    // -------------------------------
+    // 2. outline 使用「紅色 shader」
+    // -------------------------------
+    lineShader.use();
+    lineShader.setMat4("model", glm::mat4(1.0f));
+    lineShader.setMat4("view", view);
+    lineShader.setMat4("projection", proj);
+    lineShader.setVec3("lineColor", glm::vec3(1,0,0));
+
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    glLineWidth(1.0f);
+    glDepthFunc(GL_ALWAYS);
 
     glBindVertexArray(highlightVAO);
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)g_selected.size() * 3);
-    glBindVertexArray(0);
 
-    glEnable(GL_DEPTH_TEST);
+    // restore
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glDepthFunc(GL_LESS);
 }
+
 
 
 // =====================================================
@@ -510,7 +532,8 @@ int main()
             }
 
             // Highlight triangles
-            DrawHighlight(highlightShader, view, proj);
+            DrawHighlight(highlightShader, wireShader, view, proj);
+
         }
 
         // End ImGui
