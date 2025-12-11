@@ -29,6 +29,12 @@ std::vector<std::string> modelList = {
     "../assets/dancer.obj",
 };
 
+std::vector<std::string> textureList = {
+    "../assets/t1.png",
+    "../assets/t2.png",
+};
+int currentTextureIndex = 0;
+
 int currentModelIndex = 0;
 bool useCustomModel = false;
 char customModelPath[256] = "";
@@ -150,6 +156,33 @@ bool Raycast(Model* model, const Ray& ray, HitInfo& out)
         }
     }
     return out.hit;
+}
+
+
+//texture
+unsigned int LoadTexture(const std::string& path)
+{
+    int w, h, ch;
+    stbi_set_flip_vertically_on_load(true);
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &ch, 0);
+
+    if (!data) {
+        std::cout << "Failed to load texture: " << path << std::endl;
+        return 0;
+    }
+
+    GLenum format = (ch == 4 ? GL_RGBA : GL_RGB);
+
+    unsigned int tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, format, w, h, 0, format, GL_UNSIGNED_BYTE, data);
+    glGenerateMipmap(GL_TEXTURE_2D);
+
+    stbi_image_free(data);
+    return tex;
 }
 
 
@@ -495,7 +528,39 @@ int main()
         }
 
         ImGui::Checkbox("Show Triangles", &showTriangles);
+
+        // ============================
+        // Texture Selector UI
+        // ============================
+        ImGui::Separator();
+        ImGui::Text("Texture");
+
+        const char* texPreview = textureList[currentTextureIndex].c_str();
+
+        if (ImGui::BeginCombo("Select Texture", texPreview))
+        {
+            for (int i = 0; i < textureList.size(); i++)
+            {
+                bool selected = (currentTextureIndex == i);
+
+                if (ImGui::Selectable(textureList[i].c_str(), selected))
+                {
+                    currentTextureIndex = i;
+
+                    // 只是載入，不會自動套用
+                    unsigned int texID = LoadTexture(textureList[i]);
+                    std::cout << "Loaded texture: " << textureList[i]
+                            << " (ID=" << texID << ")" << std::endl;
+                }
+
+                if (selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
         ImGui::End();
+
 
 
         // =====================================================
