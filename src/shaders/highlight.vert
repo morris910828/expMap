@@ -10,6 +10,6 @@ uniform mat4 projection;
 
 void main()
 {
-    TexCoord = aUV;                       // ★ 必須傳 UV
+    TexCoord = aUV;
     gl_Position = projection * view * model * vec4(aPos, 1.0);
 }

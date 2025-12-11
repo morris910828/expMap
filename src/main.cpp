@@ -405,6 +405,8 @@ int main()
     glfwSetCursorPosCallback(win, mouse_callback);
     glfwSetMouseButtonCallback(win, mouse_button_callback);
     glfwSetScrollCallback(win, scroll_callback);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
 
     // --------------------------- IMGUI ---------------------------
     IMGUI_CHECKVERSION();
