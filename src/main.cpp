@@ -90,6 +90,7 @@ std::vector<Patch> g_patches;
 std::vector<std::string> textureList = {
     "../assets/t1.png",
     "../assets/t2.jpg",
+    "../assets/3.png",
 };
 
 int currentTextureIndex = 0;
@@ -115,16 +116,19 @@ GLuint LoadTexture(const std::string& path)
 
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, data);
-
     glGenerateMipmap(GL_TEXTURE_2D);
 
-    // 參數
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    // ★★★ 這兩行解決貼圖破碎 ★★★
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     stbi_image_free(data);
     return tex;
 }
+
 
 // =========================================
 // Highlight buffer init
@@ -513,7 +517,8 @@ int main()
                 // ---------------------------------------------------
                 // Compute UV bounding box
                 // ---------------------------------------------------
-                float minX=1e9, minY=1e9, maxX=-1e9, maxY=-1e9;
+                float minX = 1e9, minY = 1e9;
+                float maxX = -1e9, maxY = -1e9;
 
                 for (auto& ft : g_flattened)
                 {
@@ -523,19 +528,22 @@ int main()
                     maxY = std::max({maxY, ft.a.y, ft.b.y, ft.c.y});
                 }
 
-                float scaleX = 1.0f / (maxX - minX);
-                float scaleY = 1.0f / (maxY - minY);
+                float rangeX = maxX - minX;
+                float rangeY = maxY - minY;
+
+                // ---------------------------------------------------
+                // FIXED: 等比例縮放，避免貼圖嚴重放大或變形
+                // ---------------------------------------------------
+                float uniformScale = 1.0f / std::max(rangeX, rangeY);
 
                 auto Norm = [&](glm::vec2 uv)
                 {
-                    return glm::vec2(
-                        (uv.x - minX) * scaleX,
-                        (uv.y - minY) * scaleY
-                    );
+                    glm::vec2 p = uv - glm::vec2(minX, minY);
+                    return p * uniformScale;   // keep aspect ratio
                 };
 
                 // ---------------------------------------------------
-                // Build patch vertex buffer
+                // Build patch vertices (pos + uv)
                 // ---------------------------------------------------
                 for (int i = 0; i < g_selected.size(); i++)
                 {
@@ -559,7 +567,9 @@ int main()
                     P.vertices.push_back(v2);
                 }
 
-                // Build VAO
+                // ---------------------------------------------------
+                // Build VAO/VBO
+                // ---------------------------------------------------
                 glGenVertexArrays(1, &P.vao);
                 glGenBuffers(1, &P.vbo);
 
@@ -584,12 +594,17 @@ int main()
 
                 glBindVertexArray(0);
 
+                // push patch
                 g_patches.push_back(P);
+
+                // clear selection
                 g_selected.clear();
                 g_flattened.clear();
                 UpdateHighlightBuffer(loadedModel);
             }
         }
+
+
 
 
         ImGui::End();
@@ -722,6 +737,7 @@ int main()
             // =====================================================
             // Draw textured patches (ExpMap)
             // =====================================================
+            glDisable(GL_DEPTH_TEST);
             for (auto& P : g_patches)
             {
                 if (P.textureID == 0)
@@ -741,7 +757,7 @@ int main()
                 glBindVertexArray(P.vao);
                 glDrawArrays(GL_TRIANGLES, 0, P.vertices.size());
             }
-
+            glEnable(GL_DEPTH_TEST);
             // =====================================================
             // Draw highlight selected triangles
             // =====================================================
@@ -750,7 +766,7 @@ int main()
                 glDisable(GL_DEPTH_TEST);
 
                 patchShader.use();
-                patchShader.setInt("useTexture", 0);  // <<<< 重點
+                patchShader.setInt("useTexture", 0);
                 patchShader.setVec3("overrideColor", glm::vec3(0.1f, 1.0f, 0.1f));
 
                 patchShader.setMat4("model", glm::mat4(1.0f));

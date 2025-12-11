@@ -14,11 +14,7 @@ struct FlattenTri {
 // Minimal Working ExpMap
 // 把 3D 三角形投影到第一個三角形的 tangent plane
 // ------------------------------------------------------
-inline void ComputeExpMap(
-    Model* model,
-    int meshIndex,
-    const std::vector<SelectedTri>& selected,
-    std::vector<FlattenTri>& outFlatten)
+inline void ComputeExpMap(Model* model, int meshIndex, const std::vector<SelectedTri>& selected, std::vector<FlattenTri>& outFlatten)
 {
     outFlatten.clear();
     if (!model || selected.empty()) return;
@@ -61,6 +57,33 @@ inline void ComputeExpMap(
 
         outFlatten.push_back(ft);
     }
+    // ------------------------------------------------------------
+    // Step 3: Normalize UV to [0,1]
+    // ------------------------------------------------------------
+    glm::vec2 minUV(1e9f), maxUV(-1e9f);
+
+    for (auto& f : outFlatten) {
+        minUV.x = std::min({minUV.x, f.a.x, f.b.x, f.c.x});
+        minUV.y = std::min({minUV.y, f.a.y, f.b.y, f.c.y});
+
+        maxUV.x = std::max({maxUV.x, f.a.x, f.b.x, f.c.x});
+        maxUV.y = std::max({maxUV.y, f.a.y, f.b.y, f.c.y});
+    }
+
+    glm::vec2 size = maxUV - minUV;
+
+    for (auto& f : outFlatten) {
+        f.a = (f.a - minUV) / size;
+        f.b = (f.b - minUV) / size;
+        f.c = (f.c - minUV) / size;
+
+        // flip Y (OpenGL texture coordinates)
+        f.a.y = 1.0f - f.a.y;
+        f.b.y = 1.0f - f.b.y;
+        f.c.y = 1.0f - f.c.y;
+    }
+
 }
+
 
 #endif
