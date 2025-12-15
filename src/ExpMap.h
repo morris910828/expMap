@@ -24,16 +24,16 @@ struct ExpMapTransform {
 
 // ExpMap 座標系統資訊
 struct ExpMapSystem {
-    glm::vec3 origin;   // 原點(p0)
-    glm::vec3 axisU;    // U 軸(e1)
-    glm::vec3 axisV;    // V 軸(e2)
-    glm::vec3 normal;   // 法向量
+    glm::vec3 origin;
+    glm::vec3 axisU;
+    glm::vec3 axisV;
+    glm::vec3 normal;
     
-    glm::vec2 uvMin;    // UV 邊界
+    glm::vec2 uvMin;
     glm::vec2 uvMax;
-    glm::vec2 uvCenter; // UV 中心點
+    glm::vec2 uvCenter;
     
-    int meshIndex;      // 所屬 mesh
+    int meshIndex;
 };
 
 // 三角形鄰接資訊的輔助結構
