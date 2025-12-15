@@ -499,7 +499,7 @@ int main()
                 P.transform.rotation = 0.0f;
                 P.transform.surfaceOffset = glm::vec2(0.0f);
                 std::vector<TriInfo> expandedInfos;
-                ExpandExpMap(loadedModel, P.meshIndex, g_selected, P.expSystem, 2.0f, expandedInfos);
+                ExpandExpMap(loadedModel, P.meshIndex, g_selected, P.expSystem, 5.0f, expandedInfos);
 
                 // 將擴展後的資料轉存入 Patch
                 P.selectedTris.clear();

@@ -246,9 +246,9 @@ inline ExpMapSystem ComputeExpMap(Model* model,
     return sys;
 }
 
-// ------------------------------------------------------
-// 應用變換 - 最終修正版：幾何遮罩 + 頂點鎖定
-// ------------------------------------------------------
+// ============== ExpMap.h 修改 ==============
+
+// 修正 ApplyExpMapTransform 函數
 inline void ApplyExpMapTransform(Model* model,
                                 const std::vector<SelectedTri>& selected,
                                 const std::vector<FlattenTri>& flattened,
@@ -266,36 +266,28 @@ inline void ApplyExpMapTransform(Model* model,
     glm::vec2 size = sys.uvMax - sys.uvMin;
     float maxDim = std::max(size.x, size.y);
     
-    // 預先計算旋轉
     float c = cos(transform.rotation);
     float s = sin(transform.rotation);
 
-    // 設定基礎顯示半徑 (這決定了 scale = 1.0 時 Patch 有多大)
-    // 這裡假設模型單位的 0.3 為基礎半徑，你可以根據需要調整
+    // 關鍵：讓顯示半徑根據 scale 動態變化
     float baseRadius = 0.3f; 
-    float currentRadius = baseRadius * transform.scale;
+    float currentRadius = baseRadius * transform.scale;  // 直接乘以 scale
 
     for (size_t i = 0; i < flattened.size(); i++)
     {
         const SelectedTri& st = selected[i];
         const FlattenTri& ft = flattened[i];
         
-        // --- 1. 範圍檢查 (幾何縮放) ---
-        // 計算三角形中心到 ExpMap 原點的距離
         glm::vec2 triCenter = (ft.a + ft.b + ft.c) / 3.0f;
         float dist = glm::length(triCenter - sys.uvCenter);
 
-        // 如果距離超過當前的縮放半徑，就不產生這個三角形 (隱藏)
-        // 這樣視覺上 Patch 就變小了，但不需要改變頂點位置
+        // 只顯示在當前半徑內的三角形
         if (dist > currentRadius) continue;
 
-        // --- 2. 處理 3D 位置 (服貼) ---
-        // 絕對鎖定使用原始模型的頂點，確保 100% 服貼
         outPositions.push_back(mesh.vertices[st.i0].Position);
         outPositions.push_back(mesh.vertices[st.i1].Position);
         outPositions.push_back(mesh.vertices[st.i2].Position);
         
-        // --- 3. 處理 UV 座標 (紋理縮放) ---
         glm::vec2 uvs[3] = { ft.a, ft.b, ft.c };
         glm::vec2 finalUVs[3];
 
@@ -303,9 +295,8 @@ inline void ApplyExpMapTransform(Model* model,
         {
             glm::vec2 p = uvs[k] - sys.uvCenter;
 
-            // 這裡將 UV 除以 scale。
-            // 效果：當 Patch 變大 (scale 變大) 時，紋理圖案也會跟著等比例放大。
-            // 如果你不希望圖案變大 (想要更多格子)，可以把這行拿掉。
+            // 關鍵：除以 scale，讓貼圖跟著範圍同步放大
+            // scale 大 → 範圍大 → UV 變小 → 取更多貼圖 → 格子變多
             if (transform.scale > 0.001f) {
                 p /= transform.scale;
             }
@@ -329,5 +320,6 @@ inline void ApplyExpMapTransform(Model* model,
         outTexCoords.push_back(finalUVs[2]);
     }
 }
+
 
 #endif
