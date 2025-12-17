@@ -81,8 +81,8 @@ private:
             aiMesh *mesh = scene->mMeshes[node->mMeshes[i]];
             meshes.push_back(processMesh(mesh, scene));
 
-            // ---- 注意：在此呼叫 adjacency ----
-            // meshes.back().BuildAdjacency();  ← 你應該在這裡呼叫
+            // [修改] 請務必取消這一行的註解！
+            meshes.back().BuildAdjacency(); 
         }
 
         // 處理子節點
