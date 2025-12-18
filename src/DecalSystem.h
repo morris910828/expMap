@@ -2,81 +2,124 @@
 #define DECAL_SYSTEM_H
 
 #include <glad/glad.h>
+#include <glm/glm.hpp>
 #include <vector>
 #include <string>
-#include <glm/glm.hpp>
-#include "Shader.h"
-#include "HighlightRenderer.h" 
+#include <iostream>
 
-struct Decal {
+// ==========================================================
+// [結構定義] OverlayVertex
+// 用於儲存 Decal 的頂點資料。
+// 必須包含 Position, Normal, UV 以配合 textured_highlight.vert
+// ==========================================================
+struct OverlayVertex {
+    glm::vec3 position;
+    glm::vec3 normal;   // [新增] 法線資料，用於光照計算
+    glm::vec2 uv;
+};
+
+// ==========================================================
+// [類別] Decal
+// 代表單一張貼圖實體
+// ==========================================================
+class Decal {
+public:
     std::string name;
     unsigned int textureID;
-    unsigned int VAO, VBO;
-    int vertexCount;
-    std::vector<int> sourceTriangles; 
-    float radius; 
+    
+    // 幾何資料
+    std::vector<OverlayVertex> vertices; 
+    std::vector<int> selectionIndices; // 記錄它覆蓋了哪些原始三角形 (編輯用)
+    
+    // 參數 (用於重新編輯)
     int centerTriangle;
-    float textureTiling; 
-    float rotation; // [新增] 儲存旋轉角度
+    float radius;
+    float textureTiling;
+    float rotation;
+    
+    // OpenGL 物件
+    unsigned int VAO = 0, VBO = 0;
 
-    // [修改] 建構子加入 _rotation
-    Decal(std::string _name, unsigned int _texID, const std::vector<OverlayVertex>& vertices, 
-          const std::vector<int>& _srcTris, int _centerTri, float _rad, float _tiling, float _rotation) 
-        : name(_name), textureID(_texID), sourceTriangles(_srcTris), centerTriangle(_centerTri), 
-          radius(_rad), textureTiling(_tiling), rotation(_rotation)
+    // 預設建構子
+    Decal() {}
+
+    // 建構子：初始化並建立 Mesh
+    Decal(std::string n, unsigned int texID, std::vector<OverlayVertex> verts, std::vector<int> indices, int center, float rad, float tiling, float rot)
+        : name(n), textureID(texID), vertices(verts), selectionIndices(indices), centerTriangle(center), radius(rad), textureTiling(tiling), rotation(rot)
     {
-        // ... (中間的 VAO/VBO 建立程式碼保持不變) ...
-        vertexCount = (int)vertices.size();
+        SetupMesh();
+    }
+
+    // 建立 OpenGL 緩衝區
+    void SetupMesh() {
+        if (vertices.empty()) return;
+
         glGenVertexArrays(1, &VAO);
         glGenBuffers(1, &VBO);
+
         glBindVertexArray(VAO);
         glBindBuffer(GL_ARRAY_BUFFER, VBO);
+        // 填入資料
         glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(OverlayVertex), vertices.data(), GL_STATIC_DRAW);
+
+        // [重要] 設定 Vertex Attributes (必須跟 Shader 的 layout 對齊)
+        
+        // 1. Position (Location 0)
+        // layout (location = 0) in vec3 aPos;
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(OverlayVertex), (void*)0);
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(OverlayVertex), (void*)offsetof(OverlayVertex, uv));
+        
+        // 2. Normal (Location 1) 
+        // layout (location = 1) in vec3 aNormal;
+        glEnableVertexAttribArray(1); 
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(OverlayVertex), (void*)offsetof(OverlayVertex, normal));
+
+        // 3. TexCoords (Location 2)
+        // layout (location = 2) in vec2 aTexCoord;
+        glEnableVertexAttribArray(2); 
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(OverlayVertex), (void*)offsetof(OverlayVertex, uv));
+
         glBindVertexArray(0);
     }
 
+    // 釋放資源
     void Destroy() {
-        glDeleteVertexArrays(1, &VAO);
-        glDeleteBuffers(1, &VBO);
+        if (VAO) glDeleteVertexArrays(1, &VAO);
+        if (VBO) glDeleteBuffers(1, &VBO);
+        VAO = 0; VBO = 0;
     }
 };
 
+// ==========================================================
+// [系統] DecalSystem
+// 管理所有貼圖的繪製與儲存
+// ==========================================================
 class DecalSystem {
 public:
     std::vector<Decal> decals;
-    Shader shader;
 
-    DecalSystem() : shader("../src/shaders/textured_highlight.vert", "../src/shaders/textured_highlight.frag") {}
-
-    void AddDecal(const Decal& d) {
-        decals.push_back(d);
+    void AddDecal(const Decal& decal) {
+        decals.push_back(decal);
     }
 
-    // [修改] Draw 函式增加 ignoreIndex 參數
-    // 當我們正在編輯第 i 個貼圖時，這裡就不畫它，改由 HighlightRenderer 畫預覽
-    void Draw(const glm::mat4& view, const glm::mat4& proj, const glm::mat4& model, int ignoreIndex = -1) {
-        shader.use();
-        shader.setMat4("view", view);
-        shader.setMat4("projection", proj);
-        shader.setMat4("model", model);
-        shader.setInt("texture1", 0);
-
+    // 繪製單一 Decal 或全部
+    // 注意：外部必須先設定好 Shader (textured_highlight) 和 OpenGL 狀態 (Blend/Offset)
+    void Draw(const glm::mat4& view, const glm::mat4& proj, const glm::mat4& model, int editingIndex = -1) {
         for (int i = 0; i < decals.size(); i++) {
-            if (i == ignoreIndex) continue; // 跳過正在編輯的
+            // 如果正在編輯這個 Decal，就不畫它 (改由 HighlightRenderer 畫預覽)
+            // 這樣才不會出現重疊閃爍
+            if (i == editingIndex) continue;
+
+            Decal& d = decals[i];
+            if (d.VAO == 0) continue;
 
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, decals[i].textureID);
+            glBindTexture(GL_TEXTURE_2D, d.textureID);
 
-            glBindVertexArray(decals[i].VAO);
-            glDrawArrays(GL_TRIANGLES, 0, decals[i].vertexCount);
+            glBindVertexArray(d.VAO);
+            glDrawArrays(GL_TRIANGLES, 0, (int)d.vertices.size());
+            glBindVertexArray(0);
         }
-        
-        glBindVertexArray(0);
-        glBindTexture(GL_TEXTURE_2D, 0);
     }
 };
 

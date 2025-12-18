@@ -36,6 +36,7 @@ include_directories(
     external/imgui/backends
     external/assimp/include
     external/glm
+    external/eigen
     src
 )
 
