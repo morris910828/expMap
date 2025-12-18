@@ -16,7 +16,6 @@
 #include "Mesh.h"
 #include "stb_image.h"
 
-// 這個結構不屬於 Model，只是 main.cpp 用到，因此放在外面無問題
 struct SelectedTri {
     int meshIndex;
     unsigned int i0, i1, i2;

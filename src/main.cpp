@@ -1,7 +1,7 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
-// [新增] 引入檔案系統，用於自動掃描模型 (需 C++17 標準)
+// [關鍵] 引入檔案系統 (需 C++17 標準)
 #include <filesystem>
 namespace fs = std::filesystem;
 
@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 #include <iostream>
 #include <vector>
 #include <string>
-#include <algorithm> // for std::max, std::transform
+#include <algorithm> // for std::transform
 
 // 專案標頭檔
 #include "Shader.h"
@@ -36,19 +36,19 @@ HighlightRenderer* highlightRenderer = nullptr;
 DecalSystem* decalSystem = nullptr;             
 Model* loadedModel = nullptr;
 
-// 模型列表 (會自動掃描更新)
+// 模型列表 (自動掃描)
 std::vector<std::string> modelList;
 int currentModelIndex = 0;
-// 自定義模型路徑輸入緩衝區
+// 自定義路徑緩衝區
 char customModelPath[256] = "../assets/";
 
-// --- 貼圖資源管理 ---
+// --- 貼圖資源 ---
 struct TextureAsset {
     std::string name;
     std::string path;
     unsigned int id;
-    int width;  // [新增] 儲存寬度
-    int height; // [新增] 儲存高度
+    int width;  
+    int height; 
 };
 std::vector<TextureAsset> textureList;
 int currentTextureIndex = 0;
@@ -60,18 +60,18 @@ float brushRadius = 0.05f;
 int lastHitTriangle = -1;
 int editingDecalIndex = -1; 
 
-// [參數] 貼圖控制
+// [參數]
 float textureTiling = 0.45f; 
 float textureRotation = 0.0f;
 
-// 滑鼠狀態與幾何資訊
+// 滑鼠狀態
 bool isCameraRotating = false;
 bool isPatchMoving = false;
 float lastX = 0, lastY = 0;
 glm::vec3 lastHitPos(0.0f);
 
 // -----------------------------------------------------------
-// 輔助函式：讀取貼圖 (回傳 ID 並輸出寬高)
+// 輔助函式：讀取貼圖
 // -----------------------------------------------------------
 unsigned int loadTextureFromFile(const char* path, int* outWidth, int* outHeight) {
     unsigned int textureID;
@@ -86,11 +86,9 @@ unsigned int loadTextureFromFile(const char* path, int* outWidth, int* outHeight
         glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
         glGenerateMipmap(GL_TEXTURE_2D);
         
-        // [修改] 改用 Clamp 防止邊緣重複 (Decal 專用設定)
+        // Decal 設定：Clamp 防止邊緣重複
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-        
-        // 設定邊界顏色為全透明
         float borderColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
         glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor);
 
@@ -98,8 +96,6 @@ unsigned int loadTextureFromFile(const char* path, int* outWidth, int* outHeight
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         
         stbi_image_free(data);
-        
-        // [新增] 輸出寬高
         if (outWidth) *outWidth = width;
         if (outHeight) *outHeight = height;
     } else {
@@ -110,86 +106,77 @@ unsigned int loadTextureFromFile(const char* path, int* outWidth, int* outHeight
 }
 
 void InitTextures() {
-    // 預設載入清單 (請確保檔案存在)
-    std::vector<std::pair<std::string, std::string>> files = {
-        { "Checkerboard", "../assets/checkerboard.png" },
-        { "Grass", "../assets/grass.png" },
-        { "Skin", "../assets/skin.png" },
-        { "Sky", "../assets/sky.jpg" },
-        { "Wave", "../assets/wave.png" } 
+    // 這裡嘗試多個路徑前綴，增加讀取成功率
+    std::vector<std::string> prefixes = { "../assets/", "assets/", "../../assets/" };
+    
+    struct TexDef { std::string name; std::string file; };
+    std::vector<TexDef> defs = {
+        { "Checkerboard", "checkerboard.png" },
+        { "Grass", "grass.png" },
+        { "Skin", "skin.png" },
+        { "Sky", "sky.jpg" },
+        { "Wave", "wave.png" }
     };
 
-    for (auto& f : files) {
-        // 簡單檢查檔案是否存在，避免 crash
-        if (fs::exists(f.second)) {
-            int w, h;
-            unsigned int id = loadTextureFromFile(f.second.c_str(), &w, &h);
-            textureList.push_back({ f.first, f.second, id, w, h });
-        } else {
-            std::cout << "[Warning] Texture not found: " << f.second << std::endl;
+    for (auto& def : defs) {
+        bool loaded = false;
+        for(auto& prefix : prefixes) {
+            std::string fullPath = prefix + def.file;
+            if(fs::exists(fullPath)) {
+                int w, h;
+                unsigned int id = loadTextureFromFile(fullPath.c_str(), &w, &h);
+                textureList.push_back({ def.name, fullPath, id, w, h });
+                loaded = true;
+                break; 
+            }
         }
+        if(!loaded) std::cout << "[Warning] Texture not found: " << def.file << std::endl;
     }
 }
 
 // -----------------------------------------------------------
-// 邏輯：將目前的 ExpMap 資料轉換為 OverlayVertex (存檔用)
-// 包含：長寬比修正、法線拷貝
+// 邏輯：建立 OverlayVertex (含長寬比修正 + 法線)
 // -----------------------------------------------------------
 std::vector<OverlayVertex> CreateOverlayData(const Model* model, const std::vector<FlatVertex>& flatRes, float uvScale, float normalizeRadius, float rotationDeg, int texWidth, int texHeight) {
     std::vector<OverlayVertex> result;
     const auto& meshVerts = model->meshes[0].vertices;
     
-    // 防呆
     if (normalizeRadius < 0.0001f) normalizeRadius = 1.0f;
 
-    // 預計算旋轉矩陣
     float rad = glm::radians(rotationDeg);
     float cosR = cos(rad);
     float sinR = sin(rad);
 
-    // [新增] 計算長寬比修正係數
     float aspectRatio = (float)texWidth / (float)texHeight;
     float scaleX = 1.0f;
     float scaleY = 1.0f;
 
-    if (aspectRatio > 1.0f) {
-        // 圖片比較寬 (Landscape)，Y 軸需要縮放
-        scaleY = aspectRatio; 
-    } else {
-        // 圖片比較高 (Portrait)，X 軸需要縮放
-        scaleX = 1.0f / aspectRatio;
-    }
+    if (aspectRatio > 1.0f) scaleY = aspectRatio; 
+    else scaleX = 1.0f / aspectRatio;
 
     for (const auto& v : flatRes) {
         OverlayVertex ov;
         ov.position = meshVerts[v.originalIndex].Position;
         
-        // [關鍵修復] 拷貝原本模型的法線，確保 Decal 光照正確
-        // 你的 OverlayVertex 結構必須包含 glm::vec3 normal
+        // [關鍵] 拷貝法線
         ov.normal = meshVerts[v.originalIndex].Normal; 
 
-        // 1. 歸一化 + 縮放 (UV中心在 0,0)
         glm::vec2 rawUV = (v.uv / normalizeRadius) * uvScale;
-
-        // 2. 應用長寬比修正 (讓格子變回正方形)
         rawUV.x *= scaleX;
         rawUV.y *= scaleY;
 
-        // 3. 旋轉
         glm::vec2 rotatedUV;
         rotatedUV.x = rawUV.x * cosR - rawUV.y * sinR;
         rotatedUV.y = rawUV.x * sinR + rawUV.y * cosR;
 
-        // 4. 置中到貼圖中心 (0.5, 0.5)
         ov.uv = rotatedUV + glm::vec2(0.5f, 0.5f);
-        
         result.push_back(ov);
     }
     return result;
 }
 
 // -----------------------------------------------------------
-// 輔助：載入新模型並重置狀態
+// 輔助：載入模型
 // -----------------------------------------------------------
 void LoadNewModel(const std::string& path) {
     if (loadedModel) {
@@ -197,35 +184,29 @@ void LoadNewModel(const std::string& path) {
         loadedModel = nullptr;
     }
 
-    std::cout << "Loading model: " << path << std::endl;
+    std::cout << "[System] Loading model: " << path << std::endl;
     try {
         loadedModel = new Model(path);
     } catch (...) {
-        std::cout << "Error loading model." << std::endl;
+        std::cout << "[Error] Failed to load model. Check format or path." << std::endl;
         return;
     }
 
-    // 清空舊的 Decals，因為 Index 不同了
-    for(auto& d : decalSystem->decals) {
-        d.Destroy();
-    }
+    // 清空舊 Decals
+    for(auto& d : decalSystem->decals) d.Destroy();
     decalSystem->decals.clear();
 
-    // 重置編輯狀態
     currentSelectionIndices.clear();
     currentExpMapUVs.clear();
     lastHitTriangle = -1;
     editingDecalIndex = -1;
     
-    // 切換模型時重置參數
     brushRadius = 0.05f;
     textureRotation = 0.0f;
 
-    // 清空預覽
     if(highlightRenderer) 
         highlightRenderer->UpdateTextured(loadedModel, {}, 1.0f, 1.0f, 0.0f);
 
-    // 重建拓樸
     if (loadedModel && !loadedModel->meshes.empty()) {
         selectionSystem.BuildTopology(loadedModel->meshes[0].vertices, loadedModel->meshes[0].indices);
     }
@@ -301,23 +282,46 @@ int main() {
     glfwSetScrollCallback(window, scroll_callback);
     gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
 
-    // [自動掃描] 讀取 assets 資料夾下的 obj 和 ply
-    modelList.clear();
-    std::string assetPath = "../assets/";
-    if (fs::exists(assetPath)) {
-        for (const auto& entry : fs::directory_iterator(assetPath)) {
-            std::string ext = entry.path().extension().string();
-            // 轉小寫
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    // =======================================================
+    // [除錯] 顯示當前工作目錄
+    // =======================================================
+    std::cout << "[Debug] Current Working Directory: " << fs::current_path() << std::endl;
 
-            if (ext == ".obj" || ext == ".ply") {
-                modelList.push_back(entry.path().generic_string());
+    // [智慧搜尋] 嘗試在多個路徑尋找 assets 資料夾
+    modelList.clear();
+    std::vector<std::string> searchPaths = { 
+        "../assets/", 
+        "assets/", 
+        "../../assets/" 
+    };
+
+    bool foundAnyAssets = false;
+    for (const auto& path : searchPaths) {
+        if (fs::exists(path)) {
+            std::cout << "[Info] Scanning assets in: " << path << std::endl;
+            
+            for (const auto& entry : fs::directory_iterator(path)) {
+                std::string ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+                if (ext == ".obj" || ext == ".ply") {
+                    // 使用 generic_string 確保路徑格式統一 (使用 /)
+                    modelList.push_back(entry.path().generic_string());
+                    std::cout << "  - Found: " << entry.path().filename() << std::endl;
+                }
+            }
+            if(!modelList.empty()) {
+                foundAnyAssets = true;
+                break; // 找到資料夾且裡面有東西，就停止搜尋
             }
         }
     }
-    // 如果沒掃到東西，塞一個預設的防止 crash
-    if(modelList.empty()) {
-        modelList.push_back("../assets/armadillo.obj");
+
+    if (!foundAnyAssets) {
+        std::cout << "[Warning] No 3D models found in standard asset paths!" << std::endl;
+        std::cout << "          Please put .obj or .ply files in 'assets/' folder." << std::endl;
+        // 塞一個假路徑防止崩潰
+        modelList.push_back("assets/armadillo.obj");
     }
 
     // Systems Setup
@@ -337,7 +341,9 @@ int main() {
     Shader modelShader("../src/shaders/model.vert", "../src/shaders/model.frag");
 
     // 初次載入
-    LoadNewModel(modelList[currentModelIndex]);
+    if(!modelList.empty()) {
+        LoadNewModel(modelList[0]);
+    }
     interaction.SetTarget(glm::vec3(0, 0, 0));
 
     while (!glfwWindowShouldClose(window)) {
@@ -357,7 +363,6 @@ int main() {
 
             if (hitTri != -1) {
                 lastHitTriangle = hitTri;
-                
                 currentSelectionIndices = selectionSystem.GetPatchByRadius(hitTri, brushRadius);
                 if (selectionSystem.topology.isValid) {
                     currentExpMapUVs = selectionSystem.FlattenPatch(
@@ -390,7 +395,7 @@ int main() {
             modelShader.setVec3("viewPos", interaction.GetCameraPos());
             loadedModel->Draw(modelShader);
 
-            // B. 畫所有貼圖 (Decals)
+            // B. 畫所有貼圖 (Decals) - 記得切換 Shader
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(-20.0f, -20.0f);
             glEnable(GL_BLEND);
@@ -398,31 +403,21 @@ int main() {
             glDepthFunc(GL_LEQUAL);
 
             if (decalSystem) {
-                // =========================================================
-                // [關鍵修正] 必須切換到 Decal 專用的 Shader！
-                // =========================================================
-                // 我們借用 HighlightRenderer 裡的 shader (它是 textured_highlight)
                 Shader* decalShader = highlightRenderer->GetShader();
-                
                 if (decalShader) {
                     decalShader->use();
-                    
-                    // 設定必要的 Uniforms (矩陣 & 光照位置)
                     decalShader->setMat4("view", view);
                     decalShader->setMat4("projection", proj);
                     decalShader->setMat4("model", model);
-                    decalShader->setVec3("viewPos", interaction.GetCameraPos()); // 給光照用
-                    decalShader->setInt("texture1", 0); // 指定貼圖單元
+                    decalShader->setVec3("viewPos", interaction.GetCameraPos());
+                    decalShader->setInt("texture1", 0);
                 }
-
-                // 現在 Shader 準備好了，再畫圖
                 decalSystem->Draw(view, proj, model, editingDecalIndex);
             }
 
             // C. 畫目前的選取預覽
             if (highlightRenderer && !currentSelectionIndices.empty()) {
                 unsigned int previewTexID = textureList[currentTextureIndex].id;
-                // [關鍵] 傳入相機位置，以便 HighlightRenderer 計算光照
                 highlightRenderer->Draw(view, proj, model, previewTexID, interaction.GetCameraPos()); 
             }
 
@@ -440,7 +435,8 @@ int main() {
 
         // 3.0 模型選擇
         if (ImGui::CollapsingHeader("Model Selection", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (ImGui::BeginCombo("List", modelList[currentModelIndex].c_str())) {
+            // 顯示目前列表
+            if (ImGui::BeginCombo("List", (modelList.empty() ? "None" : modelList[currentModelIndex].c_str()))) {
                 for (int i = 0; i < modelList.size(); i++) {
                     if (ImGui::Selectable(modelList[i].c_str(), currentModelIndex == i)) {
                         currentModelIndex = i;
@@ -449,7 +445,7 @@ int main() {
                 }
                 ImGui::EndCombo();
             }
-            ImGui::Text("Or load from path:");
+            ImGui::Text("Or load from path (Absolute Path):");
             ImGui::InputText("Path", customModelPath, sizeof(customModelPath));
             ImGui::SameLine();
             if (ImGui::Button("Load")) {
@@ -474,7 +470,7 @@ int main() {
             }
         }
 
-        // 3.2 參數調整
+        // 3.2 參數
         bool paramChanged = false;
         if (ImGui::SliderFloat("Rotation", &textureRotation, 0.0f, 360.0f)) paramChanged = true;
         
@@ -492,30 +488,18 @@ int main() {
             }
         }
 
-        // 3.4 操作按鈕
+        // 3.4 按鈕
         if (editingDecalIndex == -1) {
-            // [新增模式]
             if (ImGui::Button("Apply Texture (Create)")) {
                 if (!currentExpMapUVs.empty()) {
-                    int currentTexW = textureList[currentTextureIndex].width;
-                    int currentTexH = textureList[currentTextureIndex].height;
-
-                    // 呼叫時傳入寬高，以進行長寬比修正
-                    std::vector<OverlayVertex> verts = CreateOverlayData(
-                        loadedModel, 
-                        currentExpMapUVs, 
-                        textureTiling, 
-                        brushRadius, 
-                        textureRotation, 
-                        currentTexW, 
-                        currentTexH
-                    ); 
+                    int w = textureList[currentTextureIndex].width;
+                    int h = textureList[currentTextureIndex].height;
+                    std::vector<OverlayVertex> verts = CreateOverlayData(loadedModel, currentExpMapUVs, textureTiling, brushRadius, textureRotation, w, h); 
                     
                     std::string name = "Decal " + std::to_string(decalSystem->decals.size() + 1);
                     Decal newDecal(name, textureList[currentTextureIndex].id, verts, currentSelectionIndices, lastHitTriangle, brushRadius, textureTiling, textureRotation);
                     decalSystem->AddDecal(newDecal);
                     
-                    // Reset
                     currentSelectionIndices.clear();
                     currentExpMapUVs.clear();
                     lastHitTriangle = -1;
@@ -523,24 +507,14 @@ int main() {
                 }
             }
         } else {
-            // [編輯模式]
             if (ImGui::Button("Update Decal")) {
                 if (!currentExpMapUVs.empty()) {
                     Decal& d = decalSystem->decals[editingDecalIndex];
                     d.Destroy();
                     
-                    int currentTexW = textureList[currentTextureIndex].width;
-                    int currentTexH = textureList[currentTextureIndex].height;
-
-                    std::vector<OverlayVertex> verts = CreateOverlayData(
-                        loadedModel, 
-                        currentExpMapUVs, 
-                        textureTiling, 
-                        brushRadius, 
-                        textureRotation,
-                        currentTexW, 
-                        currentTexH
-                    );
+                    int w = textureList[currentTextureIndex].width;
+                    int h = textureList[currentTextureIndex].height;
+                    std::vector<OverlayVertex> verts = CreateOverlayData(loadedModel, currentExpMapUVs, textureTiling, brushRadius, textureRotation, w, h);
 
                     d = Decal(d.name, textureList[currentTextureIndex].id, verts, currentSelectionIndices, lastHitTriangle, brushRadius, textureTiling, textureRotation);
                     
@@ -562,8 +536,6 @@ int main() {
         }
 
         ImGui::Separator();
-
-        // 3.5 貼圖列表
         ImGui::Text("Decal List (Click to Edit):");
         for (int i = 0; i < decalSystem->decals.size(); i++) {
             bool isSelected = (editingDecalIndex == i);
@@ -571,13 +543,11 @@ int main() {
                 editingDecalIndex = i;
                 Decal& d = decalSystem->decals[i];
                 
-                // 還原參數
                 lastHitTriangle = d.centerTriangle;
                 brushRadius = d.radius;
                 textureTiling = d.textureTiling; 
                 textureRotation = d.rotation; 
                 
-                // 還原選單
                 for(int t=0; t<textureList.size(); t++) {
                     if(textureList[t].id == d.textureID) {
                         currentTextureIndex = t;
@@ -585,21 +555,18 @@ int main() {
                     }
                 }
                 
-                // 還原預覽
                 currentSelectionIndices = selectionSystem.GetPatchByRadius(lastHitTriangle, brushRadius);
                 if (selectionSystem.topology.isValid) {
                     glm::vec3 centerPos = selectionSystem.topology.centroids[lastHitTriangle];
                     lastHitPos = centerPos; 
-
                     currentExpMapUVs = selectionSystem.FlattenPatch(currentSelectionIndices, loadedModel->meshes[0].vertices, loadedModel->meshes[0].indices, lastHitPos);
                     highlightRenderer->UpdateTextured(loadedModel, currentExpMapUVs, textureTiling, brushRadius, textureRotation);
                 }
             }
         }
-
         ImGui::End();
 
-        // --- UV Viewer ---
+        // UV Viewer
         ImGui::Begin("UV Viewer (Flattened)");
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
         ImVec2 p = ImGui::GetCursorScreenPos();
@@ -616,8 +583,7 @@ int main() {
                 maxUV.y = std::max(maxUV.y, v.uv.y);
             }
             glm::vec2 size = maxUV - minUV;
-            float padding = 20.0f;
-            float availableSize = canvas_sz - (padding * 2);
+            float availableSize = canvas_sz - 40.0f;
             float scaleX = (size.x > 0.0001f) ? (availableSize / size.x) : 1.0f;
             float scaleY = (size.y > 0.0001f) ? (availableSize / size.y) : 1.0f;
             float scale = (scaleX < scaleY) ? scaleX : scaleY;
