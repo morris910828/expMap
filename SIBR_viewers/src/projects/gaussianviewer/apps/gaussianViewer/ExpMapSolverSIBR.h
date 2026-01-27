@@ -101,6 +101,9 @@ public:
         _validTriangles.clear();
         _projectedAppPoints.clear();
         _projectedGeoPoints.clear();
+        _dijkstraPath.clear();
+        _startNode = -1;
+        _endNode = -1;
 
         // --- 1. Find Seed Vertex ---
         glm::vec3 target = toGlm(hitPos);
@@ -259,12 +262,33 @@ public:
                     float zoomFactor = 1.1f;
                     _viewScale *= (wheel > 0.0f) ? zoomFactor : (1.0f / zoomFactor);
                 }
-                if (ImGui::IsMouseDragging(2) || ImGui::IsMouseDragging(1)) { // Using integer literals for mouse buttons
+                if (ImGui::IsMouseDragging(2) || ImGui::IsMouseDragging(1)) {
                     ImVec2 delta = ImGui::GetIO().MouseDelta;
                     _viewOffset.x += delta.x;
                     _viewOffset.y += delta.y;
                 }
             }
+
+            // Dijkstra Path Picking (CTRL + Click)
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && ImGui::GetIO().KeyCtrl) {
+                ImVec2 mousePos = ImGui::GetMousePos();
+                ImVec2 uv_origin(p.x + sz.x * 0.5f + _viewOffset.x, p.y + sz.y * 0.5f + _viewOffset.y);
+                
+                float uvX = (mousePos.x - uv_origin.x) / (dim * _viewScale) + 0.5f;
+                float uvY = 1.0f - ((mousePos.y - uv_origin.y) / (dim * _viewScale) + 0.5f);
+
+                int bestID = -1; float min_uv_dist = std::numeric_limits<float>::max();
+                for(auto& kv : _displayUVs) {
+                    float d = glm::distance(glm::vec2(uvX, uvY), kv.second);
+                    if(d < min_uv_dist) { min_uv_dist = d; bestID = kv.first; }
+                }
+                if(bestID != -1 && min_uv_dist < (0.1f / _viewScale)) {
+                    if(_startNode == -1) { _startNode = bestID; _dijkstraPath.clear(); }
+                    else if(_endNode == -1) { _endNode = bestID; ComputeDijkstraPath(); }
+                    else { _startNode = bestID; _endNode = -1; _dijkstraPath.clear(); }
+                }
+            }
+
 
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(p, ImVec2(p.x + sz.x, p.y + sz.y), true);
@@ -290,6 +314,16 @@ public:
             // Draw Points
             if (_showAppPoints) for (auto& pt : _projectedAppPoints) dl->AddCircleFilled(ToScreen(pt), 3.0f, IM_COL32(0, 255, 255, 255));
             if (_showGeoPoints) for (auto& pt : _projectedGeoPoints) dl->AddCircleFilled(ToScreen(pt), 3.0f, IM_COL32(255, 50, 50, 255));
+
+            // Draw Path
+            if(_startNode != -1 && _displayUVs.count(_startNode)) dl->AddCircleFilled(ToScreen(_displayUVs[_startNode]), 5.0f, IM_COL32(0,255,0,255));
+            if(_endNode != -1 && _displayUVs.count(_endNode)) dl->AddCircleFilled(ToScreen(_displayUVs[_endNode]), 5.0f, IM_COL32(255,0,0,255));
+            if(_dijkstraPath.size() > 1) {
+                for(size_t i=0; i<_dijkstraPath.size()-1; ++i) {
+                    if(_displayUVs.count(_dijkstraPath[i]) && _displayUVs.count(_dijkstraPath[i+1]))
+                        dl->AddLine(ToScreen(_displayUVs[_dijkstraPath[i]]), ToScreen(_displayUVs[_dijkstraPath[i+1]]), IM_COL32(0,255,0,255), 3.0f);
+                }
+            }
 
             dl->PopClipRect();
         }
@@ -361,6 +395,46 @@ private:
             }
         }
     }
+    
+    void ComputeDijkstraPath() {
+        if(_startNode == -1 || _endNode == -1) return;
+        _dijkstraPath.clear();
+        
+        std::map<int, float> dists;
+        std::map<int, int> prev;
+        for(auto const& [vert_idx, uv] : _displayUVs) dists[vert_idx] = std::numeric_limits<float>::max();
+        
+        auto cmp = [&](int a, int b){ return dists[a] > dists[b]; };
+        std::priority_queue<int, std::vector<int>, decltype(cmp)> pq(cmp);
+
+        dists[_startNode] = 0;
+        pq.push(_startNode);
+
+        while(!pq.empty()) {
+            int u = pq.top(); pq.pop();
+            if(u == _endNode) break;
+
+            for(int v : _adj[u]) {
+                if(dists.find(v) == dists.end()) continue; 
+                float w = glm::distance(toGlm(_mesh->vertices()[u]), toGlm(_mesh->vertices()[v]));
+                if(dists[u] + w < dists[v]) {
+                    dists[v] = dists[u] + w;
+                    prev[v] = u;
+                    pq.push(v);
+                }
+            }
+        }
+        if(prev.find(_endNode) != prev.end()) {
+            int curr = _endNode;
+            while(curr != _startNode) {
+                _dijkstraPath.push_back(curr);
+                curr = prev[curr];
+            }
+            _dijkstraPath.push_back(_startNode);
+            std::reverse(_dijkstraPath.begin(), _dijkstraPath.end());
+        }
+    }
+
 
     void ProjectAllPointClouds(const glm::vec3& center, float radius) {
         ProcessCloud(_appCloudData, _projectedAppPoints, center, radius);
@@ -393,7 +467,7 @@ private:
                 if (glm::length(n) < 1e-9) continue;
                 n = glm::normalize(n);
 
-                if (std::abs(glm::dot(pt - v0, n)) > 0.1f * r) continue; // FIXED: Stricter plane distance check
+                if (std::abs(glm::dot(pt - v0, n)) > 0.1f * r) continue; 
 
                 glm::vec3 pProj = pt - n * glm::dot(pt - v0, n);
 
@@ -408,7 +482,6 @@ private:
                     float w = (d00 * d21 - d01 * d20) / denom;
                     float u = 1.0f - v - w;
 
-                    // FIXED: Tighter barycentric coordinate check
                     if (u >= -0.01f && v >= -0.01f && w >= -0.01f && u <= 1.01f && v <= 1.01f && w <= 1.01f) {
                         float dist = glm::distance(pt, pProj);
                         if (dist < minDist) {
@@ -442,6 +515,11 @@ private:
     std::vector<glm::vec2> _projectedAppPoints;
     std::vector<float> _geoCloudData;
     std::vector<glm::vec2> _projectedGeoPoints;
+    
+    // Path Finding
+    int _startNode = -1; 
+    int _endNode = -1;
+    std::vector<int> _dijkstraPath;
 };
 
 #endif
