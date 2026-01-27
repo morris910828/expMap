@@ -213,7 +213,7 @@ public:
             ImGui::SliderFloat("Pt Size", &_pointSize, 1.0f, 4.0f);
             ImGui::Separator();
             ImGui::Text("ExpMap Tool");
-            ImGui::SliderFloat("Radius", &_expMapRadius, 0.01f, 1.0f);
+            ImGui::SliderFloat("Radius", &_expMapRadius, 0.01f, 1.2f);
             ImGui::TextColored(ImVec4(1,1,0,1), "Right-click on mesh to flatten!");
         }
         ImGui::End();
@@ -279,7 +279,6 @@ private:
             if (_mesh->normals().size() > 0) {
                 hitNormal = _mesh->normals()[tris[hitTri].x()];
             }
-            std::cout << "[ExpMap] Hit mesh! Computing..." << std::endl;
             _expMapSolver.Compute(sibr::Vector3f(hitPoint.x, hitPoint.y, hitPoint.z), hitNormal, _expMapRadius);
         }
     }
