@@ -89,7 +89,10 @@ public:
     }
 
     const std::vector<sibr::Vector3u>& GetActiveTriangles() const { return _validTriangles; }
-    void RegisterAppPointCloud(const std::vector<float>& pointData) { _appCloudData = pointData; }
+    void RegisterAppPointCloud(const std::vector<float>& pointData, const std::vector<int>& fids) { 
+        _appCloudData = pointData; 
+        _appCloudFids = fids;
+    }
     void RegisterGeoPointCloud(const std::vector<float>& pointData) { _geoCloudData = pointData; }
 
     void Compute(const sibr::Vector3f& hitPos, const sibr::Vector3f& hitNormal, float radius) {
@@ -221,9 +224,11 @@ public:
         }
 
         const auto& tris = _mesh->triangles();
-        for (const auto& t : tris) {
+        for (size_t i=0; i < tris.size(); ++i) {
+            const auto& t = tris[i];
             if (_displayUVs.count(t[0]) && _displayUVs.count(t[1]) && _displayUVs.count(t[2])) {
                 _validTriangles.push_back(t);
+                _validTriangleIndices.insert(i);
             }
         }
 
@@ -437,41 +442,40 @@ private:
 
 
     void ProjectAllPointClouds(const glm::vec3& center, float radius) {
-        ProcessCloud(_appCloudData, _projectedAppPoints, center, radius);
-        ProcessCloud(_geoCloudData, _projectedGeoPoints, center, radius);
+        ProcessCloud(_appCloudData, _appCloudFids, _projectedAppPoints, center, radius);
+        ProcessCloud(_geoCloudData, {}, _projectedGeoPoints, center, radius);
     }
 
-    void ProcessCloud(const std::vector<float>& data, std::vector<glm::vec2>& outPts, const glm::vec3& center, float r) {
+    void ProcessCloud(const std::vector<float>& data, const std::vector<int>& fids, std::vector<glm::vec2>& outPts, const glm::vec3& center, float r) {
         outPts.clear();
         if (data.empty() || _displayUVs.empty()) return;
 
         const auto& all_verts = _mesh->vertices();
+        const auto& all_tris = _mesh->triangles();
         size_t numPoints = data.size() / 3;
         float r2 = r * r;
+
+        bool use_fids = !fids.empty() && fids.size() == numPoints;
 
         for (size_t i = 0; i < numPoints; ++i) {
             glm::vec3 pt(data[i * 3], data[i * 3 + 1], data[i * 3 + 2]);
             glm::vec3 diff = pt - center;
             if (glm::dot(diff, diff) > r2) continue;
 
-            float minDist = std::numeric_limits<float>::max();
-            glm::vec2 bestUV(0, 0);
-            bool found = false;
+            if (use_fids) {
+                int face_id = fids[i];
+                if (face_id < 0 || face_id >= (int)all_tris.size()) continue;
 
-            for (const auto& t : _validTriangles) {
+                // Check if this face is part of the flattened patch
+                if (_validTriangleIndices.count(face_id) == 0) continue;
+                
+                const auto& t = all_tris[face_id];
+
                 glm::vec3 v0 = toGlm(all_verts[t[0]]);
                 glm::vec3 v1 = toGlm(all_verts[t[1]]);
                 glm::vec3 v2 = toGlm(all_verts[t[2]]);
-
-                glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
-                if (glm::length(n) < 1e-9) continue;
-                n = glm::normalize(n);
-
-                if (std::abs(glm::dot(pt - v0, n)) > 0.1f * r) continue; 
-
-                glm::vec3 pProj = pt - n * glm::dot(pt - v0, n);
-
-                glm::vec3 v0v1 = v1 - v0; glm::vec3 v0v2 = v2 - v0; glm::vec3 pVec = pProj - v0;
+                
+                glm::vec3 v0v1 = v1 - v0; glm::vec3 v0v2 = v2 - v0; glm::vec3 pVec = pt - v0;
                 float d00 = glm::dot(v0v1, v0v1); float d01 = glm::dot(v0v1, v0v2);
                 float d11 = glm::dot(v0v2, v0v2); float d20 = glm::dot(pVec, v0v1);
                 float d21 = glm::dot(pVec, v0v2);
@@ -481,18 +485,51 @@ private:
                     float v = (d11 * d20 - d01 * d21) / denom;
                     float w = (d00 * d21 - d01 * d20) / denom;
                     float u = 1.0f - v - w;
+                    
+                    glm::vec2 uv = u * _displayUVs.at(t[0]) + v * _displayUVs.at(t[1]) + w * _displayUVs.at(t[2]);
+                    outPts.push_back(uv);
+                }
 
-                    if (u >= -0.01f && v >= -0.01f && w >= -0.01f && u <= 1.01f && v <= 1.01f && w <= 1.01f) {
-                        float dist = glm::distance(pt, pProj);
-                        if (dist < minDist) {
-                            minDist = dist;
-                            bestUV = u * _displayUVs.at(t[0]) + v * _displayUVs.at(t[1]) + w * _displayUVs.at(t[2]);
-                            found = true;
+            } else { // Fallback for geo points (or if fids are missing)
+                float minDist = std::numeric_limits<float>::max();
+                glm::vec2 bestUV(0, 0);
+                bool found = false;
+                for (const auto& t : _validTriangles) {
+                    glm::vec3 v0 = toGlm(all_verts[t[0]]);
+                    glm::vec3 v1 = toGlm(all_verts[t[1]]);
+                    glm::vec3 v2 = toGlm(all_verts[t[2]]);
+
+                    glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
+                    if (glm::length(n) < 1e-9) continue;
+                    n = glm::normalize(n);
+                    
+                    if (std::abs(glm::dot(pt - v0, n)) > 0.1f * r) continue; 
+
+                    glm::vec3 pProj = pt - n * glm::dot(pt - v0, n);
+
+                    glm::vec3 v0v1 = v1 - v0; glm::vec3 v0v2 = v2 - v0; glm::vec3 pVec = pProj - v0;
+                    float d00 = glm::dot(v0v1, v0v1); float d01 = glm::dot(v0v1, v0v2);
+                    float d11 = glm::dot(v0v2, v0v2); float d20 = glm::dot(pVec, v0v1);
+                    float d21 = glm::dot(pVec, v0v2);
+                    float denom = d00 * d11 - d01 * d01;
+
+                    if (std::abs(denom) > 1e-9f) {
+                        float v = (d11 * d20 - d01 * d21) / denom;
+                        float w = (d00 * d21 - d01 * d20) / denom;
+                        float u = 1.0f - v - w;
+
+                        if (u >= -0.01f && v >= -0.01f && w >= -0.01f && u <= 1.01f && v <= 1.01f && w <= 1.01f) {
+                            float dist = glm::distance(pt, pProj);
+                            if (dist < minDist) {
+                                minDist = dist;
+                                bestUV = u * _displayUVs.at(t[0]) + v * _displayUVs.at(t[1]) + w * _displayUVs.at(t[2]);
+                                found = true;
+                            }
                         }
                     }
                 }
+                if (found) outPts.push_back(bestUV);
             }
-            if (found) outPts.push_back(bestUV);
         }
     }
 
@@ -502,6 +539,7 @@ private:
     std::vector<ExpMapVertex> _vertexData;
     std::map<int, glm::vec2> _displayUVs;
     std::vector<sibr::Vector3u> _validTriangles;
+    std::set<int> _validTriangleIndices;
 
     // UI
     float _viewScale = 1.0f;
@@ -512,6 +550,7 @@ private:
 
     // Point Cloud Data
     std::vector<float> _appCloudData;
+    std::vector<int> _appCloudFids;
     std::vector<glm::vec2> _projectedAppPoints;
     std::vector<float> _geoCloudData;
     std::vector<glm::vec2> _projectedGeoPoints;

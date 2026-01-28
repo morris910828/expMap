@@ -78,15 +78,95 @@ public:
         glEnableVertexAttribArray(0); glBindVertexArray(0); _loaded = true;
     }
 
+    void loadFids(const std::string& path) {
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            std::cerr << "ERROR: Could not open PLY file: " << path << std::endl;
+            return;
+        }
+
+        std::string line;
+        long vertex_count = 0;
+        int face_id_offset = -1;
+        int property_count = 0;
+        bool is_ascii = false;
+
+        // Header parsing
+        while (std::getline(file, line)) {
+            std::stringstream ss(line);
+            std::string token;
+            ss >> token;
+
+            if (token == "format") {
+                ss >> token;
+                if (token == "ascii") {
+                    is_ascii = true;
+                }
+            } else if (token == "element") {
+                ss >> token;
+                if (token == "vertex") {
+                    ss >> vertex_count;
+                }
+            } else if (token == "property") {
+                if (face_id_offset == -1) {
+                    std::string type, name;
+                    ss >> type >> name;
+                    if (name == "face_id") {
+                        face_id_offset = property_count;
+                    }
+                    property_count++;
+                }
+            } else if (token == "end_header") {
+                break;
+            }
+        }
+
+        if (!is_ascii) {
+            std::cerr << "ERROR: PLY file is not in ASCII format." << std::endl;
+            return;
+        }
+        if (vertex_count == 0) {
+            std::cerr << "ERROR: Vertex count is 0 in PLY file." << std::endl;
+            return;
+        }
+        if (face_id_offset == -1) {
+            std::cerr << "ERROR: 'face_id' property not found in PLY header." << std::endl;
+            return;
+        }
+
+        // Data parsing
+        _fids.clear();
+        _fids.reserve(vertex_count);
+
+        for (long i = 0; i < vertex_count; ++i) {
+            if (!std::getline(file, line)) {
+                std::cerr << "ERROR: Unexpected end of file while reading vertices." << std::endl;
+                return;
+            }
+            std::stringstream ss(line);
+            float val;
+            int current_prop = 0;
+            while (ss >> val) {
+                if (current_prop == face_id_offset) {
+                    _fids.push_back(static_cast<int>(val));
+                    break; 
+                }
+                current_prop++;
+            }
+        }
+    }
+
     void draw() { if (!_loaded) return; glBindVertexArray(_vao); glDrawArrays(GL_POINTS, 0, (GLsizei)_count); glBindVertexArray(0); }
     bool isLoaded() const { return _loaded; }
     
     // 取得原始點雲資料介面
     const std::vector<float>& getRawData() const { return _rawData; }
+    const std::vector<int>& getFids() const { return _fids; }
 
 private:
     GLuint _vao = 0, _vbo = 0; size_t _count = 0; bool _loaded = false;
     std::vector<float> _rawData;
+    std::vector<int> _fids;
 };
 
 // ====================================================================================
@@ -115,6 +195,7 @@ public:
         // 2. Load Points
         _geoRenderer.load(geoPath);
         _appRenderer.load(appPath);
+        _appRenderer.loadFids(appPath);
 
         // 3. Init ExpMap Solver & 註冊雙點雲
         if (_mesh) {
@@ -123,7 +204,7 @@ public:
             // 註冊 App 點雲 (青色)
             if (_appRenderer.isLoaded()) {
                 std::cout << "[ExpMap] Registering App cloud: " << _appRenderer.getRawData().size() / 3 << " pts." << std::endl;
-                _expMapSolver.RegisterAppPointCloud(_appRenderer.getRawData());
+                _expMapSolver.RegisterAppPointCloud(_appRenderer.getRawData(), _appRenderer.getFids());
             }
 
             // [新增] 註冊 Geo 點雲 (紅色)
