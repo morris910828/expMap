@@ -98,16 +98,16 @@ public:
     void Compute(const sibr::Vector3f& hitPos, const sibr::Vector3f& hitNormal, float radius) {
         if (!_mesh || _mesh->vertices().empty()) return;
 
-        // --- Reset State ---
-        _vertexData.clear();
-        _displayUVs.clear();
-        _validTriangles.clear();
-        _projectedAppPoints.clear();
-        _projectedGeoPoints.clear();
-        _dijkstraPath.clear();
-        _startNode = -1;
-        _endNode = -1;
-
+            // --- Reset State ---
+            _vertexData.clear();
+            _displayUVs.clear();
+            _validTriangles.clear();
+            _validTriangleIndices.clear(); // BUG FIX: This was not being cleared.
+            _projectedAppPoints.clear();
+            _projectedGeoPoints.clear();
+            _dijkstraPath.clear();
+            _startNode = -1;
+            _endNode = -1;
         // --- 1. Find Seed Vertex ---
         glm::vec3 target = toGlm(hitPos);
         int seedIdx = -1;
@@ -558,7 +558,6 @@ private:
     // Path Finding
     int _startNode = -1; 
     int _endNode = -1;
-    std::vector<int> _dijkstraPath;
-};
+    std::vector<int> _dijkstraPath;};
 
 #endif

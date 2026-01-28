@@ -79,7 +79,7 @@ public:
     }
 
     void loadFids(const std::string& path) {
-        std::ifstream file(path);
+        std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) {
             std::cerr << "ERROR: Could not open PLY file: " << path << std::endl;
             return;
@@ -87,20 +87,25 @@ public:
 
         std::string line;
         long vertex_count = 0;
-        int face_id_offset = -1;
-        int property_count = 0;
-        bool is_ascii = false;
+        int face_id_offset = -1; // in floats
+        int property_count = 0; // in floats
+        bool is_binary = false;
 
         // Header parsing
         while (std::getline(file, line)) {
+            // Trim potential carriage return
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            
             std::stringstream ss(line);
             std::string token;
             ss >> token;
 
             if (token == "format") {
                 ss >> token;
-                if (token == "ascii") {
-                    is_ascii = true;
+                if (token == "binary_little_endian") {
+                    is_binary = true;
                 }
             } else if (token == "element") {
                 ss >> token;
@@ -108,21 +113,25 @@ public:
                     ss >> vertex_count;
                 }
             } else if (token == "property") {
-                if (face_id_offset == -1) {
-                    std::string type, name;
-                    ss >> type >> name;
-                    if (name == "face_id") {
-                        face_id_offset = property_count;
-                    }
-                    property_count++;
+                std::string type, name;
+                ss >> type;
+                if(type != "float") {
+                    std::cerr << "ERROR: Non-float property '" << type << "' not supported by this PLY parser." << std::endl;
+                    return;
                 }
+                ss >> name;
+                if (name == "face_id") {
+                    face_id_offset = property_count;
+                }
+                property_count++;
+
             } else if (token == "end_header") {
                 break;
             }
         }
 
-        if (!is_ascii) {
-            std::cerr << "ERROR: PLY file is not in ASCII format." << std::endl;
+        if (!is_binary) {
+            std::cerr << "ERROR: PLY file is not in binary format, which is required." << std::endl;
             return;
         }
         if (vertex_count == 0) {
@@ -138,21 +147,18 @@ public:
         _fids.clear();
         _fids.reserve(vertex_count);
 
+        // The file stream is now correctly positioned at the start of the binary data.
+        size_t vertex_byte_size = property_count * sizeof(float);
+        std::vector<char> vertex_buffer(vertex_byte_size);
+        float* float_buffer = reinterpret_cast<float*>(vertex_buffer.data());
+
         for (long i = 0; i < vertex_count; ++i) {
-            if (!std::getline(file, line)) {
-                std::cerr << "ERROR: Unexpected end of file while reading vertices." << std::endl;
+            file.read(vertex_buffer.data(), vertex_byte_size);
+            if(!file) {
+                std::cerr << "ERROR: Unexpected end of file while reading binary vertex data for vertex " << i << std::endl;
                 return;
             }
-            std::stringstream ss(line);
-            float val;
-            int current_prop = 0;
-            while (ss >> val) {
-                if (current_prop == face_id_offset) {
-                    _fids.push_back(static_cast<int>(val));
-                    break; 
-                }
-                current_prop++;
-            }
+            _fids.push_back(static_cast<int>(float_buffer[face_id_offset]));
         }
     }
 
