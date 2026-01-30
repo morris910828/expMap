@@ -287,6 +287,31 @@ public:
             glLineWidth(1.0f);
         }
 
+        // 3. 畫 3D 空間中的最短路徑 (紅色)
+        const auto& dijkstraPath = _expMapSolver.GetDijkstraPath();
+        if (!dijkstraPath.empty() && _mesh) {
+            // std::cout << "[DEBUG] Drawing Dijkstra path with " << dijkstraPath.size() << " nodes." << std::endl;
+            glUseProgram(0); // Ensure no shader is active
+            glMatrixMode(GL_PROJECTION);
+            glLoadMatrixf(eye.proj().data());
+            glMatrixMode(GL_MODELVIEW);
+            glLoadMatrixf(eye.view().data());
+
+            glLineWidth(5.0f); // Make the path thicker
+            glColor3f(1.0f, 0.0f, 0.0f); // Red color
+
+            glDisable(GL_DEPTH_TEST); // Disable depth test for the path to always draw on top
+            glBegin(GL_LINE_STRIP); // Use LINE_STRIP to connect sequential points
+            for (int nodeId : dijkstraPath) {
+                // Need to use ExpMapSolver's getPos because nodeId can be an extraNode (projected point)
+                glm::vec3 pos = _expMapSolver.getPos(nodeId); 
+                glVertex3f(pos.x, pos.y, pos.z);
+            }
+            glEnd();
+            glEnable(GL_DEPTH_TEST); // Re-enable depth test for subsequent rendering (if any)
+            glLineWidth(1.0f); // Reset line width
+        }
+
         dst.unbind();
     }
 
@@ -325,7 +350,12 @@ private:
         glm::vec3 rayDir = glm::normalize(glm::vec3(glm::inverse(view) * rayEye));
         glm::vec3 rayOrigin = glm::make_vec3(cam.position().data());
 
-        if (!_mesh) return;
+        if (!_mesh) {
+            std::cout << "[DEBUG] PerformRaycast: _mesh is null. Cannot raycast." << std::endl;
+            return;
+        }
+        std::cout << "[DEBUG] PerformRaycast: _mesh is valid. Vertices: " << _mesh->vertices().size() << ", Triangles: " << _mesh->triangles().size() << std::endl;
+
         float minT = 1e9f;
         bool hit = false;
         int hitTri = -1;
@@ -366,7 +396,11 @@ private:
             if (_mesh->normals().size() > 0) {
                 hitNormal = _mesh->normals()[tris[hitTri].x()];
             }
+            std::cout << "[DEBUG] PerformRaycast: Hit detected. HitTri: " << hitTri << ", HitPoint: (" << hitPoint.x << ", " << hitPoint.y << ", " << hitPoint.z << ")" << std::endl;
+            std::cout << "[DEBUG] PerformRaycast: Mesh has normals: " << (_mesh->normals().size() > 0 ? "Yes" : "No") << std::endl;
             _expMapSolver.Compute(sibr::Vector3f(hitPoint.x, hitPoint.y, hitPoint.z), hitNormal, _expMapRadius);
+        } else {
+            std::cout << "[DEBUG] PerformRaycast: No hit detected." << std::endl;
         }
     }
 
@@ -452,17 +486,60 @@ int main(int ac, char** av)
     try { scene.reset(new BasicIBRScene(myArgs, myOpts)); }
     catch (...) { myArgs.dataset_path = myArgs.modelPath.get(); scene.reset(new BasicIBRScene(myArgs, myOpts)); }
 
-    sibr::Mesh::Ptr manualMesh(new sibr::Mesh()); const sibr::Mesh* meshToRender = nullptr;
-    if (scene->proxies()->proxy().vertices().empty()) {
-        std::string objPath = myArgs.dataset_path.get() + "/mesh.obj";
-        if (manualMesh->load(objPath)) meshToRender = manualMesh.get();
-        else { std::string plyPath = myArgs.dataset_path.get() + "/mesh.ply"; if (manualMesh->load(plyPath)) meshToRender = manualMesh.get(); }
-    } else meshToRender = &scene->proxies()->proxy();
+    // 修改: 優先嘗試從 geo_point_cloud.ply 載入帶有面資訊的網格
+    sibr::Mesh::Ptr geoMeshWithFaces(new sibr::Mesh());
+    const sibr::Mesh* meshToRender = nullptr; // 將 meshToRender 初始化為 nullptr
+
+    // 組裝 geo_point_cloud.ply 的完整路徑
+    std::string plyfile = myArgs.modelPath.get(); 
+    if (plyfile.back() != '/') plyfile += "/"; 
+    plyfile += "point_cloud";
+
+    std::string iterDir; 
+    if (!myArgs.iteration.isInit()) iterDir = findLargestNumberedSubdirectory(plyfile); 
+    else iterDir = "iteration_" + myArgs.iteration.get();
     
-    std::string plyfile = myArgs.modelPath.get(); if (plyfile.back() != '/') plyfile += "/"; plyfile += "point_cloud";
-    std::string iterDir; if (!myArgs.iteration.isInit()) iterDir = findLargestNumberedSubdirectory(plyfile); else iterDir = "iteration_" + myArgs.iteration.get();
-    std::string finalPlyPath = plyfile + "/" + iterDir + "/point_cloud.ply";
     std::string plyDir = plyfile + "/" + iterDir + "/";
+    std::string geoPlyPathForMesh = plyDir + "geo_point_cloud.ply";
+
+    if (geoMeshWithFaces->load(geoPlyPathForMesh)) {
+        if (geoMeshWithFaces->triangles().size() > 0) {
+            std::cout << "[INFO] Successfully loaded geo_point_cloud.ply with " << geoMeshWithFaces->triangles().size() << " faces as mesh." << std::endl;
+            meshToRender = geoMeshWithFaces.get();
+        } else {
+            std::cout << "[INFO] geo_point_cloud.ply loaded, but no faces found. Falling back to mesh.obj/mesh.ply." << std::endl;
+        }
+    } else {
+        std::cout << "[INFO] Could not load geo_point_cloud.ply as mesh. Falling back to mesh.obj/mesh.ply." << std::endl;
+    }
+
+    // 如果 geo_point_cloud.ply 沒有成功載入為網格，則執行原有的載入邏輯
+    if (!meshToRender) {
+        sibr::Mesh::Ptr manualMesh(new sibr::Mesh());
+        if (scene->proxies()->proxy().vertices().empty()) {
+            std::string objPath = myArgs.dataset_path.get() + "/mesh.obj";
+            if (manualMesh->load(objPath)) {
+                meshToRender = manualMesh.get();
+                std::cout << "[INFO] Loaded mesh.obj as mesh." << std::endl;
+            }
+            else { 
+                std::string plyPath = myArgs.dataset_path.get() + "/mesh.ply"; 
+                if (manualMesh->load(plyPath)) {
+                    meshToRender = manualMesh.get(); 
+                    std::cout << "[INFO] Loaded mesh.ply as mesh." << std::endl;
+                } else {
+                    std::cout << "[WARNING] No mesh.obj or mesh.ply found. ExpMap functions may not work." << std::endl;
+                }
+            }
+        } else {
+            meshToRender = &scene->proxies()->proxy();
+            std::cout << "[INFO] Loaded scene proxy as mesh." << std::endl;
+        }
+    }
+    
+    // The variables plyfile, iterDir, and plyDir are already defined above.
+    // We reuse them here for the remaining point cloud paths.
+    std::string finalPlyPath = plyfile + "/" + iterDir + "/point_cloud.ply";
     std::string geoPath = plyDir + "geo_point_cloud.ply";
     std::string appPath = plyDir + "app_point_cloud.ply";
 

@@ -73,9 +73,32 @@ struct ExpVertex {
 // ==========================================
 class ExpMapSolverSIBR {
 public:
+    // Public methods
+    const std::vector<int>& GetDijkstraPath() const { return _dijkstraPath; }
+
+
     void Init(const sibr::Mesh* mesh) {
         _mesh = mesh;
         buildBaseAdjacency();
+
+        // Check if normals are all zero and compute if necessary
+        bool normalsAreZero = true;
+        if (!_mesh->normals().empty()) {
+            for (const auto& n : _mesh->normals()) {
+                if (n.norm() > 1e-6f) { // Check if normal is non-zero
+                    normalsAreZero = false;
+                    break;
+                }
+            }
+        } else {
+            // If normals vector is empty, it means no normals were loaded
+            normalsAreZero = true; 
+        }
+
+        if (normalsAreZero) {
+            std::cout << "[INFO] ExpMapSolverSIBR: Detected zero or missing normals. Computing vertex normals..." << std::endl;
+            computeVertexNormals();
+        }
     }
 
     void RegisterAppPointCloud(const std::vector<float>& pointData, const std::vector<int>& fids) { 
@@ -85,6 +108,16 @@ public:
     void RegisterGeoPointCloud(const std::vector<float>& pointData) { _geoCloudData = pointData; }
 
     const std::vector<sibr::Vector3u>& GetActiveTriangles() const { return _validTriangles; }
+
+    glm::vec3 getPos(int id) const {
+        if (id < _mesh->vertices().size()) return toGlm(_mesh->vertices()[id]);
+        else return _extraNodePositions[id - _mesh->vertices().size()];
+    }
+
+    glm::vec3 getNormal(int id) const {
+        if (id < _mesh->vertices().size()) return toGlm(_mesh->normals()[id]);
+        else return _extraNodeNormals[id - _mesh->vertices().size()];
+    }
 
     void Compute(const sibr::Vector3f& hitPos, const sibr::Vector3f& hitNormal, float radius) {
         if(!_mesh) return;
@@ -98,13 +131,12 @@ public:
         _projectedAppPoints.clear(); 
         _projectedGeoPoints.clear();
         _extraNodePositions.clear(); 
-        _extraNodeNormals.clear(); // [New] 清空虛擬法線
+        _extraNodeNormals.clear();
         
         _adj = _baseAdj; 
         _startNode = -1; _endNode = -1;
         _dijkstraPath.clear();
 
-        // 1. ExpMap Core
         glm::vec3 target = toGlm(hitPos);
         int seedIdx = -1;
         float minD = 1e9f;
@@ -192,20 +224,22 @@ public:
                 float maxRatio = 2.0f; 
                 float minRatio = 0.5f;
 
-                bool distorted = false;
-                auto checkEdge = [&](float duv, float d3d) {
-                    if (d3d > 1e-6f) {
-                        float r = duv / d3d;
-                        if (r > maxRatio || r < minRatio) return true;
-                    } else if (duv > 1e-4f) { return true; }
-                    return false;
-                };
+                // [MOD] Temporarily disable distortion check for debugging
+                // bool distorted = false;
+                // auto checkEdge = [&](float duv, float d3d) {
+                //     if (d3d > 1e-6f) {
+                //         float r = duv / d3d;
+                //         if (r > maxRatio || r < minRatio) return true;
+                //     } else if (duv > 1e-4f) { return true; }
+                //     return false;
+                // };
 
-                if (checkEdge(dUV_01, d3D_01)) distorted = true;
-                if (checkEdge(dUV_12, d3D_12)) distorted = true;
-                if (checkEdge(dUV_20, d3D_20)) distorted = true;
+                // if (checkEdge(dUV_01, d3D_01)) distorted = true;
+                // if (checkEdge(dUV_12, d3D_12)) distorted = true;
+                // if (checkEdge(dUV_20, d3D_20)) distorted = true;
 
-                if (distorted) continue;
+                // if (distorted) continue; // Always continue without distortion check
+
 
                 _validTriangles.push_back(t);
                 _validTriIDs.push_back((int)i); 
@@ -223,9 +257,6 @@ public:
             }
 
             ProjectAndInsertClouds(target, radius * 1.2f);
-            
-            // [關鍵新增] 為虛擬節點計算真實的測地線成本
-            ComputeExtraNodeCosts();
         }
     }
 
@@ -252,11 +283,9 @@ public:
             ImGui::Checkbox("Fill", &_drawFilled);
             ImGui::SameLine();
             ImGui::Checkbox("Cull", &_cullBackFace);
-            
-            // [V3 新增] 點顯示控制
-            ImGui::Checkbox("Show App Points", &_showAppPoints);
+            ImGui::Checkbox("Show App", &_showAppPoints);
             ImGui::SameLine();
-            ImGui::Checkbox("Show Geo Points", &_showGeoPoints);
+            ImGui::Checkbox("Show Geo", &_showGeoPoints);
 
             ImVec2 p = ImGui::GetCursorScreenPos();
             ImVec2 sz = ImGui::GetContentRegionAvail();
@@ -351,12 +380,8 @@ public:
                 ImVec2 pos = TransformUV(uv);
                 bool isApp = (id < (int)(meshSize + _projectedAppPoints.size()));
                 
-                // [V3 修改] 根據開關顯示點
-                if (isApp && _showAppPoints) {
-                    dl->AddCircleFilled(pos, 3.0f, IM_COL32(0, 255, 255, 255)); 
-                } else if (!isApp && _showGeoPoints) {
-                    dl->AddCircleFilled(pos, 3.0f, IM_COL32(255, 50, 50, 255)); 
-                }
+                if (isApp && _showAppPoints) dl->AddCircleFilled(pos, 3.0f, IM_COL32(0, 255, 255, 255)); 
+                else if (!isApp && _showGeoPoints) dl->AddCircleFilled(pos, 3.0f, IM_COL32(255, 50, 50, 255)); 
             }
 
             if (_dijkstraPath.size() > 1) {
@@ -378,6 +403,60 @@ public:
     }
 
 private:
+    // ... existing private members ...
+
+    void computeVertexNormals() {
+        if (!_mesh || _mesh->vertices().empty() || _mesh->triangles().empty()) {
+            std::cerr << "[WARNING] Cannot compute normals: Mesh is invalid or empty." << std::endl;
+            return;
+        }
+
+        // Ensure the normals vector is correctly sized and mutable
+        std::vector<sibr::Vector3f>& normals = const_cast<std::vector<sibr::Vector3f>&>(_mesh->normals()); 
+        if (normals.size() != _mesh->vertices().size()) {
+             normals.assign(_mesh->vertices().size(), sibr::Vector3f(0.0f, 0.0f, 0.0f));
+        } else {
+            std::fill(normals.begin(), normals.end(), sibr::Vector3f(0.0f, 0.0f, 0.0f)); // Clear existing normals
+        }
+
+        const auto& vertices = _mesh->vertices();
+        const auto& triangles = _mesh->triangles();
+
+        for (const auto& tri : triangles) {
+            // Ensure triangle indices are valid
+            if (tri.x() >= vertices.size() || tri.y() >= vertices.size() || tri.z() >= vertices.size()) {
+                std::cerr << "[WARNING] Invalid triangle index encountered during normal computation. Skipping triangle." << std::endl;
+                continue;
+            }
+
+            const sibr::Vector3f& v0 = vertices[tri.x()];
+            const sibr::Vector3f& v1 = vertices[tri.y()];
+            const sibr::Vector3f& v2 = vertices[tri.z()];
+
+            sibr::Vector3f edge1 = v1 - v0;
+            sibr::Vector3f edge2 = v2 - v0;
+            sibr::Vector3f faceNormal = edge1.cross(edge2);
+
+            // Only add if face normal is not degenerate
+            if (faceNormal.norm() > 1e-6f) {
+                faceNormal.normalize();
+                normals[tri.x()] += faceNormal;
+                normals[tri.y()] += faceNormal;
+                normals[tri.z()] += faceNormal;
+            }
+        }
+
+        // Normalize accumulated vertex normals
+        for (sibr::Vector3f& n : normals) {
+            if (n.norm() > 1e-6f) {
+                n.normalize();
+            } else {
+                // If a vertex has no incident non-degenerate faces, give it an arbitrary normal
+                n = sibr::Vector3f(0.0f, 1.0f, 0.0f); 
+            }
+        }
+        std::cout << "[INFO] ExpMapSolverSIBR: Computed missing vertex normals." << std::endl;
+    }
     void buildBaseAdjacency() {
         _baseAdj.clear();
         _baseAdj.resize(_mesh->vertices().size());
@@ -401,15 +480,17 @@ private:
         float dist = glm::distance(currPos, parentPos);
         float weightedDist = dist;
 
-        // [修改] 對所有擴展 (包括 Mesh 內部和邊緣) 都應用曲率檢查
-        glm::vec3 parentN = getNormal(parentIdx); // [New] Helper function
+        glm::vec3 parentN = getNormal(parentIdx);
         glm::vec3 currN = getNormal(currIdx);
         
         float dotNormal = glm::dot(parentN, currN);
-        if (dotNormal < 0.5f) return; // 角度過大則停止 (防止穿透尖銳邊緣)
+        // [MOD] Temporarily relax normal dot product check
+        // if (dotNormal < 0.5f) return; 
 
         float curvaturePenalty = 1.0f + 5.0f * (1.0f - dotNormal);
-        weightedDist = dist * curvaturePenalty;
+        // [MOD] Temporarily reduce curvature penalty effect
+        // weightedDist = dist * curvaturePenalty;
+        weightedDist = dist; // Use unweighted distance for now
 
         float newCost = parent.cost + weightedDist;
 
@@ -417,11 +498,8 @@ private:
             curr.cost = newCost;
             curr.parentId = parentIdx;
             
-            // UV 傳播邏輯 (僅對 Mesh 頂點)
             bool isExtraNode = (parentIdx >= _mesh->vertices().size()) || (currIdx >= _mesh->vertices().size());
             if (!isExtraNode) {
-                glm::vec3 parentN = (_mesh->normals().size() > parentIdx) ? toGlm(_mesh->normals()[parentIdx]) : glm::vec3(0,1,0);
-                glm::vec3 currN = (_mesh->normals().size() > currIdx) ? toGlm(_mesh->normals()[currIdx]) : glm::vec3(0,1,0);
                 glm::vec3 edge = currPos - parentPos;
                 glm::vec3 edgeProj = edge - parentN * glm::dot(edge, parentN);
                 if (glm::length(edgeProj) > 1e-6f) edgeProj = glm::normalize(edgeProj) * dist; else edgeProj = glm::vec3(0);
@@ -429,6 +507,7 @@ private:
                 glm::vec3 parentTangentY = glm::cross(parentN, parent.tangentX);
                 float dU = glm::dot(edgeProj, parent.tangentX);
                 float dV = glm::dot(edgeProj, parentTangentY);
+
                 curr.uv = parent.uv + glm::vec2(dU, dV);
 
                 glm::vec3 axis = glm::cross(parentN, currN);
@@ -462,7 +541,7 @@ private:
 
                 float bestDist = 1e9f; glm::vec2 bestUV(0,0); int bestTriGlobalID = -1; bool found = false;
                 glm::vec3 bestProjPos(0,0,0);
-                glm::vec3 bestProjNormal(0,1,0); // [New] 儲存投影點法線
+                glm::vec3 bestProjNormal(0,1,0); 
 
                 if (use_fids) {
                     int face_id = fids[i];
@@ -480,7 +559,6 @@ private:
                             bestUV = u * _displayUVs.at(t[0]) + v * _displayUVs.at(t[1]) + w * _displayUVs.at(t[2]);
                             bestProjPos = u * v0 + v * v1 + w * v2; 
                             
-                            // [New] Interpolate Normal
                             glm::vec3 n0 = toGlm(_mesh->normals()[t[0]]);
                             glm::vec3 n1 = toGlm(_mesh->normals()[t[1]]);
                             glm::vec3 n2 = toGlm(_mesh->normals()[t[2]]);
@@ -511,7 +589,6 @@ private:
                                     bestUV = u * _displayUVs.at(t[0]) + v * _displayUVs.at(t[1]) + w * _displayUVs.at(t[2]); 
                                     bestProjPos = pProj; bestTriGlobalID = globalTIdx; found = true; 
                                     
-                                    // [New] Interpolate Normal
                                     glm::vec3 n0 = toGlm(_mesh->normals()[t[0]]);
                                     glm::vec3 n1 = toGlm(_mesh->normals()[t[1]]);
                                     glm::vec3 n2 = toGlm(_mesh->normals()[t[2]]);
@@ -526,51 +603,33 @@ private:
                     outPts.push_back(bestUV);
                     int newNodeID = (int)meshSize + (int)_extraNodePositions.size();
                     _extraNodePositions.push_back(bestProjPos);
-                    _extraNodeNormals.push_back(bestProjNormal); // [New] Store normal
+                    _extraNodeNormals.push_back(bestProjNormal);
                     _displayUVs[newNodeID] = bestUV;
                     
-                    // [關鍵新增] 為虛擬節點創建 ExpVertex
                     ExpVertex vExtra;
                     vExtra.id = newNodeID;
-                    vExtra.cost = 1e9f;  // 初始化為高成本，稍後計算真實值
+                    vExtra.cost = 1e9f; 
                     vExtra.uv = bestUV;
                     vExtra.frozen = false;
                     _vertexData[newNodeID] = vExtra;
                     
                     if (_adj.size() <= newNodeID) _adj.resize(newNodeID + 1);
 
+                    // 1. [修正] 連接所有 3 個頂點，確保結構穩固
                     const auto& t = _mesh->triangles()[bestTriGlobalID];
                     int v[3] = { (int)t[0], (int)t[1], (int)t[2] };
-                    
-                    // [修正] 只連接最近的 2 個頂點
-                    std:: vector<std::pair<float, int>> distVerts;
                     for(int k=0; k<3; ++k) {
-                        float d = glm::distance(bestProjPos, toGlm(_mesh->vertices()[v[k]]));
-                        distVerts.push_back({d, v[k]});
-                    }
-                    std::sort(distVerts.begin(), distVerts.end());
-                    
-                    // [修正] 只連接最近的 2 個頂點，且距離不能太遠
-                    float maxConnectionDist = 0.15f; // 可調整
-                    int connected = 0;
-                    for(int k=0; k<3 && connected < 2; ++k) {
-                        if (distVerts[k].first > maxConnectionDist) continue;
-                        int vertID = distVerts[k].second;
-                        _adj[newNodeID].push_back(vertID);
-                        _adj[vertID].push_back(newNodeID);
-                        connected++;
+                        _adj[newNodeID].push_back(v[k]);
+                        _adj[v[k]].push_back(newNodeID);
                     }
 
-                    // [關鍵修正V3] 移除同一三角形內虛擬節點的互連
-                    // 虛擬節點之間不應該有直連，必須通過網格頂點
-                    
+                    // 2. [恢復] 內部互連 (Sibling)
                     if (triToExtraNodes.count(bestTriGlobalID)) {
                         for (int siblingID : triToExtraNodes[bestTriGlobalID]) {
                             _adj[newNodeID].push_back(siblingID);
                             _adj[siblingID].push_back(newNodeID);
                         }
                     }
-                    
                     triToExtraNodes[bestTriGlobalID].push_back(newNodeID);
                 }
              }
@@ -579,75 +638,32 @@ private:
         process(_appCloudData, _appCloudFids, _projectedAppPoints);
         process(_geoCloudData, {}, _projectedGeoPoints);
 
-        // [關鍵修正V3] 移除共享邊三角形的虛擬節點互連
-        // 這是導致路徑跨越三角形的主要原因
-        /*
-        std::map<std::pair<int, int>, std::vector<int>> edgeToTriangles;
-        for (auto const& [globalTIdx, nodes] : triToExtraNodes) {
-            const auto& t = _mesh->triangles()[globalTIdx];
-            int v[3] = { (int)t[0], (int)t[1], (int)t[2] };
-            auto addEdge = [&](int a, int b) { 
-                if (a > b) std::swap(a, b); 
-                edgeToTriangles[{a, b}].push_back(globalTIdx); 
-            };
-            addEdge(v[0], v[1]); addEdge(v[1], v[2]); addEdge(v[2], v[0]);
-        }
+    } // End of ProjectAndInsertClouds function before Neighbor Connection
 
-        for (auto const& kv : edgeToTriangles) {
-            const auto& tris = kv.second;
-            for (size_t i = 0; i < tris.size(); ++i) {
-                for (size_t j = i + 1; j < tris.size(); ++j) {
-                    int tA = tris[i];
-                    int tB = tris[j];
-                    for (int nA : triToExtraNodes[tA]) {
-                        for (int nB : triToExtraNodes[tB]) {
-                             _adj[nA].push_back(nB);
-                             _adj[nB].push_back(nA);
-                        }
-                    }
-                }
-            }
-        }
-        */
-    }
 
-    glm::vec3 getPos(int id) const {
-        if (id < _mesh->vertices().size()) return toGlm(_mesh->vertices()[id]);
-        else return _extraNodePositions[id - _mesh->vertices().size()];
-    }
 
-    // [New] Helper to get Normal for ANY node
-    glm::vec3 getNormal(int id) const {
-        if (id < _mesh->vertices().size()) return toGlm(_mesh->normals()[id]);
-        else return _extraNodeNormals[id - _mesh->vertices().size()];
-    }
+
 
     void ComputeExtraNodeCosts() {
         size_t meshSize = _mesh->vertices().size();
-        
-        // 對每個虛擬節點，從其連接的網格頂點計算最小成本
         for (auto& [nodeID, vData] : _vertexData) {
-            if (nodeID < (int)meshSize) continue; // 跳過原始網格頂點
+            if (nodeID < (int)meshSize) continue; 
             
             float minCost = 1e9f;
             int bestParent = -1;
             
-            // 遍歷所有鄰居（應該是網格頂點）
             if (nodeID < (int)_adj.size()) {
                 for (int neighborID : _adj[nodeID]) {
-                    if (neighborID >= (int)meshSize) continue; // 只考慮網格頂點
+                    if (neighborID >= (int)meshSize) continue; 
                     if (_vertexData.find(neighborID) == _vertexData.end()) continue;
                     if (!_vertexData[neighborID].frozen) continue;
                     
-                    // 計算從鄰居到這個虛擬節點的成本
                     float dist = glm::distance(getPos(nodeID), getPos(neighborID));
-                    
-                    // 應用曲率懲罰
                     glm::vec3 nodeN = getNormal(nodeID);
                     glm::vec3 neighborN = getNormal(neighborID);
                     float dotNormal = glm::dot(nodeN, neighborN);
                     
-                    if (dotNormal < 0.3f) continue; // 角度太大則跳過
+                    if (dotNormal < 0.3f) continue; 
                     
                     float penalty = 1.0f + 5.0f * (1.0f - dotNormal);
                     float edgeCost = dist * penalty;
@@ -701,20 +717,17 @@ private:
 
                 float dist = glm::distance(getPos(u), getPos(v));
                 
-                // [關鍵修正] 在 Dijkstra 路徑搜尋時也應用曲率懲罰
-                // 這能防止路徑 "鑽地" (穿透法線差異大的面)
                 glm::vec3 uN = getNormal(u);
                 glm::vec3 vN = getNormal(v);
                 float dotNormal = glm::dot(uN, vN);
                 
-                // [修正] 更嚴格的角度閾值:只允許 < 60° (cos 60° = 0.5)
-                if (dotNormal < 0.85f) continue; 
+                // [關鍵] 稍微放寬角度限制 (從 0.85 -> 0.5) 讓轉角處能連通
+                // 但依賴下方的 penalty 來懲罰不平的捷徑
+                if (dotNormal < 0.5f) continue; 
 
-                // [新增] 檢查邊長異常(可能是錯誤連接)
-                float maxEdgeLength = 0.25f; // 根據場景調整
+                float maxEdgeLength = 0.25f; 
                 if (dist > maxEdgeLength) continue;
 
-                // [修正] 更大的懲罰係數來避免穿透
                 float penalty = 1.0f + 20.0f * (1.0f - dotNormal);
                 float weight = dist * penalty;
                 
@@ -734,6 +747,9 @@ private:
             }
             _dijkstraPath.push_back(startIdx);
             std::reverse(_dijkstraPath.begin(), _dijkstraPath.end());
+            std::cout << "[DEBUG] ComputeDijkstra: Path found with " << _dijkstraPath.size() << " nodes." << std::endl;
+        } else {
+            std::cout << "[DEBUG] ComputeDijkstra: No path found between " << startIdx << " and " << endIdx << "." << std::endl;
         }
     }
 
@@ -749,7 +765,7 @@ private:
     std::set<int> _validTriangleIndicesSet;
     
     std::vector<glm::vec3> _extraNodePositions; 
-    std::vector<glm::vec3> _extraNodeNormals; // [New]
+    std::vector<glm::vec3> _extraNodeNormals; 
 
     float _uvScale = 1.0f;
     float _autoThreshold = 2.5f;
