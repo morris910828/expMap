@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <numeric>
 #include <limits>
+#include <iostream>
 #include <imgui/imgui.h>
+#include "texture.h"
 
 inline glm::vec3 toGlm(const sibr::Vector3f& v) { return glm::vec3(v.x(), v.y(), v.z()); }
 
@@ -221,8 +223,8 @@ public:
                 float dUV_12 = glm::distance(uv1, uv2) / _uvScale; float d3D_12 = glm::distance(p1, p2);
                 float dUV_20 = glm::distance(uv2, uv0) / _uvScale; float d3D_20 = glm::distance(p2, p0);
                 
-                float maxRatio = 2.0f; 
-                float minRatio = 0.5f;
+                // float maxRatio = 2.0f; 
+                // float minRatio = 0.5f;
 
                 // [MOD] Temporarily disable distortion check for debugging
                 // bool distorted = false;
@@ -262,8 +264,39 @@ public:
 
     void RenderUI() {
         ImGui::SetNextWindowSize(ImVec2(400, 450), ImGuiCond_FirstUseEver);
-        if(ImGui::Begin("ExpMap UV Result")) {
+        if(ImGui::Begin("ExpMap UV Result", nullptr, ImGuiWindowFlags_MenuBar)) {
             
+            if (ImGui::BeginMenuBar()) {
+                if (ImGui::BeginMenu("File")) {
+                    if (ImGui::BeginMenu("Load Background")) {
+                        
+                        // [MODIFIED] Hardcoded path to force loading images from D drive
+                        std::string targetDir = "/mnt/d/SGGaussians/SGGaussians/output/texture/";
+                        std::vector<std::string> imageFiles = _textureLoader.scanForImages(targetDir);
+                        
+                        if (imageFiles.empty()) {
+                            ImGui::MenuItem("(No images in output/texture)", NULL, false, false);
+                        } else {
+                            for (const auto& imagePath : imageFiles) {
+                                // Extract filename for display (simple logic to remove path)
+                                std::string displayName = imagePath;
+                                size_t lastSlash = displayName.find_last_of("/\\");
+                                if (lastSlash != std::string::npos) {
+                                    displayName = displayName.substr(lastSlash + 1);
+                                }
+
+                                if (ImGui::MenuItem(displayName.c_str())) {
+                                    _textureLoader.LoadImage(imagePath);
+                                }
+                            }
+                        }
+                        ImGui::EndMenu();
+                    }
+                    ImGui::EndMenu();
+                }
+                ImGui::EndMenuBar();
+            }
+
             if (_displayUVs.empty()) {
                 ImGui::TextColored(ImVec4(1,1,0,1), "Right-click on the mesh to compute UV.");
                 ImGui::End();
@@ -347,7 +380,13 @@ public:
 
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(p, ImVec2(p.x + sz.x, p.y + sz.y), true);
-            dl->AddRectFilled(p, ImVec2(p.x + sz.x, p.y + sz.y), IM_COL32(40, 40, 40, 255));
+
+            const auto& bgTex = _textureLoader.getTexture();
+            if (bgTex && bgTex->handle() != 0) {
+                dl->AddImage((void*)(intptr_t)bgTex->handle(), p, ImVec2(p.x + sz.x, p.y + sz.y), ImVec2(0, 1), ImVec2(1, 0));
+            } else {
+                dl->AddRectFilled(p, ImVec2(p.x + sz.x, p.y + sz.y), IM_COL32(40, 40, 40, 255));
+            }
             
             auto TransformUV = [&](const glm::vec2& uv) -> ImVec2 {
                 float lx = (uv.x - 0.5f) * dim * _viewScale;
@@ -403,8 +442,6 @@ public:
     }
 
 private:
-    // ... existing private members ...
-
     void computeVertexNormals() {
         if (!_mesh || _mesh->vertices().empty() || _mesh->triangles().empty()) {
             std::cerr << "[WARNING] Cannot compute normals: Mesh is invalid or empty." << std::endl;
@@ -638,12 +675,8 @@ private:
         process(_appCloudData, _appCloudFids, _projectedAppPoints);
         process(_geoCloudData, {}, _projectedGeoPoints);
 
-    } // End of ProjectAndInsertClouds function before Neighbor Connection
-
-
-
-
-
+    }
+    
     void ComputeExtraNodeCosts() {
         size_t meshSize = _mesh->vertices().size();
         for (auto& [nodeID, vData] : _vertexData) {
@@ -786,6 +819,8 @@ private:
     int _startNode = -1;
     int _endNode = -1;
     std::vector<int> _dijkstraPath;
+
+    TextureLoader _textureLoader;
 };
 
 #endif
