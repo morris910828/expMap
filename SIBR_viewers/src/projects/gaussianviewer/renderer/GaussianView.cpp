@@ -10,7 +10,14 @@
  */
 
 #include <projects/gaussianviewer/renderer/GaussianView.hpp>
+#include <core/graphics/Image.hpp>
 #include <core/graphics/GUI.hpp>
+#include <iostream>
+#include <vector>
+#include <map>
+#include <glm/glm.hpp>
+#include <core/graphics/Image.hpp>
+#include <core/graphics/Texture.hpp>
 #include <thread>
 #include <boost/asio.hpp>
 #include <rasterizer.h>
@@ -374,12 +381,15 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint
 	}
 	else if (sh_degree == 3)
 	{
-		count = loadPly<3>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
-	}
-
-	_boxmin = _scenemin;
-	_boxmax = _scenemax;
-
+			count = loadPly<3>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+		}
+		
+		for (int k = 0; k < count; ++k) {
+		    _pos_to_idx_map[pos[k]] = k;
+		}
+		
+		_boxmin = _scenemin;
+		_boxmax = _scenemax;
 	int P = count;
 
 	// Allocate and fill the GPU data
@@ -629,6 +639,97 @@ void sibr::GaussianView::onGUI()
 		ImGui::Checkbox("Don't show this message again", _dontshow);
 		ImGui::EndPopup();
 	}
+}
+
+
+void sibr::GaussianView::applyTexture(const sibr::Texture2DRGBA& texture, const std::map<sibr::Vector3f, glm::vec2>& pos_uv_map)
+{
+	std::cout << "[GaussianView] Applying texture..." << std::endl;
+	if (pos_uv_map.empty() || count == 0) {
+		std::cout << "[GaussianView] ERROR: Position-UV map is empty or Gaussian count is zero." << std::endl;
+		return;
+	}
+
+	// --- 1. Download SH data from GPU to CPU ---
+	const int sh_components = (_sh_degree + 1) * (_sh_degree + 1);
+	const int sh_stride = sh_components * 3;
+	const size_t shs_total_size_bytes = (size_t)count * sh_stride * sizeof(float);
+
+	std::vector<float> shs_cpu(count * sh_stride);
+	cudaError_t err = cudaMemcpy(shs_cpu.data(), shs_cuda, shs_total_size_bytes, cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess) {
+		std::cerr << "[GaussianView] ERROR: Failed to copy SH data from device to host: " << cudaGetErrorString(err) << std::endl;
+		return;
+	}
+
+	// --- 2. Access Texture Data on CPU ---
+	auto cpuImg = texture.readBack();	
+	
+	if (cpuImg.data() == nullptr) {
+		std::cerr << "[GaussianView] ERROR: Failed to read texture data back to CPU." << std::endl;
+		return;
+	}
+	const unsigned char* texture_data = cpuImg.data();
+	const int tex_w = cpuImg.w();
+	const int tex_h = cpuImg.h();
+	
+	// [FIXED] sibr::ImageRGBA (Image<uchar, 4>) has fixed 4 channels, no .channels() method
+	const int tex_channels = 4; 
+
+	if (tex_channels < 3) {
+		std::cerr << "[GaussianView] ERROR: Texture must have at least 3 channels (RGB)." << std::endl;
+		return;
+	}
+
+	std::cout << "[GaussianView] Modifying " << pos_uv_map.size() << " points..." << std::endl;
+
+	// --- 3. Modify SH data on CPU ---
+	const float SH_C0 = 0.28209479177387814f;
+
+	for (const auto& pair : pos_uv_map) {
+		const sibr::Vector3f& point_pos = pair.first;
+		const glm::vec2& uv = pair.second;
+
+		auto it = _pos_to_idx_map.find(point_pos);
+		if (it == _pos_to_idx_map.end()) {
+			// Point position not found in the Gaussian set, skip it
+			continue;
+		}
+		int gaussian_index = it->second;
+
+		// UV to Pixel Coords (with vertical flip)
+		int px = static_cast<int>(uv.x * tex_w);
+		int py = static_cast<int>((1.0f - uv.y) * tex_h);
+
+		// Clamp coordinates to be safe
+		px = std::max(0, std::min(tex_w - 1, px));
+		py = std::max(0, std::min(tex_h - 1, py));
+
+		// Sample Texture
+		int pixel_offset = (py * tex_w + px) * tex_channels;
+		unsigned char r = texture_data[pixel_offset + 0];
+		unsigned char g = texture_data[pixel_offset + 1];
+		unsigned char b = texture_data[pixel_offset + 2];
+
+		// Color Conversion (RGB to SH DC component)
+		glm::vec3 color_rgb(r / 255.0f, g / 255.0f, b / 255.0f);
+		glm::vec3 color_sh_dc = (color_rgb - 0.5f) / SH_C0;
+
+		// Modify Attribute (f_dc only)
+		int sh_offset = gaussian_index * sh_stride;
+		shs_cpu[sh_offset + 0] = color_sh_dc.x;
+		shs_cpu[sh_offset + 1] = color_sh_dc.y;
+		shs_cpu[sh_offset + 2] = color_sh_dc.z;
+	}
+
+	// --- 4. Upload modified SH data from CPU to GPU ---
+	err = cudaMemcpy(shs_cuda, shs_cpu.data(), shs_total_size_bytes, cudaMemcpyHostToDevice);
+	if (err != cudaSuccess) {
+		std::cerr << "[GaussianView] ERROR: Failed to copy SH data from host to device: " << cudaGetErrorString(err) << std::endl;
+		return;
+	}
+
+	std::cout << "[GaussianView] Texture applied successfully. GPU data updated." << std::endl;
 }
 
 sibr::GaussianView::~GaussianView()

@@ -230,6 +230,35 @@ public:
 
     void onUpdate(Input& input, const Viewport& viewport) override {
         _gaussianView->onUpdate(input);
+
+        // Check for texture apply trigger
+        if (_expMapSolver.isApplyTextureTriggered()) {
+            _expMapSolver.clearApplyTextureTrigger(); // Reset trigger immediately
+
+            // [FIXED] Changed from sibr::Texture* to sibr::Texture2DRGBA*
+            const sibr::Texture2DRGBA* tex = _expMapSolver.getTexture();
+            const auto& uvMap_from_solver = _expMapSolver.getUVs();
+
+            if (tex && !uvMap_from_solver.empty()) {
+                std::cout << "[MeshGaussianView] Apply texture triggered." << std::endl;
+
+                std::map<sibr::Vector3f, glm::vec2> pos_uv_map;
+                for (const auto& pair : uvMap_from_solver) {
+                    int point_id_from_solver = pair.first;
+                    const glm::vec2& uv = pair.second;
+
+                    // Get the 3D position corresponding to this solver ID
+                    glm::vec3 pos_glm = _expMapSolver.getPos(point_id_from_solver);
+                    sibr::Vector3f pos_sibr(pos_glm.x, pos_glm.y, pos_glm.z);
+                    pos_uv_map[pos_sibr] = uv;
+                }
+
+                _gaussianView->applyTexture(*tex, pos_uv_map);
+            } else {
+                std::cerr << "[MeshGaussianView] ERROR: Texture or UV map is not available for application." << std::endl;
+            }
+        }
+
         // 右鍵點擊觸發計算
         if (input.mouseButton().isReleased(sibr::Mouse::Right) && !ImGui::GetIO().WantCaptureMouse) {
             PerformRaycast(input, viewport);
@@ -290,26 +319,24 @@ public:
         // 3. 畫 3D 空間中的最短路徑 (紅色)
         const auto& dijkstraPath = _expMapSolver.GetDijkstraPath();
         if (!dijkstraPath.empty() && _mesh) {
-            // std::cout << "[DEBUG] Drawing Dijkstra path with " << dijkstraPath.size() << " nodes." << std::endl;
-            glUseProgram(0); // Ensure no shader is active
+            glUseProgram(0); 
             glMatrixMode(GL_PROJECTION);
             glLoadMatrixf(eye.proj().data());
             glMatrixMode(GL_MODELVIEW);
             glLoadMatrixf(eye.view().data());
 
-            glLineWidth(5.0f); // Make the path thicker
+            glLineWidth(5.0f); 
             glColor3f(1.0f, 0.0f, 0.0f); // Red color
 
-            glDisable(GL_DEPTH_TEST); // Disable depth test for the path to always draw on top
-            glBegin(GL_LINE_STRIP); // Use LINE_STRIP to connect sequential points
+            glDisable(GL_DEPTH_TEST); // Always on top
+            glBegin(GL_LINE_STRIP); 
             for (int nodeId : dijkstraPath) {
-                // Need to use ExpMapSolver's getPos because nodeId can be an extraNode (projected point)
                 glm::vec3 pos = _expMapSolver.getPos(nodeId); 
                 glVertex3f(pos.x, pos.y, pos.z);
             }
             glEnd();
-            glEnable(GL_DEPTH_TEST); // Re-enable depth test for subsequent rendering (if any)
-            glLineWidth(1.0f); // Reset line width
+            glEnable(GL_DEPTH_TEST); 
+            glLineWidth(1.0f); 
         }
 
         dst.unbind();

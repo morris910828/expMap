@@ -13,6 +13,9 @@
 # include "Config.hpp"
 # include <core/renderer/RenderMaskHolder.hpp>
 # include <core/scene/BasicIBRScene.hpp>
+# include <core/graphics/Texture.hpp>
+# include <glm/glm.hpp>
+# include <map>
 # include <core/system/SimpleTimer.hpp>
 # include <core/system/Config.hpp>
 # include <core/graphics/Mesh.hpp>
@@ -76,6 +79,8 @@ namespace sibr {
 		 */
 		void onGUI() override;
 
+		void applyTexture(const sibr::Texture2DRGBA& texture, const std::map<sibr::Vector3f, glm::vec2>& pos_uv_map);
+
 		/** \return a reference to the scene */
 		const std::shared_ptr<sibr::BasicIBRScene> & getScene() const { return _scene; }
 
@@ -89,6 +94,7 @@ namespace sibr {
 		bool _antialiasing = false;
 		bool _cropping = false;
 		sibr::Vector3f _boxmin, _boxmax, _scenemin, _scenemax;
+		std::map<sibr::Vector3f, int> _pos_to_idx_map;
 		char _buff[512] = "cropped.ply";
 
 		bool _fastCulling = true;

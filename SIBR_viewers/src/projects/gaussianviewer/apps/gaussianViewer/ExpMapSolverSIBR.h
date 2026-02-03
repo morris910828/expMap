@@ -78,9 +78,16 @@ public:
     // Public methods
     const std::vector<int>& GetDijkstraPath() const { return _dijkstraPath; }
 
-
-    void Init(const sibr::Mesh* mesh) {
-        _mesh = mesh;
+    bool isApplyTextureTriggered() const { return _applyTextureTrigger; }
+    void clearApplyTextureTrigger() { _applyTextureTrigger = false; }
+    const sibr::Texture2DRGBA* getTexture() const {
+        return _textureLoader.getTexture().get();
+    }
+            const std::map<int, glm::vec2>& getUVs() const {
+                return _displayUVs;
+            }
+        
+            void Init(const sibr::Mesh* mesh) {        _mesh = mesh;
         buildBaseAdjacency();
 
         // Check if normals are all zero and compute if necessary
@@ -312,9 +319,13 @@ public:
 
             ImGui::SameLine();
             if (ImGui::Button("Reset View")) { _viewScale = 1.0f; _viewOffset = ImVec2(0,0); }
-            
-            ImGui::Checkbox("Fill", &_drawFilled);
-            ImGui::SameLine();
+
+                        ImGui::SameLine();
+                                                if (ImGui::Button("Apply Texture")) {
+                                                    _applyTextureTrigger = true;
+                                                }
+                                                
+                                                ImGui::Checkbox("Fill", &_drawFilled);            ImGui::SameLine();
             ImGui::Checkbox("Cull", &_cullBackFace);
             ImGui::Checkbox("Show App", &_showAppPoints);
             ImGui::SameLine();
@@ -821,6 +832,7 @@ private:
     std::vector<int> _dijkstraPath;
 
     TextureLoader _textureLoader;
+    bool _applyTextureTrigger = false;
 };
 
 #endif
