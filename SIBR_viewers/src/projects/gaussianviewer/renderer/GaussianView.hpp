@@ -13,9 +13,6 @@
 # include "Config.hpp"
 # include <core/renderer/RenderMaskHolder.hpp>
 # include <core/scene/BasicIBRScene.hpp>
-# include <core/graphics/Texture.hpp>
-# include <glm/glm.hpp>
-# include <map>
 # include <core/system/SimpleTimer.hpp>
 # include <core/system/Config.hpp>
 # include <core/graphics/Mesh.hpp>
@@ -40,8 +37,9 @@ namespace sibr {
 	class BufferCopyRenderer2;
 
 	/**
-	 * \class RemotePointView
-	 * \brief Wrap a ULR renderer with additional parameters and information.
+	 * \class GaussianView
+	 * \brief Renders 3D Gaussian splats. Does NOT draw overlay points;
+	 *        overlay point rendering is handled by MeshGaussianView in main.cpp.
 	 */
 	class SIBR_EXP_ULR_EXPORT GaussianView : public sibr::ViewBase
 	{
@@ -49,39 +47,16 @@ namespace sibr {
 
 	public:
 
-		/**
-		 * Constructor
-		 * \param ibrScene The scene to use for rendering.
-		 * \param render_w rendering width
-		 * \param render_h rendering height
-		 */
-		GaussianView(const sibr::BasicIBRScene::Ptr& ibrScene, uint render_w, uint render_h, const char* file, bool* message_read, int sh_degree, bool white_bg = false, bool useInterop = true, int device = 0);
+		GaussianView(const sibr::BasicIBRScene::Ptr& ibrScene, uint render_w, uint render_h,
+		             const char* file, bool* message_read, int sh_degree,
+		             bool white_bg = false, bool useInterop = true, int device = 0);
 
-		/** Replace the current scene.
-		 *\param newScene the new scene to render */
 		void setScene(const sibr::BasicIBRScene::Ptr & newScene);
 
-		/**
-		 * Perform rendering. Called by the view manager or rendering mode.
-		 * \param dst The destination rendertarget.
-		 * \param eye The novel viewpoint.
-		 */
 		void onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camera& eye) override;
-
-		/**
-		 * Update inputs (do nothing).
-		 * \param input The inputs state.
-		 */
 		void onUpdate(Input& input) override;
-
-		/**
-		 * Update the GUI.
-		 */
 		void onGUI() override;
 
-		void applyTexture(const sibr::Texture2DRGBA& texture, const std::map<sibr::Vector3f, glm::vec2>& pos_uv_map);
-
-		/** \return a reference to the scene */
 		const std::shared_ptr<sibr::BasicIBRScene> & getScene() const { return _scene; }
 
 		virtual ~GaussianView() override;
@@ -94,7 +69,6 @@ namespace sibr {
 		bool _antialiasing = false;
 		bool _cropping = false;
 		sibr::Vector3f _boxmin, _boxmax, _scenemin, _scenemax;
-		std::map<sibr::Vector3f, int> _pos_to_idx_map;
 		char _buff[512] = "cropped.ply";
 
 		bool _fastCulling = true;
@@ -129,11 +103,10 @@ namespace sibr {
 		float* fallbackBufferCuda = nullptr;
 		bool accepted = false;
 
-
-		std::shared_ptr<sibr::BasicIBRScene> _scene; ///< The current scene.
+		std::shared_ptr<sibr::BasicIBRScene> _scene;
 		PointBasedRenderer::Ptr _pointbasedrenderer;
 		BufferCopyRenderer* _copyRenderer;
 		GaussianSurfaceRenderer* _gaussianRenderer;
 	};
 
-} /*namespace sibr*/ 
+} /*namespace sibr*/

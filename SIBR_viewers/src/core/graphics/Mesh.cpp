@@ -634,7 +634,7 @@ namespace sibr
 	{
 		// Does the file exist?
 	
-		std::string fname = dataset_path + "/points3D.bin";
+		std::string fname = dataset_path + "points3D.bin";
 
 		std::cerr << "LOADSFM: Try to open " << fname << std::endl;
 

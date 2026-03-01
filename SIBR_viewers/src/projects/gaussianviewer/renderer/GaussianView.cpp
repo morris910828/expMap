@@ -10,21 +10,12 @@
  */
 
 #include <projects/gaussianviewer/renderer/GaussianView.hpp>
-#include <core/graphics/Image.hpp>
 #include <core/graphics/GUI.hpp>
-#include <iostream>
-#include <vector>
-#include <map>
-#include <glm/glm.hpp>
-#include <core/graphics/Image.hpp>
-#include <core/graphics/Texture.hpp>
 #include <thread>
 #include <boost/asio.hpp>
 #include <rasterizer.h>
 #include <imgui_internal.h>
 
-// Define the types and sizes that make up the contents of each Gaussian 
-// in the trained model.
 typedef sibr::Vector3f Pos;
 template<int D>
 struct SHs
@@ -72,7 +63,6 @@ SIBR_ERR << cudaGetErrorString(cudaGetLastError());
 # define CUDA_SAFE_CALL(A) A
 #endif
 
-// Load the Gaussians from the given file.
 template<int D>
 int loadPly(const char* filename,
 	std::vector<Pos>& pos,
@@ -88,7 +78,6 @@ int loadPly(const char* filename,
 	if (!infile.good())
 		SIBR_ERR << "Unable to find model's PLY file, attempted:\n" << filename << std::endl;
 
-	// "Parse" header (it has to be a specific format anyway)
 	std::string buff;
 	std::getline(infile, buff);
 	std::getline(infile, buff);
@@ -99,28 +88,21 @@ int loadPly(const char* filename,
 	int count;
 	ss >> dummy >> dummy >> count;
 
-	// Output number of Gaussians contained
 	SIBR_LOG << "Loading " << count << " Gaussian splats" << std::endl;
 
 	while (std::getline(infile, buff))
 		if (buff.compare("end_header") == 0)
 			break;
 
-	// Read all Gaussians at once (AoS)
 	std::vector<RichPoint<D>> points(count);
 	infile.read((char*)points.data(), count * sizeof(RichPoint<D>));
 
-	// Resize our SoA data
 	pos.resize(count);
 	shs.resize(count);
 	scales.resize(count);
 	rot.resize(count);
 	opacities.resize(count);
 
-	// Gaussians are done training, they won't move anymore. Arrange
-	// them according to 3D Morton order. This means better cache
-	// behavior for reading Gaussians that end up in the same tile 
-	// (close in 3D --> close in 2D).
 	minn = sibr::Vector3f(FLT_MAX, FLT_MAX, FLT_MAX);
 	maxx = -minn;
 	for (int i = 0; i < count; i++)
@@ -145,19 +127,17 @@ int loadPly(const char* filename,
 		mapp[i].first = code;
 		mapp[i].second = i;
 	}
-	auto sorter = [](const std::pair < uint64_t, int>& a, const std::pair < uint64_t, int>& b) {
+	auto sorter = [](const std::pair<uint64_t, int>& a, const std::pair<uint64_t, int>& b) {
 		return a.first < b.first;
 	};
 	std::sort(mapp.begin(), mapp.end(), sorter);
 
-	// Move data from AoS to SoA
 	int SH_N = (D + 1) * (D + 1);
 	for (int k = 0; k < count; k++)
 	{
 		int i = mapp[k].second;
 		pos[k] = points[i].pos;
 
-		// Normalize quaternion
 		float length2 = 0;
 		for (int j = 0; j < 4; j++)
 			length2 += points[i].rot.rot[j] * points[i].rot.rot[j];
@@ -165,11 +145,9 @@ int loadPly(const char* filename,
 		for (int j = 0; j < 4; j++)
 			rot[k].rot[j] = points[i].rot.rot[j] / length;
 
-		// Exponentiate scale
 		for(int j = 0; j < 3; j++)
 			scales[k].scale[j] = exp(points[i].scale.scale[j]);
 
-		// Activate alpha
 		opacities[k] = sigmoid(points[i].opacity);
 
 		shs[k].shs[0] = points[i].shs.shs[0];
@@ -194,9 +172,8 @@ void savePly(const char* filename,
 	const sibr::Vector3f& minn,
 	const sibr::Vector3f& maxx)
 {
-	// Read all Gaussians at once (AoS)
 	int count = 0;
-	for (int i = 0; i < pos.size(); i++)
+	for (int i = 0; i < (int)pos.size(); i++)
 	{
 		if (pos[i].x() < minn.x() || pos[i].y() < minn.y() || pos[i].z() < minn.z() ||
 			pos[i].x() > maxx.x() || pos[i].y() > maxx.y() || pos[i].z() > maxx.z())
@@ -205,14 +182,13 @@ void savePly(const char* filename,
 	}
 	std::vector<RichPoint<3>> points(count);
 
-	// Output number of Gaussians contained
 	SIBR_LOG << "Saving " << count << " Gaussian splats" << std::endl;
 
 	std::ofstream outfile(filename, std::ios_base::binary);
 
 	outfile << "ply\nformat binary_little_endian 1.0\nelement vertex " << count << "\n";
 
-	std::string props1[] = { "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"};
+	std::string props1[] = { "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2" };
 	std::string props2[] = { "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3" };
 
 	for (auto s : props1)
@@ -224,24 +200,22 @@ void savePly(const char* filename,
 	outfile << "end_header" << std::endl;
 
 	count = 0;
-	for (int i = 0; i < pos.size(); i++)
+	for (int i = 0; i < (int)pos.size(); i++)
 	{
 		if (pos[i].x() < minn.x() || pos[i].y() < minn.y() || pos[i].z() < minn.z() ||
 			pos[i].x() > maxx.x() || pos[i].y() > maxx.y() || pos[i].z() > maxx.z())
 			continue;
 		points[count].pos = pos[i];
 		points[count].rot = rot[i];
-		// Exponentiate scale
 		for (int j = 0; j < 3; j++)
 			points[count].scale.scale[j] = log(scales[i].scale[j]);
-		// Activate alpha
 		points[count].opacity = inverse_sigmoid(opacities[i]);
 		points[count].shs.shs[0] = shs[i].shs[0];
 		points[count].shs.shs[1] = shs[i].shs[1];
 		points[count].shs.shs[2] = shs[i].shs[2];
 		for (int j = 1; j < 16; j++)
 		{
-			points[count].shs.shs[(j - 1) + 3] = shs[i].shs[j * 3 + 0];
+			points[count].shs.shs[(j - 1) + 3]  = shs[i].shs[j * 3 + 0];
 			points[count].shs.shs[(j - 1) + 18] = shs[i].shs[j * 3 + 1];
 			points[count].shs.shs[(j - 1) + 33] = shs[i].shs[j * 3 + 2];
 		}
@@ -252,20 +226,14 @@ void savePly(const char* filename,
 
 namespace sibr
 {
-	// A simple copy renderer class. Much like the original, but this one
-	// reads from a buffer instead of a texture and blits the result to
-	// a render target. 
 	class BufferCopyRenderer
 	{
-
 	public:
-
 		BufferCopyRenderer()
 		{
 			_shader.init("CopyShader",
 				sibr::loadFile(sibr::getShadersDirectory("gaussian") + "/copy.vert"),
 				sibr::loadFile(sibr::getShadersDirectory("gaussian") + "/copy.frag"));
-
 			_flip.init(_shader, "flip");
 			_width.init(_shader, "width");
 			_height.init(_shader, "height");
@@ -285,26 +253,21 @@ namespace sibr
 
 			dst.clear();
 			dst.bind();
-
 			glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bufferID);
-
 			sibr::RenderUtility::renderScreenQuad();
-
 			dst.unbind();
 			_shader.end();
 		}
 
-		/** \return option to flip the texture when copying. */
 		bool& flip() { return _flip.get(); }
 		int& width() { return _width.get(); }
 		int& height() { return _height.get(); }
 
 	private:
-
-		GLShader			_shader; 
-		GLuniform<bool>		_flip = false; ///< Flip the texture when copying.
-		GLuniform<int>		_width = 1000;
-		GLuniform<int>		_height = 800;
+		GLShader         _shader;
+		GLuniform<bool>  _flip = false;
+		GLuniform<int>   _width = 1000;
+		GLuniform<int>   _height = 800;
 	};
 }
 
@@ -322,11 +285,20 @@ std::function<char* (size_t N)> resizeFunctional(void** ptr, size_t& S) {
 	return lambda;
 }
 
-sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint render_w, uint render_h, const char* file, bool* messageRead, int sh_degree, bool white_bg, bool useInterop, int device) :
-	_scene(ibrScene),
-	_dontshow(messageRead),
-	_sh_degree(sh_degree),
-	sibr::ViewBase(render_w, render_h)
+// Constructor: no geo_file / app_file parameters.
+// Point loading and rendering is handled entirely by MeshGaussianView in main.cpp.
+sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene,
+	uint render_w, uint render_h,
+	const char* file,
+	bool* messageRead,
+	int sh_degree,
+	bool white_bg,
+	bool useInterop,
+	int device)
+	: _scene(ibrScene),
+	  _dontshow(messageRead),
+	  _sh_degree(sh_degree),
+	  sibr::ViewBase(render_w, render_h)
 {
 	int num_devices;
 	CUDA_SAFE_CALL_ALWAYS(cudaGetDeviceCount(&num_devices));
@@ -342,9 +314,7 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint
 	cudaDeviceProp prop;
 	CUDA_SAFE_CALL_ALWAYS(cudaGetDeviceProperties(&prop, device));
 	if (prop.major < 7)
-	{
 		SIBR_ERR << "Sorry, need at least compute capability 7.0+!";
-	}
 
 	_pointbasedrenderer.reset(new PointBasedRenderer());
 	_copyRenderer = new BufferCopyRenderer();
@@ -354,67 +324,49 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint
 
 	std::vector<uint> imgs_ulr;
 	const auto & cams = ibrScene->cameras()->inputCameras();
-	for(size_t cid = 0; cid < cams.size(); ++cid) {
-		if(cams[cid]->isActive()) {
+	for(size_t cid = 0; cid < cams.size(); ++cid)
+		if(cams[cid]->isActive())
 			imgs_ulr.push_back(uint(cid));
-		}
-	}
 	_scene->cameras()->debugFlagCameraAsUsed(imgs_ulr);
 
-	// Load the PLY data (AoS) to the GPU (SoA)
+	// Load PLY
 	std::vector<Pos> pos;
 	std::vector<Rot> rot;
 	std::vector<Scale> scale;
 	std::vector<float> opacity;
 	std::vector<SHs<3>> shs;
-	if (sh_degree == 0)
-	{
-		count = loadPly<0>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
-	}
-	else if (sh_degree == 1)
-	{
-		count = loadPly<1>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
-	}
-	else if (sh_degree == 2)
-	{
-		count = loadPly<2>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
-	}
-	else if (sh_degree == 3)
-	{
-			count = loadPly<3>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
-		}
-		
-		for (int k = 0; k < count; ++k) {
-		    _pos_to_idx_map[pos[k]] = k;
-		}
-		
-		_boxmin = _scenemin;
-		_boxmax = _scenemax;
+
+	if      (sh_degree == 0) count = loadPly<0>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+	else if (sh_degree == 1) count = loadPly<1>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+	else if (sh_degree == 2) count = loadPly<2>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+	else                     count = loadPly<3>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+
+	_boxmin = _scenemin;
+	_boxmax = _scenemax;
+
 	int P = count;
 
-	// Allocate and fill the GPU data
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&pos_cuda, sizeof(Pos) * P));
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(pos_cuda, pos.data(), sizeof(Pos) * P, cudaMemcpyHostToDevice));
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&rot_cuda, sizeof(Rot) * P));
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(rot_cuda, rot.data(), sizeof(Rot) * P, cudaMemcpyHostToDevice));
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&shs_cuda, sizeof(SHs<3>) * P));
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(shs_cuda, shs.data(), sizeof(SHs<3>) * P, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&pos_cuda,     sizeof(Pos)   * P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(pos_cuda,     pos.data(),     sizeof(Pos)   * P, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&rot_cuda,     sizeof(Rot)   * P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(rot_cuda,     rot.data(),     sizeof(Rot)   * P, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&shs_cuda,     sizeof(SHs<3>)* P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(shs_cuda,     shs.data(),     sizeof(SHs<3>)* P, cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&opacity_cuda, sizeof(float) * P));
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(opacity_cuda, opacity.data(), sizeof(float) * P, cudaMemcpyHostToDevice));
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&scale_cuda, sizeof(Scale) * P));
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(scale_cuda, scale.data(), sizeof(Scale) * P, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&scale_cuda,   sizeof(Scale) * P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(scale_cuda,   scale.data(),   sizeof(Scale) * P, cudaMemcpyHostToDevice));
 
-	// Create space for view parameters
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&view_cuda, sizeof(sibr::Matrix4f)));
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&proj_cuda, sizeof(sibr::Matrix4f)));
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&cam_pos_cuda, 3 * sizeof(float)));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&view_cuda,       sizeof(sibr::Matrix4f)));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&proj_cuda,       sizeof(sibr::Matrix4f)));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&cam_pos_cuda,    3 * sizeof(float)));
 	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&background_cuda, 3 * sizeof(float)));
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&rect_cuda, 2 * P * sizeof(int)));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&rect_cuda,       2 * P * sizeof(int)));
 
 	float bg[3] = { white_bg ? 1.f : 0.f, white_bg ? 1.f : 0.f, white_bg ? 1.f : 0.f };
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(background_cuda, bg, 3 * sizeof(float), cudaMemcpyHostToDevice));
 
-	gData = new GaussianData(P, 
+	gData = new GaussianData(P,
 		(float*)pos.data(),
 		(float*)rot.data(),
 		(float*)scale.data(),
@@ -423,16 +375,13 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint
 
 	_gaussianRenderer = new GaussianSurfaceRenderer();
 
-	// Create GL buffer ready for CUDA/GL interop
 	glCreateBuffers(1, &imageBuffer);
 	glNamedBufferStorage(imageBuffer, render_w * render_h * 3 * sizeof(float), nullptr, GL_DYNAMIC_STORAGE_BIT);
 
 	if (useInterop)
 	{
 		if (cudaPeekAtLastError() != cudaSuccess)
-		{
-			SIBR_ERR << "A CUDA error occurred in setup:" << cudaGetErrorString(cudaGetLastError()) << ". Please rerun in Debug to find the exact line!";
-		}
+			SIBR_ERR << "A CUDA error occurred in setup:" << cudaGetErrorString(cudaGetLastError());
 		cudaGraphicsGLRegisterBuffer(&imageBufferCuda, imageBuffer, cudaGraphicsRegisterFlagsWriteDiscard);
 		useInterop &= (cudaGetLastError() == cudaSuccess);
 	}
@@ -443,23 +392,19 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint
 		_interop_failed = true;
 	}
 
-	geomBufferFunc = resizeFunctional(&geomPtr, allocdGeom);
+	geomBufferFunc    = resizeFunctional(&geomPtr,    allocdGeom);
 	binningBufferFunc = resizeFunctional(&binningPtr, allocdBinning);
-	imgBufferFunc = resizeFunctional(&imgPtr, allocdImg);
+	imgBufferFunc     = resizeFunctional(&imgPtr,     allocdImg);
 }
 
 void sibr::GaussianView::setScene(const sibr::BasicIBRScene::Ptr & newScene)
 {
 	_scene = newScene;
-
-	// Tell the scene we are a priori using all active cameras.
 	std::vector<uint> imgs_ulr;
 	const auto & cams = newScene->cameras()->inputCameras();
-	for (size_t cid = 0; cid < cams.size(); ++cid) {
-		if (cams[cid]->isActive()) {
+	for (size_t cid = 0; cid < cams.size(); ++cid)
+		if (cams[cid]->isActive())
 			imgs_ulr.push_back(uint(cid));
-		}
-	}
 	_scene->cameras()->debugFlagCameraAsUsed(imgs_ulr);
 }
 
@@ -475,26 +420,22 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget & dst, const sibr::Came
 	}
 	else
 	{
-		// Convert view and projection to target coordinate system
 		auto view_mat = eye.view();
 		auto proj_mat = eye.viewproj();
 		view_mat.row(1) *= -1;
 		view_mat.row(2) *= -1;
 		proj_mat.row(1) *= -1;
 
-		// Compute additional view parameters
 		float tan_fovy = tan(eye.fovy() * 0.5f);
 		float tan_fovx = tan_fovy * eye.aspect();
 
-		// Copy frame-dependent data to GPU
-		CUDA_SAFE_CALL(cudaMemcpy(view_cuda, view_mat.data(), sizeof(sibr::Matrix4f), cudaMemcpyHostToDevice));
-		CUDA_SAFE_CALL(cudaMemcpy(proj_cuda, proj_mat.data(), sizeof(sibr::Matrix4f), cudaMemcpyHostToDevice));
-		CUDA_SAFE_CALL(cudaMemcpy(cam_pos_cuda, &eye.position(), sizeof(float) * 3, cudaMemcpyHostToDevice));
+		CUDA_SAFE_CALL(cudaMemcpy(view_cuda,    view_mat.data(),    sizeof(sibr::Matrix4f), cudaMemcpyHostToDevice));
+		CUDA_SAFE_CALL(cudaMemcpy(proj_cuda,    proj_mat.data(),    sizeof(sibr::Matrix4f), cudaMemcpyHostToDevice));
+		CUDA_SAFE_CALL(cudaMemcpy(cam_pos_cuda, &eye.position(),    sizeof(float) * 3,      cudaMemcpyHostToDevice));
 
 		float* image_cuda = nullptr;
 		if (!_interop_failed)
 		{
-			// Map OpenGL buffer resource for use with CUDA
 			size_t bytes;
 			CUDA_SAFE_CALL(cudaGraphicsMapResources(1, &imageBufferCuda));
 			CUDA_SAFE_CALL(cudaGraphicsResourceGetMappedPointer((void**)&image_cuda, &bytes, imageBufferCuda));
@@ -504,42 +445,25 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget & dst, const sibr::Came
 			image_cuda = fallbackBufferCuda;
 		}
 
-		// Rasterize
-		int* rects = _fastCulling ? rect_cuda : nullptr;
-		float* boxmin = _cropping ? (float*)&_boxmin : nullptr;
-		float* boxmax = _cropping ? (float*)&_boxmax : nullptr;
+		int* rects   = _fastCulling ? rect_cuda          : nullptr;
+		float* boxmin = _cropping   ? (float*)&_boxmin   : nullptr;
+		float* boxmax = _cropping   ? (float*)&_boxmax   : nullptr;
+
 		CudaRasterizer::Rasterizer::forward(
-			geomBufferFunc,
-			binningBufferFunc,
-			imgBufferFunc,
+			geomBufferFunc, binningBufferFunc, imgBufferFunc,
 			count, _sh_degree, 16,
 			background_cuda,
 			_resolution.x(), _resolution.y(),
-			pos_cuda,
-			shs_cuda,
-			nullptr,
-			opacity_cuda,
-			scale_cuda,
-			_scalingModifier,
-			rot_cuda,
-			nullptr,
-			view_cuda,
-			proj_cuda,
-			cam_pos_cuda,
-			tan_fovx,
-			tan_fovy,
-			false,
-			image_cuda,
-			_antialiasing,
-			nullptr,
-			rects,
-			boxmin,
-			boxmax
+			pos_cuda, shs_cuda, nullptr, opacity_cuda, scale_cuda,
+			_scalingModifier, rot_cuda, nullptr,
+			view_cuda, proj_cuda, cam_pos_cuda,
+			tan_fovx, tan_fovy,
+			false, image_cuda, _antialiasing,
+			nullptr, rects, boxmin, boxmax
 		);
 
 		if (!_interop_failed)
 		{
-			// Unmap OpenGL resource for use with OpenGL
 			CUDA_SAFE_CALL(cudaGraphicsUnmapResources(1, &imageBufferCuda));
 		}
 		else
@@ -547,14 +471,13 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget & dst, const sibr::Came
 			CUDA_SAFE_CALL(cudaMemcpy(fallback_bytes.data(), fallbackBufferCuda, fallback_bytes.size(), cudaMemcpyDeviceToHost));
 			glNamedBufferSubData(imageBuffer, 0, fallback_bytes.size(), fallback_bytes.data());
 		}
-		// Copy image contents to framebuffer
+
+		// Blit splat pixels to framebuffer. No overlay points are drawn here.
 		_copyRenderer->process(imageBuffer, dst, _resolution.x(), _resolution.y());
 	}
 
 	if (cudaPeekAtLastError() != cudaSuccess)
-	{
-		SIBR_ERR << "A CUDA error occurred during rendering:" << cudaGetErrorString(cudaGetLastError()) << ". Please rerun in Debug to find the exact line!";
-	}
+		SIBR_ERR << "A CUDA error occurred during rendering:" << cudaGetErrorString(cudaGetLastError());
 }
 
 void sibr::GaussianView::onUpdate(Input & input)
@@ -563,29 +486,24 @@ void sibr::GaussianView::onUpdate(Input & input)
 
 void sibr::GaussianView::onGUI()
 {
-	// Generate and update UI elements
 	const std::string guiName = "3D Gaussians";
-	if (ImGui::Begin(guiName.c_str())) 
+	if (ImGui::Begin(guiName.c_str()))
 	{
 		if (ImGui::BeginCombo("Render Mode", currMode.c_str()))
 		{
-			if (ImGui::Selectable("Splats"))
-				currMode = "Splats";
-			if (ImGui::Selectable("Initial Points"))
-				currMode = "Initial Points";
-			if (ImGui::Selectable("Ellipsoids"))
-				currMode = "Ellipsoids";
+			if (ImGui::Selectable("Splats"))      currMode = "Splats";
+			if (ImGui::Selectable("Initial Points")) currMode = "Initial Points";
+			if (ImGui::Selectable("Ellipsoids"))  currMode = "Ellipsoids";
 			ImGui::EndCombo();
 		}
 	}
 	if (currMode == "Splats")
-	{
 		ImGui::SliderFloat("Scaling Modifier", &_scalingModifier, 0.001f, 1.0f);
-	}
-	ImGui::Checkbox("Fast culling", &_fastCulling);
-	ImGui::Checkbox("Antialiasing", &_antialiasing);
 
-	ImGui::Checkbox("Crop Box", &_cropping);
+	ImGui::Checkbox("Fast culling",  &_fastCulling);
+	ImGui::Checkbox("Antialiasing", &_antialiasing);
+	ImGui::Checkbox("Crop Box",      &_cropping);
+
 	if (_cropping)
 	{
 		ImGui::SliderFloat("Box Min X", &_boxmin.x(), _scenemin.x(), _scenemax.x());
@@ -602,11 +520,11 @@ void sibr::GaussianView::onGUI()
 			std::vector<float> opacity(count);
 			std::vector<SHs<3>> shs(count);
 			std::vector<Scale> scale(count);
-			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(pos.data(), pos_cuda, sizeof(Pos) * count, cudaMemcpyDeviceToHost));
-			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(rot.data(), rot_cuda, sizeof(Rot) * count, cudaMemcpyDeviceToHost));
-			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(opacity.data(), opacity_cuda, sizeof(float) * count, cudaMemcpyDeviceToHost));
-			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(shs.data(), shs_cuda, sizeof(SHs<3>) * count, cudaMemcpyDeviceToHost));
-			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(scale.data(), scale_cuda, sizeof(Scale) * count, cudaMemcpyDeviceToHost));
+			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(pos.data(),     pos_cuda,     sizeof(Pos)    * count, cudaMemcpyDeviceToHost));
+			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(rot.data(),     rot_cuda,     sizeof(Rot)    * count, cudaMemcpyDeviceToHost));
+			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(opacity.data(), opacity_cuda, sizeof(float)  * count, cudaMemcpyDeviceToHost));
+			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(shs.data(),     shs_cuda,     sizeof(SHs<3>) * count, cudaMemcpyDeviceToHost));
+			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(scale.data(),   scale_cuda,   sizeof(Scale)  * count, cudaMemcpyDeviceToHost));
 			savePly(_buff, pos, shs, opacity, scale, rot, _boxmin, _boxmax);
 		}
 	}
@@ -616,131 +534,35 @@ void sibr::GaussianView::onGUI()
 	if(!*_dontshow && !accepted && _interop_failed)
 		ImGui::OpenPopup("Error Using Interop");
 
-	if (!*_dontshow && !accepted && _interop_failed && ImGui::BeginPopupModal("Error Using Interop", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (!*_dontshow && !accepted && _interop_failed &&
+		ImGui::BeginPopupModal("Error Using Interop", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+	{
 		ImGui::SetItemDefaultFocus();
 		ImGui::SetWindowFontScale(2.0f);
-		ImGui::Text("This application tries to use CUDA/OpenGL interop.\n"\
-			" It did NOT work for your current configuration.\n"\
-			" For highest performance, OpenGL and CUDA must run on the same\n"\
-			" GPU on an OS that supports interop.You can try to pass a\n"\
-			" non-zero index via --device on a multi-GPU system, and/or try\n" \
-			" attaching the monitors to the main CUDA card.\n"\
-			" On a laptop with one integrated and one dedicated GPU, you can try\n"\
-			" to set the preferred GPU via your operating system.\n\n"\
+		ImGui::Text("This application tries to use CUDA/OpenGL interop.\n"
+			" It did NOT work for your current configuration.\n"
+			" For highest performance, OpenGL and CUDA must run on the same\n"
+			" GPU on an OS that supports interop.You can try to pass a\n"
+			" non-zero index via --device on a multi-GPU system, and/or try\n"
+			" attaching the monitors to the main CUDA card.\n"
+			" On a laptop with one integrated and one dedicated GPU, you can try\n"
+			" to set the preferred GPU via your operating system.\n\n"
 			" FALLING BACK TO SLOWER RENDERING WITH CPU ROUNDTRIP\n");
-
 		ImGui::Separator();
-
-		if (ImGui::Button("  OK  ")) {
-			ImGui::CloseCurrentPopup();
-			accepted = true;
-		}
+		if (ImGui::Button("  OK  ")) { ImGui::CloseCurrentPopup(); accepted = true; }
 		ImGui::SameLine();
 		ImGui::Checkbox("Don't show this message again", _dontshow);
 		ImGui::EndPopup();
 	}
 }
 
-
-void sibr::GaussianView::applyTexture(const sibr::Texture2DRGBA& texture, const std::map<sibr::Vector3f, glm::vec2>& pos_uv_map)
-{
-	std::cout << "[GaussianView] Applying texture..." << std::endl;
-	if (pos_uv_map.empty() || count == 0) {
-		std::cout << "[GaussianView] ERROR: Position-UV map is empty or Gaussian count is zero." << std::endl;
-		return;
-	}
-
-	// --- 1. Download SH data from GPU to CPU ---
-	const int sh_components = (_sh_degree + 1) * (_sh_degree + 1);
-	const int sh_stride = sh_components * 3;
-	const size_t shs_total_size_bytes = (size_t)count * sh_stride * sizeof(float);
-
-	std::vector<float> shs_cpu(count * sh_stride);
-	cudaError_t err = cudaMemcpy(shs_cpu.data(), shs_cuda, shs_total_size_bytes, cudaMemcpyDeviceToHost);
-	if (err != cudaSuccess) {
-		std::cerr << "[GaussianView] ERROR: Failed to copy SH data from device to host: " << cudaGetErrorString(err) << std::endl;
-		return;
-	}
-
-	// --- 2. Access Texture Data on CPU ---
-	auto cpuImg = texture.readBack();	
-	
-	if (cpuImg.data() == nullptr) {
-		std::cerr << "[GaussianView] ERROR: Failed to read texture data back to CPU." << std::endl;
-		return;
-	}
-	const unsigned char* texture_data = cpuImg.data();
-	const int tex_w = cpuImg.w();
-	const int tex_h = cpuImg.h();
-	
-	// [FIXED] sibr::ImageRGBA (Image<uchar, 4>) has fixed 4 channels, no .channels() method
-	const int tex_channels = 4; 
-
-	if (tex_channels < 3) {
-		std::cerr << "[GaussianView] ERROR: Texture must have at least 3 channels (RGB)." << std::endl;
-		return;
-	}
-
-	std::cout << "[GaussianView] Modifying " << pos_uv_map.size() << " points..." << std::endl;
-
-	// --- 3. Modify SH data on CPU ---
-	const float SH_C0 = 0.28209479177387814f;
-
-	for (const auto& pair : pos_uv_map) {
-		const sibr::Vector3f& point_pos = pair.first;
-		const glm::vec2& uv = pair.second;
-
-		auto it = _pos_to_idx_map.find(point_pos);
-		if (it == _pos_to_idx_map.end()) {
-			// Point position not found in the Gaussian set, skip it
-			continue;
-		}
-		int gaussian_index = it->second;
-
-		// UV to Pixel Coords (with vertical flip)
-		int px = static_cast<int>(uv.x * tex_w);
-		int py = static_cast<int>((1.0f - uv.y) * tex_h);
-
-		// Clamp coordinates to be safe
-		px = std::max(0, std::min(tex_w - 1, px));
-		py = std::max(0, std::min(tex_h - 1, py));
-
-		// Sample Texture
-		int pixel_offset = (py * tex_w + px) * tex_channels;
-		unsigned char r = texture_data[pixel_offset + 0];
-		unsigned char g = texture_data[pixel_offset + 1];
-		unsigned char b = texture_data[pixel_offset + 2];
-
-		// Color Conversion (RGB to SH DC component)
-		glm::vec3 color_rgb(r / 255.0f, g / 255.0f, b / 255.0f);
-		glm::vec3 color_sh_dc = (color_rgb - 0.5f) / SH_C0;
-
-		// Modify Attribute (f_dc only)
-		int sh_offset = gaussian_index * sh_stride;
-		shs_cpu[sh_offset + 0] = color_sh_dc.x;
-		shs_cpu[sh_offset + 1] = color_sh_dc.y;
-		shs_cpu[sh_offset + 2] = color_sh_dc.z;
-	}
-
-	// --- 4. Upload modified SH data from CPU to GPU ---
-	err = cudaMemcpy(shs_cuda, shs_cpu.data(), shs_total_size_bytes, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess) {
-		std::cerr << "[GaussianView] ERROR: Failed to copy SH data from host to device: " << cudaGetErrorString(err) << std::endl;
-		return;
-	}
-
-	std::cout << "[GaussianView] Texture applied successfully. GPU data updated." << std::endl;
-}
-
 sibr::GaussianView::~GaussianView()
 {
-	// Cleanup
 	cudaFree(pos_cuda);
 	cudaFree(rot_cuda);
 	cudaFree(scale_cuda);
 	cudaFree(opacity_cuda);
 	cudaFree(shs_cuda);
-
 	cudaFree(view_cuda);
 	cudaFree(proj_cuda);
 	cudaFree(cam_pos_cuda);
@@ -748,21 +570,15 @@ sibr::GaussianView::~GaussianView()
 	cudaFree(rect_cuda);
 
 	if (!_interop_failed)
-	{
 		cudaGraphicsUnregisterResource(imageBufferCuda);
-	}
 	else
-	{
 		cudaFree(fallbackBufferCuda);
-	}
+
 	glDeleteBuffers(1, &imageBuffer);
 
-	if (geomPtr)
-		cudaFree(geomPtr);
-	if (binningPtr)
-		cudaFree(binningPtr);
-	if (imgPtr)
-		cudaFree(imgPtr);
+	if (geomPtr)    cudaFree(geomPtr);
+	if (binningPtr) cudaFree(binningPtr);
+	if (imgPtr)     cudaFree(imgPtr);
 
 	delete _copyRenderer;
 }
