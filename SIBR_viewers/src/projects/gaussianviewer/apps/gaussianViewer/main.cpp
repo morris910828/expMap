@@ -41,14 +41,29 @@ public:
                     (float)gaussianView->getResolution().y())
     {
         // Load point clouds
-        if (std_fs::exists(geoPath)) _geoRenderer.load(geoPath);
-        if (std_fs::exists(appPath)) { _appRenderer.load(appPath); _appRenderer.loadFids(appPath); }
+        if (std_fs::exists(geoPath)) {
+            _geoRenderer.load(geoPath);
+            _geoRenderer.loadGaussianProps(geoPath);
+        }
+        if (std_fs::exists(appPath)) {
+            _appRenderer.load(appPath);
+            _appRenderer.loadFids(appPath);
+            _appRenderer.loadGaussianProps(appPath);
+        }
 
         // Initialise ExpMap solver
         if (_mesh) {
             _expMapSolver.Init(_mesh);
-            if (_geoRenderer.isLoaded()) _expMapSolver.RegisterGeoPointCloud(_geoRenderer.getRawData());
-            if (_appRenderer.isLoaded()) _expMapSolver.RegisterAppPointCloud(_appRenderer.getRawData(), _appRenderer.getFids());
+            if (_geoRenderer.isLoaded())
+                _expMapSolver.RegisterGeoPointCloud(_geoRenderer.getRawData(),
+                                                    _geoRenderer.getGaussianProps());
+            if (_appRenderer.isLoaded())
+                _expMapSolver.RegisterAppPointCloud(_appRenderer.getRawData(),
+                                                    _appRenderer.getFids(),
+                                                    _appRenderer.getGaussianProps());
+
+            // NEW: Upload the entire mesh to GPU VRAM for fast rendering
+            _wireframeRenderer.uploadMesh(_mesh);
         }
 
         // Default overlay colours
@@ -71,19 +86,22 @@ public:
         // 1. Mesh wireframe (black = regular tris, yellow = UV-active tris)
         _wireframeRenderer.render(_mesh, _expMapSolver.GetActiveTriIndices(), mvp, _showMesh);
 
-        // 2. Texture projection — first render all SAVED slots, then the live (active) slot
-        _textureProjector.renderAll(
-            _mesh,
+        // 2. Texture display — texture_gs 風格
+        //    每個 Gaussian 以 splat 形式渲染，顏色從 ExpMap UV sample texture
+        const glm::mat4 view = glm::make_mat4(eye.view().data());
+        const glm::mat4 proj = glm::make_mat4(eye.proj().data());
+        const float vpW = (float)dst.w();
+        const float vpH = (float)dst.h();
+
+        _gsRenderer.renderAll(
             _expMapSolver.GetAllSlots(),
-            mvp
+            view, proj, vpW, vpH
         );
-        // Live (unsaved) slot — shown with the projector's own alpha control
-        _textureProjector.render(
-            _mesh,
-            _expMapSolver.GetActiveTris(),
-            _expMapSolver.GetDisplayUVs(),
+        _gsRenderer.render(
+            _expMapSolver.GetProjectedGeoPoints(),
+            _expMapSolver.GetProjectedAppPoints(),
             _expMapSolver.GetTextureLoader().getTexture(),
-            mvp
+            view, proj, vpW, vpH
         );
 
         // 3. Geo / App point clouds
@@ -128,10 +146,11 @@ public:
         _gaussianView->onGUI();
 
         ImGui::Begin("Mesh & Controls");
-        ImGui::Checkbox("Show Mesh",       &_showMesh);
+        ImGui::Checkbox("Show Mesh",              &_showMesh);
+        ImGui::Checkbox("Show UV Wireframe",      &_wireframeRenderer._showYellowWireframe);
         ImGui::Checkbox("Show Geo Points", &_showGeo);
         ImGui::Checkbox("Show App Points", &_showApp);
-        _textureProjector.renderGUI();
+        _gsRenderer.renderGUI();
         ImGui::SliderFloat("Point Size",    &_pointSize,    1.0f, 3.0f);
         ImGui::SliderFloat("ExpMap Radius", &_expMapRadius, 0.05f, 2.0f);
         if (ImGui::Button("Clear ExpMap")) _expMapSolver.ClearRaycastState();
@@ -242,7 +261,7 @@ private:
     SimplePointRenderer             _appRenderer;
     PointCloudRenderer              _pointCloudRenderer;
     MeshWireframeRenderer           _wireframeRenderer;
-    TextureProjector                _textureProjector;
+    GaussianSplatRenderer           _gsRenderer;
     ExpMapSolverSIBR                _expMapSolver;
 
     const sibr::Mesh*                   _mesh;

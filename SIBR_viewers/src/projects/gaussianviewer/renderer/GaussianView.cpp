@@ -71,7 +71,8 @@ int loadPly(const char* filename,
 	std::vector<Scale>& scales,
 	std::vector<Rot>& rot,
 	sibr::Vector3f& minn,
-	sibr::Vector3f& maxx)
+	sibr::Vector3f& maxx,
+	std::vector<int>& plyToSorted)
 {
 	std::ifstream infile(filename, std::ios_base::binary);
 
@@ -131,6 +132,10 @@ int loadPly(const char* filename,
 		return a.first < b.first;
 	};
 	std::sort(mapp.begin(), mapp.end(), sorter);
+
+	plyToSorted.resize(count);
+	for (int k = 0; k < count; k++)
+		plyToSorted[mapp[k].second] = k;
 
 	int SH_N = (D + 1) * (D + 1);
 	for (int k = 0; k < count; k++)
@@ -336,10 +341,10 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene,
 	std::vector<float> opacity;
 	std::vector<SHs<3>> shs;
 
-	if      (sh_degree == 0) count = loadPly<0>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
-	else if (sh_degree == 1) count = loadPly<1>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
-	else if (sh_degree == 2) count = loadPly<2>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
-	else                     count = loadPly<3>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+	if      (sh_degree == 0) count = loadPly<0>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax, _plyToSorted);
+	else if (sh_degree == 1) count = loadPly<1>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax, _plyToSorted);
+	else if (sh_degree == 2) count = loadPly<2>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax, _plyToSorted);
+	else                     count = loadPly<3>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax, _plyToSorted);
 
 	_boxmin = _scenemin;
 	_boxmax = _scenemax;

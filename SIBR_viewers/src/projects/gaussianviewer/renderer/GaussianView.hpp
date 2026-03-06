@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 #include <functional>
+#include <unordered_map>
 # include "GaussianSurfaceRenderer.hpp"
 
 namespace CudaRasterizer
@@ -57,6 +58,21 @@ namespace sibr {
 		void onUpdate(Input& input) override;
 		void onGUI() override;
 
+		/** Update Gaussian colors (SH DC) for the given original PLY indices.
+		 *  Uses inverse mapping to handle Morton-sorted buffer and SH domain conversion.
+		 */
+		void updateGaussianColorsBulk(const std::vector<int>& originalIndices, const std::vector<sibr::Vector3f>& colors);
+
+		/** Update Gaussian colours by matching world-space positions.
+		 *  This is the correct method when the caller has geo/app sub-cloud points
+		 *  whose indices do NOT directly map to point_cloud.ply indices.
+		 *  Builds a position->sortedIndex hash at construction time; call once per bake.
+		 *  Higher-order SH bands are zeroed for baked Gaussians (pure diffuse texture).
+		 */
+		void updateGaussianColorsByWorldPos(
+			const std::vector<sibr::Vector3f>& worldPositions,
+			const std::vector<sibr::Vector3f>& colors);
+
 		const std::shared_ptr<sibr::BasicIBRScene> & getScene() const { return _scene; }
 
 		virtual ~GaussianView() override;
@@ -82,6 +98,13 @@ namespace sibr {
 		float* opacity_cuda;
 		float* shs_cuda;
 		int* rect_cuda;
+
+		// Inverse mapping: original PLY index -> sorted GPU index
+		std::vector<int> _plyToSorted;
+
+		// Position -> sorted GPU index (built at load time for world-pos baking)
+		// Key = hash of raw float bits of (x, y, z).
+		std::unordered_map<uint64_t, int> _posToSorted;
 
 		GLuint imageBuffer;
 		cudaGraphicsResource_t imageBufferCuda;

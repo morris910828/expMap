@@ -1,0 +1,4 @@
+# ninja log v5
+2	11905	1769426299286158000	/mnt/d/SGGaussians/SGGaussians/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/simple_knn.o	eae3e70234990691
+1	15945	1769426303003705600	/mnt/d/SGGaussians/SGGaussians/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/ext.o	593522df30c4a4a2
+2	44730	1769426331857140000	/mnt/d/SGGaussians/SGGaussians/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/spatial.o	a853825b95061c2c
