@@ -82,6 +82,11 @@ struct ExpVertex {
 
 class ExpMapSolverSIBR {
 public:
+    ~ExpMapSolverSIBR() {
+        ClearAllSlots();
+        if (_liveSSBO) glDeleteBuffers(1, &_liveSSBO);
+    }
+
     const std::vector<int>& GetDijkstraPath() const { return _dijkstraPath; }
 
     const std::vector<sibr::Vector3u>& GetActiveTris() const { return _validTriangles; }
@@ -89,7 +94,6 @@ public:
     
     const std::vector<sibr::Vector3u>& GetSelectedTris() const { return _selectedTriangles; }
     
-    // 【架構修正】新增資料存取介面供渲染管線調用
     const std::vector<ProjectedGaussian>& GetProjectedGeoPoints() const { return _projectedGeoPoints; }
     const std::vector<ProjectedGaussian>& GetProjectedAppPoints() const { return _projectedAppPoints; }
     const std::vector<int>& GetSelectedGeoIndices() const { return _selectedGeoIndices; }
@@ -110,16 +114,33 @@ public:
         slot.texturePath = _textureLoader.getPath();
         slot.alpha       = 1.f;
         slot.visible     = true;
+        
+        slot.geoPoints   = _projectedGeoPoints;
+        slot.appPoints   = _projectedAppPoints;
+        slot.ssbo        = 0;
+        slot.isDirty     = true;
+        
         _slots.push_back(std::move(slot));
         return (int)_slots.size() - 1;
     }
     void RemoveSlot(int idx) {
-        if (idx >= 0 && idx < (int)_slots.size())
+        if (idx >= 0 && idx < (int)_slots.size()) {
+            if (_slots[idx].ssbo) glDeleteBuffers(1, &_slots[idx].ssbo);
             _slots.erase(_slots.begin() + idx);
+        }
     }
-    void ClearAllSlots() { _slots.clear(); }
+    void ClearAllSlots() { 
+        for (auto& s : _slots) {
+            if (s.ssbo) glDeleteBuffers(1, &s.ssbo);
+        }
+        _slots.clear(); 
+    }
+    
+    std::vector<TextureSlotData>& GetAllSlotsRef() { return _slots; }
     const std::vector<TextureSlotData>& GetAllSlots() const { return _slots; }
-    std::vector<TextureSlotData>&       GetAllSlots()       { return _slots; }
+    
+    GLuint& GetLiveSSBO() { return _liveSSBO; }
+    bool&   GetLiveDirty() { return _liveDirty; }
     
     void ClearRaycastState() {
         _validTriangles.clear();
@@ -131,7 +152,6 @@ public:
         _displayUVs.clear();
         _vertexData.clear();
         
-        // 【架構修正】清空擴充的陣列結構
         _projectedAppPoints.clear();
         _projectedGeoPoints.clear();
         _selectedGeoIndices.clear();
@@ -143,6 +163,9 @@ public:
         _isSelecting = false;
         
         _projectionStats = ProjectionStats();
+
+        if (_liveSSBO) { glDeleteBuffers(1, &_liveSSBO); _liveSSBO = 0; }
+        _liveDirty = true;
     }
     
     void OnRaycastHit(const sibr::Vector3f& hitPos, float radius, int hitTriID) {
@@ -211,14 +234,12 @@ public:
     void Compute(const sibr::Vector3f& hitPos, const sibr::Vector3f& hitNormal, float radius) {
         if(!_mesh) return;
 
-        // Reset
         _vertexData.clear();
         _displayUVs.clear();
         _validTriangles.clear();
         _validTriIDs.clear();
         _validTriangleIndicesSet.clear();
         
-        // 【架構修正】清空擴充的陣列結構
         _projectedAppPoints.clear(); 
         _projectedGeoPoints.clear();
         _selectedGeoIndices.clear();
@@ -359,19 +380,6 @@ public:
             }
 
             ProjectAndInsertClouds(target, radius * 1.2f);
-            
-            std::cout << "\n========== ProjectionStats ==========" << std::endl;
-            std::cout << "APP Points:" << std::endl;
-            std::cout << "  Total: " << _projectionStats.appTotal << std::endl;
-            std::cout << "  Out of radius: " << _projectionStats.appOutOfRadius << std::endl;
-            std::cout << "  Invalid face_id: " << _projectionStats.appInvalidFid << std::endl;
-            std::cout << "  Face_id not in range: " << _projectionStats.appFidOutOfRange << std::endl;
-            std::cout << "  Successfully projected: " << _projectionStats.appProjected << std::endl;
-            std::cout << "\nGEO Points:" << std::endl;
-            std::cout << "  Total: " << _projectionStats.geoTotal << std::endl;
-            std::cout << "  Out of radius: " << _projectionStats.geoOutOfRadius << std::endl;
-            std::cout << "  Successfully projected: " << _projectionStats.geoProjected << std::endl;
-            std::cout << "====================================\n" << std::endl;
         }
     }
 
@@ -535,7 +543,6 @@ public:
                     _selectionEnd.x = (lx / (dim * _viewScale)) + 0.5f;
                     _selectionEnd.y = 1.0f - ((ly / (dim * _viewScale)) + 0.5f);
                 }
-                // 【架構修正】同時觸發網格三角形與高斯點的交集運算
                 if (_isSelecting && ImGui::IsMouseReleased(0)) {
                     _isSelecting = false;
                     UpdateSelectedTriangles();
@@ -628,10 +635,6 @@ public:
                 else dl->AddTriangle(ip1, ip2, ip3, IM_COL32(255, 215, 0, 200), 1.0f);
             }
 
-            // ================================================================
-            // 【架構修正】強健化的高斯點繪製邏輯，直接遍歷專屬陣列，解除對隱式 ID 偏移的依賴
-            // 包含：選取狀態的高亮標示（黃色）
-            // ================================================================
             if (_showGeoPoints) {
                 for (const auto& pt : _projectedGeoPoints) {
                     if (pt.uv.x < -1.0f || pt.uv.x > 2.0f || pt.uv.y < -1.0f || pt.uv.y > 2.0f) continue;
@@ -712,7 +715,6 @@ private:
         }
     }
 
-    // 【架構修正】實作高斯點雲 2D 空間交集過濾演算法
     void UpdateSelectedGaussians() {
         _selectedGeoIndices.clear();
         _selectedAppIndices.clear();
@@ -926,7 +928,6 @@ private:
     void ProjectAndInsertClouds(const glm::vec3& center, float radius) {
         std::map<int, std::vector<int>> triToExtraNodes;
 
-        // 【架構修正】將 std::vector<glm::vec2> 替換為 std::vector<ProjectedGaussian>
         auto process = [&](const std::vector<float>& cloud, const std::vector<int>& fids,
                           const std::vector<GaussianProps>& props,
                           std::vector<ProjectedGaussian>& outPts, const char* cloudName) {
@@ -945,6 +946,17 @@ private:
             int projected = 0;
 
             for (size_t i = 0; i < numPoints; ++i) {
+                // ==========================================================
+                // [架構修正] 嚴格物理尺度過濾 (Scale Culling)
+                // 強制剔除體積過大的浮游點，切斷導致「貼圖嚴重向外溢出」的傳播媒介
+                // ==========================================================
+                if (i < props.size()) {
+                    float maxScaleRaw = std::max({props[i].scale[0], props[i].scale[1], props[i].scale[2]});
+                    if (std::exp(maxScaleRaw) > radius * 0.15f) {
+                        continue; 
+                    }
+                }
+
                 glm::vec3 pt(cloud[i*3], cloud[i*3+1], cloud[i*3+2]);
                 
                 if (glm::dot(pt - center, pt - center) > r2) {
@@ -1050,11 +1062,41 @@ private:
                 }
 
                 if (found) {
-                    // 【架構修正】綁定原始索引與 UV 座標寫入陣列
+                    const auto& t_orig = _mesh->triangles()[bestTriGlobalID];
+                    glm::vec3 v0_tri = toGlm(_mesh->vertices()[t_orig[0]]);
+                    glm::vec3 v1_tri = toGlm(_mesh->vertices()[t_orig[1]]);
+                    glm::vec3 v2_tri = toGlm(_mesh->vertices()[t_orig[2]]);
+                    glm::vec2 uv0_tri = _displayUVs.at(t_orig[0]);
+                    glm::vec2 uv1_tri = _displayUVs.at(t_orig[1]);
+                    glm::vec2 uv2_tri = _displayUVs.at(t_orig[2]);
+
+                    glm::vec3 E1 = v1_tri - v0_tri;
+                    glm::vec3 E2 = v2_tri - v0_tri;
+                    glm::vec2 dUV1 = uv1_tri - uv0_tri;
+                    glm::vec2 dUV2 = uv2_tri - uv0_tri;
+                    glm::vec3 N_tri = glm::normalize(glm::cross(E1, E2));
+
+                    glm::mat3 M_T = glm::transpose(glm::mat3(E1, E2, N_tri));
+                    float detM = glm::determinant(M_T);
+                    glm::vec3 dU(0.f), dV(0.f);
+                    if (std::abs(detM) > 1e-9f) {
+                        glm::mat3 M_inv = glm::inverse(M_T);
+                        dU = M_inv * glm::vec3(dUV1.x, dUV2.x, 0.0f);
+                        dV = M_inv * glm::vec3(dUV1.y, dUV2.y, 0.0f);
+                    }
+
                     ProjectedGaussian pg;
                     pg.originalIndex = (int)i;
                     pg.uv            = bestUV;
-                    pg.position      = pt;
+                    // ==========================================================
+                    // [架構修正] 強制吸附 (Geometric Snapping)
+                    // 將高斯點真正的 3D 位置取代為網格表面上的精確投影點。
+                    // 這使得 Fragment Shader 發射的切線面絕對平滑無縫。
+                    // ==========================================================
+                    pg.position      = bestProjPos; 
+                    pg.dU            = dU;          
+                    pg.dV            = dV;          
+                    
                     if (i < props.size()) {
                         pg.opacity   = props[i].opacity;
                         pg.scale     = glm::vec3(props[i].scale[0], props[i].scale[1], props[i].scale[2]);
@@ -1112,9 +1154,10 @@ private:
             }
         };
 
-        // 【架構修正】嚴格落實依序處理，先 GEO 再 APP
         process(_geoCloudData, {}, _geoGaussianProps, _projectedGeoPoints, "GEO");
         process(_appCloudData, _appCloudFids, _appGaussianProps, _projectedAppPoints, "APP");
+
+        _liveDirty = true;
     }
     
     void ComputeExtraNodeCosts() {
@@ -1280,6 +1323,9 @@ private:
     float _autoThreshold = 3.0f;
     
     ProjectionStats _projectionStats;
+
+    GLuint _liveSSBO = 0;
+    bool   _liveDirty = true;
 };
 
 #endif

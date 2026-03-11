@@ -561,6 +561,76 @@ void sibr::GaussianView::onGUI()
 	}
 }
 
+void sibr::GaussianView::updateGaussianColorsByWorldPos(
+	const std::vector<sibr::Vector3f>& worldPositions,
+	const std::vector<sibr::Vector3f>& colors)
+{
+	if (worldPositions.empty()) return;
+	if (worldPositions.size() != colors.size()) return;
+
+	// Build pos->sortedIndex hash map from pos_cuda on first call (built once only)
+	if (_posToSorted.empty()) {
+		std::vector<sibr::Vector3f> hostPos(count);
+		cudaMemcpy(hostPos.data(), pos_cuda,
+			sizeof(sibr::Vector3f) * count, cudaMemcpyDeviceToHost);
+		_posToSorted.reserve(count);
+		for (int k = 0; k < count; ++k) {
+			uint32_t ix, iy, iz;
+			memcpy(&ix, &hostPos[k].x(), 4);
+			memcpy(&iy, &hostPos[k].y(), 4);
+			memcpy(&iz, &hostPos[k].z(), 4);
+			uint64_t key = uint64_t(ix)
+				^ (uint64_t(iy) << 20)
+				^ (uint64_t(iz) << 40);
+			_posToSorted[key] = k;
+		}
+		SIBR_LOG << "[BakeTexture] Built pos->sorted map ("
+			<< count << " entries)" << std::endl;
+	}
+
+	// SHs<3>: 16 coefficients * 3 channels = 48 floats per Gaussian
+	// DC = first 3 floats (R, G, B)
+	const int SH_FLOATS = 16 * 3;
+	const float kInvC0 = 3.5449077018f; // 1 / (0.5 * sqrt(1/pi))
+
+	std::vector<float> hostShs((size_t)count * SH_FLOATS);
+	cudaMemcpy(hostShs.data(), shs_cuda,
+		sizeof(float) * count * SH_FLOATS, cudaMemcpyDeviceToHost);
+
+	int matched = 0;
+	for (size_t i = 0; i < worldPositions.size(); ++i) {
+		const sibr::Vector3f& p = worldPositions[i];
+		uint32_t ix, iy, iz;
+		memcpy(&ix, &p.x(), 4);
+		memcpy(&iy, &p.y(), 4);
+		memcpy(&iz, &p.z(), 4);
+		uint64_t key = uint64_t(ix)
+			^ (uint64_t(iy) << 20)
+			^ (uint64_t(iz) << 40);
+
+		auto it = _posToSorted.find(key);
+		if (it == _posToSorted.end()) continue;
+
+		int k = it->second;
+		// DC SH = linear_color / C0
+		hostShs[(size_t)k * SH_FLOATS + 0] = colors[i].x() * kInvC0;
+		hostShs[(size_t)k * SH_FLOATS + 1] = colors[i].y() * kInvC0;
+		hostShs[(size_t)k * SH_FLOATS + 2] = colors[i].z() * kInvC0;
+		// Zero out higher-order SH bands (pure diffuse, view-independent)
+		for (int j = 3; j < SH_FLOATS; ++j)
+			hostShs[(size_t)k * SH_FLOATS + j] = 0.f;
+		++matched;
+	}
+
+	cudaMemcpy(shs_cuda, hostShs.data(),
+		sizeof(float) * count * SH_FLOATS, cudaMemcpyHostToDevice);
+	cudaDeviceSynchronize();
+
+	SIBR_LOG << "[BakeTexture] Matched " << matched
+		<< " / " << worldPositions.size()
+		<< " Gaussians into point_cloud" << std::endl;
+}
+
 sibr::GaussianView::~GaussianView()
 {
 	cudaFree(pos_cuda);

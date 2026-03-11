@@ -17,7 +17,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-#include "ExpMapSolverSIBR.h"  // also pulls in texture.h
+#include "ExpMapSolverSIBR.h" 
 
 namespace std_fs = std::filesystem;
 using namespace sibr;
@@ -28,7 +28,7 @@ public:
 
     MeshGaussianView(
         GaussianView::Ptr                   gaussianView,
-        const sibr::Mesh*                   mesh,
+        const sibr::Mesh* mesh,
         const std::string&                  geoPath,
         const std::string&                  appPath,
         sibr::InteractiveCameraHandler::Ptr camHandler
@@ -40,7 +40,6 @@ public:
                     (float)gaussianView->getResolution().x(),
                     (float)gaussianView->getResolution().y())
     {
-        // Load point clouds
         if (std_fs::exists(geoPath)) {
             _geoRenderer.load(geoPath);
             _geoRenderer.loadGaussianProps(geoPath);
@@ -51,7 +50,6 @@ public:
             _appRenderer.loadGaussianProps(appPath);
         }
 
-        // Initialise ExpMap solver
         if (_mesh) {
             _expMapSolver.Init(_mesh);
             if (_geoRenderer.isLoaded())
@@ -62,11 +60,9 @@ public:
                                                     _appRenderer.getFids(),
                                                     _appRenderer.getGaussianProps());
 
-            // NEW: Upload the entire mesh to GPU VRAM for fast rendering
             _wireframeRenderer.uploadMesh(_mesh);
         }
 
-        // Default overlay colours
         _meshColor = sibr::Vector3f(0.0f, 0.6f, 0.0f);
         _geoColor  = sibr::Vector3f(1.0f, 0.2f, 0.0f);
         _appColor  = sibr::Vector3f(0.0f, 0.4f, 1.0f);
@@ -83,35 +79,33 @@ public:
 
         const glm::mat4 mvp = glm::make_mat4(eye.viewproj().data());
 
-        // 1. Mesh wireframe (black = regular tris, yellow = UV-active tris)
         _wireframeRenderer.render(_mesh, _expMapSolver.GetActiveTriIndices(), mvp, _showMesh);
 
-        // 2. Texture display — texture_gs 風格
-        //    每個 Gaussian 以 splat 形式渲染，顏色從 ExpMap UV sample texture
         const glm::mat4 view = glm::make_mat4(eye.view().data());
         const glm::mat4 proj = glm::make_mat4(eye.proj().data());
         const float vpW = (float)dst.w();
         const float vpH = (float)dst.h();
 
+        // [架構修正] 傳遞 SSBO 狀態供渲染器進行快取評估
         _gsRenderer.renderAll(
-            _expMapSolver.GetAllSlots(),
+            _expMapSolver.GetAllSlotsRef(),
             view, proj, vpW, vpH
         );
         _gsRenderer.render(
             _expMapSolver.GetProjectedGeoPoints(),
             _expMapSolver.GetProjectedAppPoints(),
+            _expMapSolver.GetLiveSSBO(),
+            _expMapSolver.GetLiveDirty(),
             _expMapSolver.GetTextureLoader().getTexture(),
             view, proj, vpW, vpH
         );
 
-        // 3. Geo / App point clouds
         _pointCloudRenderer.render(
             mvp, _pointSize,
             _geoRenderer, _geoColor, _showGeo,
             _appRenderer,  _appColor, _showApp
         );
 
-        // 4. Dijkstra path (legacy immediate-mode GL)
         const auto& path = _expMapSolver.GetDijkstraPath();
         if (path.size() >= 2 && _mesh) {
             const auto& verts = _mesh->vertices();
@@ -156,7 +150,6 @@ public:
         if (ImGui::Button("Clear ExpMap")) _expMapSolver.ClearRaycastState();
 
         ImGui::Separator();
-        // Show saved slot count
         const auto& slots = _expMapSolver.GetAllSlots();
         if (!slots.empty()) {
             ImGui::TextColored(ImVec4(0.3f, 1.f, 0.5f, 1.f),
@@ -192,11 +185,9 @@ private:
             static_cast<float>(input.mousePosition().y())
         );
 
-        // Screen → NDC
         float ndcX = (2.f * mousePos.x()) / _viewport.finalWidth()  - 1.f;
         float ndcY = 1.f - (2.f * mousePos.y()) / _viewport.finalHeight();
 
-        // NDC → world ray
         sibr::Matrix4f invVP = cam.viewproj().inverse();
         sibr::Vector4f nearPt = invVP * sibr::Vector4f(ndcX, ndcY, -1.f, 1.f);
         sibr::Vector4f farPt  = invVP * sibr::Vector4f(ndcX, ndcY,  1.f, 1.f);
@@ -216,7 +207,6 @@ private:
         int           hitTriID = -1;
         sibr::Vector3f hitPos;
 
-        // Möller–Trumbore for each triangle
         for (size_t t = 0; t < triangles.size(); ++t) {
             const auto& tri = triangles[t];
             const sibr::Vector3f& v0 = verts[tri[0]];
@@ -228,7 +218,7 @@ private:
             sibr::Vector3f h     = rayDir.cross(edge2);
             float          a     = edge1.dot(h);
 
-            if (a > -1e-6f && a < 1e-6f) continue; // parallel
+            if (a > -1e-6f && a < 1e-6f) continue; 
 
             float          f = 1.f / a;
             sibr::Vector3f s = rayOrigin - v0;
@@ -251,6 +241,53 @@ private:
             std::cout << "[INFO] Raycast hit triangle " << hitTriID
                       << " at distance " << minDist << std::endl;
             _expMapSolver.OnRaycastHit(hitPos, _expMapRadius, hitTriID);
+
+            // Bake texture colors into point_cloud.ply Gaussians via world-pos matching
+            const auto& texLoader = _expMapSolver.GetTextureLoader();
+            if (texLoader.getTexture()) {
+                if (_bakeImagePath != texLoader.getPath() || _bakeImage.w() == 0) {
+                    _bakeImage.load(texLoader.getPath());
+                    _bakeImagePath = texLoader.getPath();
+                }
+
+                std::vector<sibr::Vector3f> worldPositions;
+                std::vector<sibr::Vector3f> colors;
+
+                auto sampleAndCollect = [&](const std::vector<ProjectedGaussian>& pts) {
+                    for (size_t pi = 0; pi < pts.size(); ++pi) {
+                        const ProjectedGaussian& pg = pts[pi];
+                        float u = pg.uv.x;
+                        float v = pg.uv.y;
+                        if (u < 0.f || u > 1.f || v < 0.f || v > 1.f) continue;
+
+                        float vf = 1.f - v; // flip Y: image y=0 is top
+                        float px = u  * float(_bakeImage.w() - 1);
+                        float py = vf * float(_bakeImage.h() - 1);
+                        int x0 = std::max(0, std::min((int)px,     (int)_bakeImage.w()-1));
+                        int y0 = std::max(0, std::min((int)py,     (int)_bakeImage.h()-1));
+                        int x1 = std::max(0, std::min((int)px + 1, (int)_bakeImage.w()-1));
+                        int y1 = std::max(0, std::min((int)py + 1, (int)_bakeImage.h()-1));
+                        float fx = px - float(x0);
+                        float fy = py - float(y0);
+
+                        auto lerp = [](float a, float b, float t){ return a + t*(b-a); };
+                        auto c00 = _bakeImage(x0,y0), c10 = _bakeImage(x1,y0);
+                        auto c01 = _bakeImage(x0,y1), c11 = _bakeImage(x1,y1);
+                        float r = lerp(lerp(c00[0],c10[0],fx), lerp(c01[0],c11[0],fx), fy) / 255.f;
+                        float g = lerp(lerp(c00[1],c10[1],fx), lerp(c01[1],c11[1],fx), fy) / 255.f;
+                        float b = lerp(lerp(c00[2],c10[2],fx), lerp(c01[2],c11[2],fx), fy) / 255.f;
+
+                        worldPositions.emplace_back(pg.position.x, pg.position.y, pg.position.z);
+                        colors.emplace_back(r, g, b);
+                    }
+                };
+
+                sampleAndCollect(_expMapSolver.GetProjectedAppPoints());
+                sampleAndCollect(_expMapSolver.GetProjectedGeoPoints());
+
+                if (!worldPositions.empty())
+                    _gaussianView->updateGaussianColorsByWorldPos(worldPositions, colors);
+            }
         } else {
             std::cout << "[INFO] Raycast missed all triangles" << std::endl;
         }
@@ -264,7 +301,7 @@ private:
     GaussianSplatRenderer           _gsRenderer;
     ExpMapSolverSIBR                _expMapSolver;
 
-    const sibr::Mesh*                   _mesh;
+    const sibr::Mesh* _mesh;
     sibr::InteractiveCameraHandler::Ptr _camHandler;
     sibr::Viewport                      _viewport;
 
@@ -274,8 +311,10 @@ private:
     bool   _showApp     = true;
     float  _pointSize   = 1.0f;
     float  _expMapRadius = 0.5f;
-};
 
+    sibr::ImageRGBA _bakeImage;
+    std::string     _bakeImagePath;
+};
 
 static std::string findLargestNumberedSubdirectory(const std::string& dirPath) {
     std_fs::path p(dirPath);
@@ -295,14 +334,12 @@ static std::string findLargestNumberedSubdirectory(const std::string& dirPath) {
     return best;
 }
 
-// Return [start, end) of the value for a named argument in a Python-style arg string.
 static std::pair<int,int> findArg(const std::string& line, const std::string& name) {
     size_t start = line.find(name, 0);
     start = line.find("=", start) + 1;
     size_t end = line.find_first_of(",)", start);
     return { (int)start, (int)end };
 }
-
 
 static void* User_ReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char*) { return (void*)0x1; }
 static void  User_ReadLine(ImGuiContext*, ImGuiSettingsHandler* h, void*, const char* line) {
@@ -314,10 +351,6 @@ static void  User_WriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBuff
     buf->appendf("[UserData][UserData]\nDontShow=%d\n\n", *((bool*)h->UserData) ? 1 : 0);
 }
 
-
-// ============================================================================
-// main
-// ============================================================================
 int main(int ac, char** av) {
     CommandLineArgs::parseMainArgs(ac, av);
     GaussianAppArgs myArgs;
@@ -328,7 +361,6 @@ int main(int ac, char** av) {
 
     sibr::Window window("sibr_3Dgaussian", sibr::Vector2i(50, 50), myArgs);
 
-    // Register ImGui settings handler for the "DontShow" flag
     bool messageRead = false;
     ImGuiSettingsHandler ini_handler;
     ini_handler.TypeName   = "UserData";
@@ -340,7 +372,6 @@ int main(int ac, char** av) {
     ImGui::GetCurrentContext()->SettingsHandlers.push_back(ini_handler);
     window.loadSettings();
 
-    // Parse cfg_args
     std::string cfgLine;
     std::ifstream cfgFile(myArgs.modelPath.get() + "/cfg_args");
     if (!cfgFile.good()) SIBR_ERR << "Could not find config file 'cfg_args' at: " << myArgs.modelPath.get();
@@ -355,7 +386,6 @@ int main(int ac, char** av) {
     rng = findArg(cfgLine, "white_background");
     bool white_background = cfgLine.substr(rng.first, rng.second - rng.first).find("True") != std::string::npos;
 
-    // Build scene
     BasicIBRScene::SceneOptions myOpts;
     myOpts.renderTargets = myArgs.loadImages;
     myOpts.mesh    = true;
@@ -367,7 +397,6 @@ int main(int ac, char** av) {
     try { scene.reset(new BasicIBRScene(myArgs, myOpts)); }
     catch (...) { myArgs.dataset_path = myArgs.modelPath.get(); scene.reset(new BasicIBRScene(myArgs, myOpts)); }
 
-    // Resolve PLY paths
     std::string plyBase = myArgs.modelPath.get();
     if (plyBase.back() != '/' && plyBase.back() != '\\') plyBase += "/";
     plyBase += "point_cloud";
@@ -385,9 +414,8 @@ int main(int ac, char** av) {
     const std::string geoPath      = plyDir + "geo_point_cloud.ply";
     const std::string appPath      = plyDir + "app_point_cloud.ply";
 
-    // Choose mesh: prefer geo PLY, fall back to scene proxy
     sibr::Mesh::Ptr      geoMesh(new sibr::Mesh());
-    const sibr::Mesh*    meshToRender = nullptr;
+    const sibr::Mesh* meshToRender = nullptr;
     if (std_fs::exists(geoPath) && geoMesh->load(geoPath) && !geoMesh->triangles().empty()) {
         meshToRender = geoMesh.get();
         std::cout << "Using geo mesh: " << geoMesh->triangles().size()
@@ -397,7 +425,6 @@ int main(int ac, char** av) {
         std::cout << "Fallback: using proxy mesh from scene" << std::endl;
     }
 
-    // Compute rendering resolution
     uint  scene_w  = scene->cameras()->inputCameras()[0]->w();
     uint  scene_h  = scene->cameras()->inputCameras()[0]->h();
     float aspect   = scene_w * 1.f / scene_h;
@@ -407,7 +434,6 @@ int main(int ac, char** av) {
     rh = (rh <= 0) ? (uint)(std::min(1200U, scene_w) / aspect) : rh;
     Vector2u usedRes(rw, rh);
 
-    // Create views
     GaussianView::Ptr gaussianView(new GaussianView(
         scene, usedRes.x(), usedRes.y(),
         finalPlyPath.c_str(), &messageRead, sh_degree, white_background,
@@ -420,7 +446,6 @@ int main(int ac, char** av) {
     MeshGaussianView::Ptr meshView(new MeshGaussianView(
         gaussianView, meshToRender, geoPath, appPath, generalCamera));
 
-    // Build multi-view layout
     MultiViewManager multiViewManager(window, false);
     if (myArgs.rendering_mode == 1)
         multiViewManager.renderingMode(IRenderingMode::Ptr(new StereoAnaglyphRdrMode()));
@@ -434,7 +459,6 @@ int main(int ac, char** av) {
     multiViewManager.addSubView("Top view", topView, usedRes);
     topView->active(false);
 
-    // Offline path recording
     generalCamera->getCameraRecorder().setViewPath(gaussianView, myArgs.dataset_path.get());
     if (myArgs.pathFile.get() != "") {
         generalCamera->getCameraRecorder().loadPath(myArgs.pathFile.get(), usedRes.x(), usedRes.y());
@@ -443,7 +467,6 @@ int main(int ac, char** av) {
         if (!myArgs.noExit) exit(0);
     }
 
-    // Render loop
     while (window.isOpened()) {
         sibr::Input::poll();
         window.makeContextCurrent();

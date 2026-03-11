@@ -10,6 +10,7 @@
 #include <sstream>
 #include <iostream>
 #include <algorithm>
+#include <numeric>
 
 // SIBR / Third-party
 #include <core/graphics/Image.hpp>
@@ -34,18 +35,18 @@ struct GaussianProps {
 
 // ============================================================================
 // 投影到 UV 空間的 Gaussian 點（ExpMap 結果 + 渲染所需屬性）
-// 定義在此處，供 texture.h 內的 GaussianSplatRenderer 使用
-// ExpMapSolverSIBR.h 請移除其中的舊版定義，改由此處繼承
 // ============================================================================
 struct ProjectedGaussian {
-    int       originalIndex;  // 對應來源點雲的原始 index
-    glm::vec2 uv;             // ExpMap 解算出的 texture UV 座標
+    int       originalIndex;  
+    glm::vec2 uv;             
 
-    // 渲染所需欄位（由 ProjectAndInsertClouds 填入）
-    glm::vec3 position;       // 世界座標原始位置
-    float     opacity;        // raw（before sigmoid）
-    glm::vec3 scale;          // raw（before exp）
-    glm::vec4 rotation;       // quaternion (w, x, y, z)
+    glm::vec3 position;       
+    float     opacity;        
+    glm::vec3 scale;          
+    glm::vec4 rotation;       
+
+    glm::vec3 dU; 
+    glm::vec3 dV; 
 };
 
 namespace detail {
@@ -84,7 +85,6 @@ inline const std::string& meshFragSrc() {
     return s;
 }
 
-// Compile one shader stage; writes errors to stderr. Returns 0 on failure.
 inline GLuint compileGLShader(const std::string& src, GLenum type) {
     if (src.empty()) return 0;
     GLuint sh = glCreateShader(type);
@@ -99,7 +99,6 @@ inline GLuint compileGLShader(const std::string& src, GLenum type) {
     return sh;
 }
 
-// Link vs + fs into a program; deletes both shader objects.
 inline GLuint linkProgram(GLuint vs, GLuint fs) {
     GLuint prog = glCreateProgram();
     glAttachShader(prog, vs);
@@ -109,9 +108,7 @@ inline GLuint linkProgram(GLuint vs, GLuint fs) {
     glDeleteShader(fs);
     return prog;
 }
-
 }
-
 
 class TextureLoader {
 public:
@@ -125,7 +122,6 @@ public:
         return true;
     }
 
-    // Return all image paths under `directory` with a supported extension.
     std::vector<std::string> scanForImages(const std::string& directory) const {
         std::vector<std::string> result;
         fs::path dirPath(directory);
@@ -150,10 +146,8 @@ private:
     std::string              _path;
 };
 
-
 class SimplePointRenderer {
 public:
-    // Upload vertex positions from a PLY / mesh file to the GPU.
     void load(const std::string& path) {
         sibr::Mesh::Ptr mesh(new sibr::Mesh());
         if (!mesh->load(path)) return;
@@ -180,7 +174,6 @@ public:
         _loaded = true;
     }
 
-    // Read per-vertex `face_id` float property from a binary PLY header.
     void loadFids(const std::string& path) {
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) return;
@@ -238,8 +231,6 @@ public:
     const std::vector<float>& getRawData() const { return _rawData; }
     const std::vector<int>&   getFids()    const { return _fids; }
 
-    // 讀取 PLY 裡的 opacity / scale_0~2 / rot_0~3
-    // 必須在 load() 之後呼叫，使用同一個 PLY 路徑
     void loadGaussianProps(const std::string& path) {
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) return;
@@ -307,13 +298,11 @@ private:
     std::vector<GaussianProps> _gaussianProps;
 };
 
-
 class PointCloudRenderer {
 public:
     PointCloudRenderer()  { init(); }
     ~PointCloudRenderer() { if (_progID) glDeleteProgram(_progID); }
 
-    // Set MVP, configure GL state, and draw both point clouds.
     void render(
         const glm::mat4&           mvp,
         float                      pointSize,
@@ -359,7 +348,6 @@ private:
     GLint  _locUseLighting = -1;
 };
 
-
 class MeshWireframeRenderer {
 public:
     MeshWireframeRenderer()  { init(); }
@@ -371,7 +359,6 @@ public:
         }
     }
 
-    // Upload the entire mesh wireframe to GPU memory (called once)
     void uploadMesh(const sibr::Mesh* mesh) {
         if (!mesh || mesh->vertices().empty()) return;
 
@@ -406,7 +393,7 @@ public:
     }
 
     void render(
-        const sibr::Mesh*       mesh,
+        const sibr::Mesh* mesh,
         const std::set<int>&    activeIndices,
         const glm::mat4&        mvp,
         bool                    showMesh
@@ -419,7 +406,6 @@ public:
         glUniformMatrix4fv(_locMVP, 1, GL_FALSE, glm::value_ptr(mvp));
         glUniform1i(_locUseLighting, 0);
 
-        // 1. Draw entire static mesh in black (from GPU VRAM)
         if (showMesh && _staticVao) {
             glLineWidth(1.0f);
             glUniform3f(_locColor, 0.f, 0.f, 0.f);
@@ -428,7 +414,6 @@ public:
             glBindVertexArray(0);
         }
 
-        // 2. Draw yellow lines — UV-active triangles (dynamic overlay)
         if (_showYellowWireframe && !activeIndices.empty()) {
             const auto& verts   = mesh->vertices();
             const auto& normals = mesh->normals();
@@ -450,10 +435,9 @@ public:
         glUseProgram(0);
     }
 
-    bool _showYellowWireframe = true;  // toggled from GUI
+    bool _showYellowWireframe = true;  
 
 private:
-    // Append 3 edges of a triangle (pos + normal, stride = 6 floats) to `out`.
     void pushEdges(
         const sibr::Vector3u&              tri,
         const std::vector<sibr::Vector3f>& verts,
@@ -467,12 +451,11 @@ private:
             out.push_back(v.x()); out.push_back(v.y()); out.push_back(v.z());
             out.push_back(n.x()); out.push_back(n.y()); out.push_back(n.z());
         };
-        push(tri[0]); push(tri[1]); // edge 0-1
-        push(tri[1]); push(tri[2]); // edge 1-2
-        push(tri[2]); push(tri[0]); // edge 2-0
+        push(tri[0]); push(tri[1]); 
+        push(tri[1]); push(tri[2]); 
+        push(tri[2]); push(tri[0]); 
     }
 
-    // Upload a temporary VAO/VBO and draw as GL_LINES, then free immediately.
     void uploadAndDraw(const std::vector<float>& data) {
         GLuint vao, vbo;
         glGenVertexArrays(1, &vao);
@@ -517,9 +500,11 @@ struct TextureSlotData {
     std::string                      name;
     float                            alpha   = 1.f;
     bool                             visible = true;
-    // GS 渲染所需：儲存此 slot 的投影 Gaussian 點
     std::vector<ProjectedGaussian>   geoPoints;
     std::vector<ProjectedGaussian>   appPoints;
+    
+    GLuint                           ssbo = 0;
+    bool                             isDirty = true;
 };
 
 class TextureProjector {
@@ -528,7 +513,7 @@ public:
     ~TextureProjector() { if (_progID) glDeleteProgram(_progID); }
 
     void renderSlot(
-        const sibr::Mesh*                  mesh,
+        const sibr::Mesh* mesh,
         const std::vector<sibr::Vector3u>& triangles,
         const std::map<int, glm::vec2>&    uvMap,
         const sibr::Texture2DRGBA::Ptr&    texture,
@@ -543,7 +528,6 @@ public:
         const auto& normals  = mesh->normals();
         const sibr::Vector3f kDefaultN(0.f, 1.f, 0.f);
 
-        // VBO layout: ndcX, ndcY, u, v, nx, ny, nz  (7 floats per vertex)
         std::vector<float> vboData;
         vboData.reserve(triangles.size() * 3 * 7);
         for (const auto& tri : triangles) {
@@ -564,7 +548,7 @@ public:
                 triVerts.push_back(ndc.x);
                 triVerts.push_back(ndc.y);
                 triVerts.push_back(uv.x);
-                triVerts.push_back(1.f - uv.y); // flip Y
+                triVerts.push_back(1.f - uv.y); 
                 triVerts.push_back(n.x());
                 triVerts.push_back(n.y());
                 triVerts.push_back(n.z());
@@ -594,7 +578,6 @@ public:
         glUniform1i(_locUseLighting, _useLighting ? 1 : 0);
 
         if (_useLighting) {
-            // Light direction derived from camera: camera direction + upward bias
             glm::vec3 camDir  = glm::length(camPos) > 1e-4f ? glm::normalize(camPos) : glm::vec3(0, 0, 1);
             glm::vec3 lightDir = glm::normalize(camDir + glm::vec3(0.f, 0.4f, 0.f));
             glUniform3f(_locLightDir,         lightDir.x, lightDir.y, lightDir.z);
@@ -626,7 +609,7 @@ public:
     }
 
     void render(
-        const sibr::Mesh*                  mesh,
+        const sibr::Mesh* mesh,
         const std::vector<sibr::Vector3u>& triangles,
         const std::map<int, glm::vec2>&    uvMap,
         const sibr::Texture2DRGBA::Ptr&    texture,
@@ -638,7 +621,7 @@ public:
     }
 
     void renderAll(
-        const sibr::Mesh*                       mesh,
+        const sibr::Mesh* mesh,
         const std::vector<TextureSlotData>&     slots,
         const glm::mat4&                        mvp,
         const glm::vec3&                        camPos
@@ -650,7 +633,6 @@ public:
         }
     }
 
-    // ImGui checkbox + alpha slider + lighting toggle.
     void renderGUI() {
         ImGui::Checkbox("Show Texture Projection", &_enabled);
         if (_enabled) {
@@ -670,7 +652,6 @@ public:
 
 private:
     void init() {
-        // VBO layout: ndcX, ndcY, u, v, nx, ny, nz  (7 floats, stride = 28 bytes)
         const std::string vertSrc = R"(
             #version 330 core
             layout(location = 0) in vec2 aNDC;
@@ -704,7 +685,6 @@ private:
                     vec3  N    = normalize(vNormal);
                     vec3  L    = normalize(uLightDir);
                     float diff = max(dot(N, L), 0.0);
-                    // Blinn-Phong: view approximated as (0,0,1) in NDC space
                     vec3  H    = normalize(L + vec3(0.0, 0.0, 1.0));
                     float spec = pow(max(dot(N, H), 0.0), uShininess);
                     float light = uAmbient
@@ -740,9 +720,8 @@ private:
     GLint  _locShininess        = -1;
     float  _alpha               = 1.f;
     bool   _enabled             = true;
-    bool   _useLighting         = true;   // lighting ON by default
+    bool   _useLighting         = true;   
 
-    // Hard-coded lighting constants
     static constexpr float kAmbient          = 0.35f;
     static constexpr float kDiffuseStrength  = 0.65f;
     static constexpr float kSpecularStrength = 0.15f;
@@ -750,19 +729,18 @@ private:
 };
 
 // ============================================================================
-// GaussianSplatRenderer
-//
-// texture_gs 風格渲染：
-//   每個 Gaussian 以 instanced quad 渲染成橢圓 splat，
-//   顏色來自 ExpMap 解算出的 UV 座標對 texture 做 sample，
-//   完全取代 SH 係數取色的標準 3DGS 做法。
-//
-// 渲染流程：
-//   1. CPU 端依相機深度 back-to-front 排序（正確 alpha 合成）
-//   2. 建 per-instance VBO：position / scale / rotation / opacity / uv
-//   3. Vertex shader：3D covariance → screen-space conic → quad 大小
-//   4. Fragment shader：Gaussian falloff alpha × texture2D(uv)
+// GaussianSplatRenderer - 射線-切線平面幾何重建 (Ray-Tangent-Plane Intersection)
 // ============================================================================
+#pragma pack(push, 1)
+struct GaussianAttr {
+    glm::vec4 pos_opacity;
+    glm::vec4 rot;
+    glm::vec4 scale_uvx;
+    glm::vec4 du_uvy;
+    glm::vec4 dv;
+};
+#pragma pack(pop)
+
 class GaussianSplatRenderer {
 public:
     GaussianSplatRenderer()  { init(); }
@@ -771,30 +749,30 @@ public:
         if (_quadVBO) glDeleteBuffers(1, &_quadVBO);
     }
 
-    // 渲染 live (active) slot
     void render(
         const std::vector<ProjectedGaussian>& geoPoints,
         const std::vector<ProjectedGaussian>& appPoints,
+        GLuint& ssbo,
+        bool& isDirty,
         const sibr::Texture2DRGBA::Ptr&       texture,
         const glm::mat4& view,
         const glm::mat4& proj,
         float vpW, float vpH
     ) {
         if (!_enabled) return;
-        renderFlat(geoPoints, appPoints, texture, view, proj, vpW, vpH, _alpha);
+        renderFlat(geoPoints, appPoints, ssbo, isDirty, texture, view, proj, vpW, vpH, _alpha);
     }
 
-    // 渲染所有已儲存的 slots
     void renderAll(
-        const std::vector<TextureSlotData>& slots,
+        std::vector<TextureSlotData>& slots,
         const glm::mat4& view,
         const glm::mat4& proj,
         float vpW, float vpH
     ) {
         if (!_enabled) return;
-        for (const auto& slot : slots) {
+        for (auto& slot : slots) {
             if (!slot.visible || !slot.texture) continue;
-            renderFlat(slot.geoPoints, slot.appPoints, slot.texture, view, proj, vpW, vpH, slot.alpha);
+            renderFlat(slot.geoPoints, slot.appPoints, slot.ssbo, slot.isDirty, slot.texture, view, proj, vpW, vpH, slot.alpha);
         }
     }
 
@@ -809,14 +787,14 @@ public:
     }
 
     bool  isEnabled() const { return _enabled; }
-    float getAlpha()  const { return _alpha; }
-    void  setAlpha(float a) { _alpha = a; }
 
 private:
     void renderFlat(
         const std::vector<ProjectedGaussian>& geoPoints,
         const std::vector<ProjectedGaussian>& appPoints,
-        const sibr::Texture2DRGBA::Ptr&       texture,
+        GLuint& ssbo,
+        bool& isDirty,
+        const sibr::Texture2DRGBA::Ptr& texture,
         const glm::mat4& view,
         const glm::mat4& proj,
         float vpW, float vpH,
@@ -824,71 +802,75 @@ private:
     ) {
         if (!texture || texture->handle() == 0) return;
 
-        // --- 1. 合併兩個點雲並依深度排序 (back-to-front) ---
-        std::vector<const ProjectedGaussian*> all;
-        all.reserve(geoPoints.size() + appPoints.size());
-        for (const auto& p : geoPoints) all.push_back(&p);
-        for (const auto& p : appPoints) all.push_back(&p);
-        if (all.empty()) return;
+        int totalSize = geoPoints.size() + appPoints.size();
+        if (totalSize == 0) return;
 
-        std::sort(all.begin(), all.end(), [&](const ProjectedGaussian* a, const ProjectedGaussian* b) {
-            // view 矩陣第三行 = camera -Z 方向，取 view-space z
-            float za = view[0][2]*a->position.x + view[1][2]*a->position.y
-                     + view[2][2]*a->position.z + view[3][2];
-            float zb = view[0][2]*b->position.x + view[1][2]*b->position.y
-                     + view[2][2]*b->position.z + view[3][2];
-            return za < zb;  // 最遠（最負）先畫
-        });
-
-        // --- 2. 建 per-instance buffer (13 floats/instance) ---
-        // 佈局：pos(3) | scale(3) | rot(4) | opacity(1) | uv(2)
-        constexpr int kStride = 13;
-        std::vector<float> inst;
-        inst.reserve(all.size() * kStride);
-        for (const auto* p : all) {
-            inst.push_back(p->position.x);  inst.push_back(p->position.y);  inst.push_back(p->position.z);
-            inst.push_back(p->scale.x);     inst.push_back(p->scale.y);     inst.push_back(p->scale.z);
-            // rotation: glm::vec4 儲存 (w,x,y,z) → 依序推入
-            inst.push_back(p->rotation.x);  inst.push_back(p->rotation.y);
-            inst.push_back(p->rotation.z);  inst.push_back(p->rotation.w);
-            inst.push_back(p->opacity);
-            inst.push_back(p->uv.x);        inst.push_back(p->uv.y);
+        if (isDirty) {
+            if (ssbo == 0) { glGenBuffers(1, &ssbo); }
+            
+            std::vector<GaussianAttr> packed(totalSize);
+            for (int i = 0; i < totalSize; ++i) {
+                const ProjectedGaussian* p = (i < geoPoints.size()) ? &geoPoints[i] : &appPoints[i - geoPoints.size()];
+                packed[i].pos_opacity = glm::vec4(p->position, p->opacity);
+                packed[i].rot         = p->rotation;
+                packed[i].scale_uvx   = glm::vec4(p->scale, p->uv.x);
+                packed[i].du_uvy      = glm::vec4(p->dU, p->uv.y);
+                packed[i].dv          = glm::vec4(p->dV, 0.0f);
+            }
+            
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, packed.size() * sizeof(GaussianAttr), packed.data(), GL_STATIC_DRAW);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            
+            isDirty = false;
         }
 
-        // --- 3. 上傳 instance VBO ---
-        GLuint instVBO;
-        glGenBuffers(1, &instVBO);
-        glBindBuffer(GL_ARRAY_BUFFER, instVBO);
-        glBufferData(GL_ARRAY_BUFFER, inst.size()*sizeof(float), inst.data(), GL_DYNAMIC_DRAW);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        std::vector<int> indices(totalSize);
+        std::iota(indices.begin(), indices.end(), 0);
 
-        // --- 4. 建立 VAO（quad + instance）---
+        std::sort(indices.begin(), indices.end(), [&](int a, int b) {
+            const ProjectedGaussian* pA = (a < geoPoints.size()) ? &geoPoints[a] : &appPoints[a - geoPoints.size()];
+            const ProjectedGaussian* pB = (b < geoPoints.size()) ? &geoPoints[b] : &appPoints[b - geoPoints.size()];
+            
+            float za = view[0][2]*pA->position.x + view[1][2]*pA->position.y + view[2][2]*pA->position.z + view[3][2];
+            float zb = view[0][2]*pB->position.x + view[1][2]*pB->position.y + view[2][2]*pB->position.z + view[3][2];
+            return za < zb;
+        });
+
+        GLuint indexVBO;
+        glGenBuffers(1, &indexVBO);
+        glBindBuffer(GL_ARRAY_BUFFER, indexVBO);
+        glBufferData(GL_ARRAY_BUFFER, indices.size() * sizeof(int), indices.data(), GL_DYNAMIC_DRAW);
+
         GLuint vao;
         glGenVertexArrays(1, &vao);
         glBindVertexArray(vao);
 
-        // loc 0: quad 頂點 (static)
+        // 使用 2D Quad 作為渲染載體
         glBindBuffer(GL_ARRAY_BUFFER, _quadVBO);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
         glEnableVertexAttribArray(0);
 
-        // loc 1~5: per-instance
-        glBindBuffer(GL_ARRAY_BUFFER, instVBO);
-        const GLsizei s = kStride * sizeof(float);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, s, (void*)(0));               glEnableVertexAttribArray(1); glVertexAttribDivisor(1,1);
-        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, s, (void*)(3*sizeof(float))); glEnableVertexAttribArray(2); glVertexAttribDivisor(2,1);
-        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, s, (void*)(6*sizeof(float))); glEnableVertexAttribArray(3); glVertexAttribDivisor(3,1);
-        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, s, (void*)(10*sizeof(float)));glEnableVertexAttribArray(4); glVertexAttribDivisor(4,1);
-        glVertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, s, (void*)(11*sizeof(float)));glEnableVertexAttribArray(5); glVertexAttribDivisor(5,1);
+        glBindBuffer(GL_ARRAY_BUFFER, indexVBO);
+        glVertexAttribIPointer(1, 1, GL_INT, sizeof(int), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribDivisor(1, 1);
+        
         glBindVertexArray(0);
 
-        // --- 5. 設定 uniform 並繪製 ---
         float focalX = proj[0][0] * vpW * 0.5f;
         float focalY = proj[1][1] * vpH * 0.5f;
 
+        glm::mat4 invView = glm::inverse(view);
+        glm::mat4 invProj = glm::inverse(proj);
+        glm::vec3 camPos  = glm::vec3(invView[3]);
+
         glUseProgram(_progID);
-        glUniformMatrix4fv(_locView,   1, GL_FALSE, glm::value_ptr(view));
-        glUniformMatrix4fv(_locProj,   1, GL_FALSE, glm::value_ptr(proj));
+        glUniformMatrix4fv(_locView,     1, GL_FALSE, glm::value_ptr(view));
+        glUniformMatrix4fv(_locProj,     1, GL_FALSE, glm::value_ptr(proj));
+        glUniformMatrix4fv(_locInvView,  1, GL_FALSE, glm::value_ptr(invView));
+        glUniformMatrix4fv(_locInvProj,  1, GL_FALSE, glm::value_ptr(invProj));
+        glUniform3fv(_locCamPos,         1, glm::value_ptr(camPos));
         glUniform1f(_locFocalX,  focalX);
         glUniform1f(_locFocalY,  focalY);
         glUniform1f(_locW,       vpW);
@@ -897,47 +879,55 @@ private:
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture->handle());
+        
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
 
+        // ====================================================================
+        // 恢復 3DGS 平滑混合，避免深度遮擋帶來的硬邊緣與拼圖感
+        // ====================================================================
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
-        glDepthMask(GL_FALSE);          // splat 不寫入 depth buffer
+        glDepthMask(GL_FALSE);          
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_CULL_FACE);
 
         glBindVertexArray(vao);
-        glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)all.size());
+        glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)totalSize);
         glBindVertexArray(0);
 
-        // 還原狀態
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
 
         glDeleteVertexArrays(1, &vao);
-        glDeleteBuffers(1, &instVBO);
+        glDeleteBuffers(1, &indexVBO);
     }
 
     void init() {
-        // 靜態 unit quad (4 頂點，TRIANGLE_STRIP)
         const float quad[] = { -1.f,-1.f,  1.f,-1.f,  -1.f,1.f,  1.f,1.f };
         glGenBuffers(1, &_quadVBO);
         glBindBuffer(GL_ARRAY_BUFFER, _quadVBO);
         glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-        // ---- Vertex Shader ----
-        // 從 scale+rotation 計算 3D covariance → 投影到 screen-space conic
-        // 決定 quad 大小，輸出 pixel offset (vDelta) 給 fragment 計算 Gaussian falloff
         const std::string vs = R"(
             #version 430 core
-            layout(location=0) in vec2  aQuad;    // unit quad corner
-            layout(location=1) in vec3  aPos;     // world-space center
-            layout(location=2) in vec3  aScale;   // log scale (raw)
-            layout(location=3) in vec4  aRot;     // quaternion (w,x,y,z) raw
-            layout(location=4) in float aOpacity; // raw (before sigmoid)
-            layout(location=5) in vec2  aUV;      // ExpMap UV
+            layout(location=0) in vec2 aQuad;
+            layout(location=1) in int  aIndex;
+
+            struct GaussianAttr {
+                vec4 pos_opacity;
+                vec4 rot;
+                vec4 scale_uvx;
+                vec4 du_uvy;
+                vec4 dv;
+            };
+
+            layout(std430, binding = 0) buffer GaussianData {
+                GaussianAttr gData[];
+            };
 
             uniform mat4  uView;
             uniform mat4  uProj;
@@ -946,19 +936,48 @@ private:
             uniform float uW;
             uniform float uH;
 
-            out vec2  vDelta;    // pixel offset from splat center
-            out vec3  vConic;    // inverse 2D covariance (a,b,c)
+            out vec2  vDelta;    
+            out vec3  vConic;    
             out float vOpacity;
-            out vec2  vUV;
+            out vec2  vNDC;
+
+            // ==========================================================
+            // [架構修正] 絕對平坦傳遞 (Absolute Flat Interpolation)
+            // 強制使用 flat，阻止 OpenGL 進行 1/w 透視插值。保證平面幾何常數在整個 fragment 中絕對一致！
+            // ==========================================================
+            flat out vec3  vCenter;
+            flat out vec2  vUV_center;
+            flat out vec3  v_dU;
+            flat out vec3  v_dV;
+            flat out vec3  vNormal;
 
             void main() {
-                // --- view-space position ---
+                GaussianAttr attr = gData[aIndex];
+                vec3 aPos = attr.pos_opacity.xyz;
+                float aOpacity = attr.pos_opacity.w;
+                vec4 aRot = attr.rot;
+                vec3 aScale = attr.scale_uvx.xyz;
+                vec2 aUV = vec2(attr.scale_uvx.w, attr.du_uvy.w);
+                vec3 a_dU = attr.du_uvy.xyz;
+                vec3 a_dV = attr.dv.xyz;
+
+                // 綁定平面幾何常數
+                vCenter = aPos;
+                vUV_center = aUV;
+                v_dU = a_dU;
+                v_dV = a_dV;
+                
+                // 由 U V 梯度外積求出絕對網格法線
+                vec3 N_mesh = cross(a_dU, a_dV);
+                float lenN = length(N_mesh);
+                vNormal = (lenN > 1e-8) ? (N_mesh / lenN) : vec3(0.0, 1.0, 0.0);
+                vOpacity = aOpacity;
+
                 vec4 posV = uView * vec4(aPos, 1.0);
                 float tz = posV.z;
                 if (tz >= -0.1) { gl_Position = vec4(0,0,2,1); return; }
                 float tx = posV.x, ty = posV.y, tz2 = tz*tz;
 
-                // --- 3D covariance: Sigma = (R*S) * (R*S)^T ---
                 vec3  sc = exp(aScale);
                 float qw=aRot.x, qx=aRot.y, qy=aRot.z, qz=aRot.w;
                 mat3 R = mat3(
@@ -967,10 +986,9 @@ private:
                     vec3(2.0*(qx*qz+qw*qy), 2.0*(qy*qz-qw*qx), 1.0-2.0*(qx*qx+qy*qy))
                 );
                 mat3 S   = mat3(sc.x,0,0, 0,sc.y,0, 0,0,sc.z);
-                mat3 M   = R * S;
-                mat3 Sig = M * transpose(M);
+                mat3 M_cov = R * S;
+                mat3 Sig = M_cov * transpose(M_cov);
 
-                // --- Jacobian (perspective projection) ---
                 mat3 J = mat3(
                     vec3(uFocalX/tz,  0.0, 0.0),
                     vec3(0.0, uFocalY/tz,  0.0),
@@ -980,57 +998,89 @@ private:
                 mat3 T    = J * W;
                 mat3 cov2 = T * Sig * transpose(T);
 
-                // 2x2 covariance + low-pass filter
                 float a = cov2[0][0] + 0.3;
                 float b = cov2[0][1];
                 float c = cov2[1][1] + 0.3;
                 float det = a*c - b*b;
                 if (det <= 0.0) { gl_Position = vec4(0,0,2,1); return; }
 
-                // --- conic (inverse 2x2 cov) ---
                 vConic = vec3(c/det, -b/det, a/det);
 
-                // --- quad size from larger eigenvalue ---
                 float mid  = 0.5*(a+c);
                 float disc = sqrt(max(0.1, mid*mid - det));
                 float rad  = ceil(3.0 * sqrt(mid + disc));
 
-                // --- screen-space position ---
                 vec4  posC      = uProj * posV;
                 vec2  centerNDC = posC.xy / posC.w;
                 vec2  delta     = aQuad * rad;
-                gl_Position = vec4(centerNDC + delta*(2.0/vec2(uW,uH)),
-                                   posC.z/posC.w, 1.0);
-                vDelta   = delta;
-                vUV      = aUV;
-                vOpacity = aOpacity;
+                vNDC = centerNDC + delta*(2.0/vec2(uW,uH));
+                
+                gl_Position = vec4(vNDC, posC.z/posC.w, 1.0);
+                vDelta = delta;
             }
         )";
 
-        // ---- Fragment Shader ----
-        // Gaussian falloff × texture sample = texture_gs 的核心
         const std::string fs = R"(
             #version 330 core
             in vec2  vDelta;
             in vec3  vConic;
             in float vOpacity;
-            in vec2  vUV;
+            in vec2  vNDC;
+            
+            flat in vec3  vCenter;
+            flat in vec2  vUV_center;
+            flat in vec3  v_dU;
+            flat in vec3  v_dV;
+            flat in vec3  vNormal;
+            
             out vec4 FragColor;
+            
             uniform sampler2D uTexture;
             uniform float     uAlpha;
+            uniform mat4      uInvView;
+            uniform mat4      uInvProj;
+            uniform vec3      uCamPos;
 
             void main() {
+                // 1. 基本高斯柔和邊緣剔除
                 float dx = vDelta.x, dy = vDelta.y;
-                // Gaussian power: -0.5 * x^T * Sigma^{-1} * x
                 float power = -0.5*(vConic.x*dx*dx + 2.0*vConic.y*dx*dy + vConic.z*dy*dy);
                 if (power > 0.0) discard;
 
-                // sigmoid(opacity) * exp(power) = alpha of this splat
                 float alpha = min(0.99, (1.0/(1.0+exp(-vOpacity))) * exp(power));
                 if (alpha < 1.0/255.0) discard;
 
-                // texture_gs: colour from UV sample, NOT from SH coefficients
-                vec4 c = texture(uTexture, vUV);
+                // ==========================================================
+                // [架構修正] 射線-切線平面幾何重建 (Ray-Tangent-Plane Intersection)
+                // 摒棄 3D 橢球表面。將相機射線直接投影到「絕對平滑的網格切線面」上。
+                // 保證相鄰高斯點的 UV 完美無縫接合。
+                // ==========================================================
+                vec4 target = uInvProj * vec4(vNDC.x, vNDC.y, 1.0, 1.0);
+                vec3 rayDirView = normalize(target.xyz / target.w);
+                vec3 rayDir = normalize((uInvView * vec4(rayDirView, 0.0)).xyz);
+
+                float denom = dot(vNormal, rayDir);
+                if (abs(denom) < 1e-4) discard; // 防止視角與表面平行時的撕裂破圖 (魚鱗狀)
+                
+                float t = dot(vNormal, vCenter - uCamPos) / denom;
+                if (t < 0.0) discard; 
+
+                vec3 P_intersect = uCamPos + t * rayDir;
+                vec3 dP = P_intersect - vCenter;
+
+                vec2 exactUV = vUV_center + vec2(dot(v_dU, dP), dot(v_dV, dP));
+
+                // ==========================================================
+                // [架構修正] 嚴格物理範圍遮罩 (Strict Boundary Masking)
+                // 一刀切斷所有超出 [0,1] 矩形與 0.48 半徑圓形的像素，徹底消滅貼圖溢出。
+                // ==========================================================
+                if (exactUV.x < 0.0 || exactUV.x > 1.0 || exactUV.y < 0.0 || exactUV.y > 1.0) discard;
+                vec2 centerOffset = exactUV - vec2(0.5);
+                if (dot(centerOffset, centerOffset) > 0.2304) discard; // 0.48^2
+
+                vec4 c = texture(uTexture, exactUV);
+                if (c.a < 0.01) discard;
+
                 FragColor = vec4(c.rgb, c.a * alpha * uAlpha);
             }
         )";
@@ -1039,13 +1089,16 @@ private:
         GLuint sf = detail::compileGLShader(fs, GL_FRAGMENT_SHADER);
         _progID = detail::linkProgram(sv, sf);
 
-        _locView   = glGetUniformLocation(_progID, "uView");
-        _locProj   = glGetUniformLocation(_progID, "uProj");
-        _locFocalX = glGetUniformLocation(_progID, "uFocalX");
-        _locFocalY = glGetUniformLocation(_progID, "uFocalY");
-        _locW      = glGetUniformLocation(_progID, "uW");
-        _locH      = glGetUniformLocation(_progID, "uH");
-        _locAlpha  = glGetUniformLocation(_progID, "uAlpha");
+        _locView     = glGetUniformLocation(_progID, "uView");
+        _locProj     = glGetUniformLocation(_progID, "uProj");
+        _locInvView  = glGetUniformLocation(_progID, "uInvView");
+        _locInvProj  = glGetUniformLocation(_progID, "uInvProj");
+        _locCamPos   = glGetUniformLocation(_progID, "uCamPos");
+        _locFocalX   = glGetUniformLocation(_progID, "uFocalX");
+        _locFocalY   = glGetUniformLocation(_progID, "uFocalY");
+        _locW        = glGetUniformLocation(_progID, "uW");
+        _locH        = glGetUniformLocation(_progID, "uH");
+        _locAlpha    = glGetUniformLocation(_progID, "uAlpha");
 
         glUseProgram(_progID);
         glUniform1i(glGetUniformLocation(_progID, "uTexture"), 0);
@@ -1055,13 +1108,16 @@ private:
     GLuint _progID  = 0;
     GLuint _quadVBO = 0;
 
-    GLint  _locView   = -1;
-    GLint  _locProj   = -1;
-    GLint  _locFocalX = -1;
-    GLint  _locFocalY = -1;
-    GLint  _locW      = -1;
-    GLint  _locH      = -1;
-    GLint  _locAlpha  = -1;
+    GLint  _locView     = -1;
+    GLint  _locProj     = -1;
+    GLint  _locInvView  = -1;
+    GLint  _locInvProj  = -1;
+    GLint  _locCamPos   = -1;
+    GLint  _locFocalX   = -1;
+    GLint  _locFocalY   = -1;
+    GLint  _locW        = -1;
+    GLint  _locH        = -1;
+    GLint  _locAlpha    = -1;
 
     float _alpha   = 1.f;
     bool  _enabled = true;
