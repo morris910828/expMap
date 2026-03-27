@@ -25,28 +25,27 @@
 namespace fs = boost::filesystem;
 
 // ============================================================================
-// 每個 Gaussian 的物理屬性（從 PLY 讀取，數值為 raw，尚未套 activation）
+// 每個 Gaussian 的物理屬性
 // ============================================================================
 struct GaussianProps {
-    float opacity;    // raw，渲染時套 sigmoid
-    float scale[3];   // raw，渲染時套 exp
-    float rot[4];     // quaternion (w, x, y, z)，已正規化
+    float opacity;
+    float scale[3];
+    float rot[4];
 };
 
 // ============================================================================
-// 投影到 UV 空間的 Gaussian 點（ExpMap 結果 + 渲染所需屬性）
+// 投影到 UV 空間的 Gaussian 點
 // ============================================================================
 struct ProjectedGaussian {
-    int       originalIndex;  
-    glm::vec2 uv;             
-
-    glm::vec3 position;       
-    float     opacity;        
-    glm::vec3 scale;          
-    glm::vec4 rotation;       
-
-    glm::vec3 dU; 
-    glm::vec3 dV; 
+    int       originalIndex;
+    glm::vec2 uv;
+    glm::vec3 position;
+    glm::vec3 originalPos;
+    float     opacity;
+    glm::vec3 scale;
+    glm::vec4 rotation;
+    glm::vec3 dU;
+    glm::vec3 dV;
 };
 
 namespace detail {
@@ -351,8 +350,8 @@ private:
 class MeshWireframeRenderer {
 public:
     MeshWireframeRenderer()  { init(); }
-    ~MeshWireframeRenderer() { 
-        if (_progID) glDeleteProgram(_progID); 
+    ~MeshWireframeRenderer() {
+        if (_progID) glDeleteProgram(_progID);
         if (_staticVao) {
             glDeleteBuffers(1, &_staticVbo);
             glDeleteVertexArrays(1, &_staticVao);
@@ -424,7 +423,7 @@ public:
             for (int idx : activeIndices)
                 if (idx >= 0 && idx < (int)tris.size())
                     pushEdges(tris[idx], verts, normals, lines);
-            
+
             if (!lines.empty()) {
                 glLineWidth(2.5f);
                 glUniform3f(_locColor, 1.f, 1.f, 0.f);
@@ -435,7 +434,7 @@ public:
         glUseProgram(0);
     }
 
-    bool _showYellowWireframe = true;  
+    bool _showYellowWireframe = true;
 
 private:
     void pushEdges(
@@ -451,9 +450,9 @@ private:
             out.push_back(v.x()); out.push_back(v.y()); out.push_back(v.z());
             out.push_back(n.x()); out.push_back(n.y()); out.push_back(n.z());
         };
-        push(tri[0]); push(tri[1]); 
-        push(tri[1]); push(tri[2]); 
-        push(tri[2]); push(tri[0]); 
+        push(tri[0]); push(tri[1]);
+        push(tri[1]); push(tri[2]);
+        push(tri[2]); push(tri[0]);
     }
 
     void uploadAndDraw(const std::vector<float>& data) {
@@ -502,7 +501,7 @@ struct TextureSlotData {
     bool                             visible = true;
     std::vector<ProjectedGaussian>   geoPoints;
     std::vector<ProjectedGaussian>   appPoints;
-    
+
     GLuint                           ssbo = 0;
     bool                             isDirty = true;
 };
@@ -548,7 +547,7 @@ public:
                 triVerts.push_back(ndc.x);
                 triVerts.push_back(ndc.y);
                 triVerts.push_back(uv.x);
-                triVerts.push_back(1.f - uv.y); 
+                triVerts.push_back(1.f - uv.y);
                 triVerts.push_back(n.x());
                 triVerts.push_back(n.y());
                 triVerts.push_back(n.z());
@@ -591,8 +590,8 @@ public:
         glBindTexture(GL_TEXTURE_2D, texture->handle());
 
         glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LEQUAL);
-        glDepthMask(GL_TRUE);
+        glDepthFunc(GL_LESS);
+        glDepthMask(GL_FALSE);
         glEnable(GL_CULL_FACE);
         glCullFace(GL_BACK);
         glEnable(GL_BLEND);
@@ -601,6 +600,7 @@ public:
 
         glDisable(GL_BLEND);
         glDisable(GL_CULL_FACE);
+        glDepthMask(GL_TRUE);
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
         glBindVertexArray(0);
@@ -720,7 +720,7 @@ private:
     GLint  _locShininess        = -1;
     float  _alpha               = 1.f;
     bool   _enabled             = true;
-    bool   _useLighting         = true;   
+    bool   _useLighting         = true;
 
     static constexpr float kAmbient          = 0.35f;
     static constexpr float kDiffuseStrength  = 0.65f;
@@ -728,9 +728,6 @@ private:
     static constexpr float kShininess        = 32.f;
 };
 
-// ============================================================================
-// GaussianSplatRenderer - 射線-切線平面幾何重建 (Ray-Tangent-Plane Intersection)
-// ============================================================================
 #pragma pack(push, 1)
 struct GaussianAttr {
     glm::vec4 pos_opacity;
@@ -740,6 +737,145 @@ struct GaussianAttr {
     glm::vec4 dv;
 };
 #pragma pack(pop)
+
+// ============================================================================
+// MeshDepthStencilRenderer
+//
+// Renders the mesh geometry to the depth buffer and stencil buffer in a
+// colour-invisible prepass.  After this call:
+//   - depth buffer  : holds the mesh surface's depth at each covered pixel
+//   - stencil buffer: = 1 at every pixel where mesh geometry was rasterised
+//
+// GaussianSplatRenderer then uses stencil-test == 1 to clip its billboard
+// quads to the exact mesh footprint, preventing them from spilling over the
+// silhouette edge onto the background.
+// ============================================================================
+class MeshDepthStencilRenderer {
+public:
+    MeshDepthStencilRenderer()  { init(); }
+    ~MeshDepthStencilRenderer() {
+        if (_progID) glDeleteProgram(_progID);
+        if (_vao)    glDeleteVertexArrays(1, &_vao);
+        if (_vbo)    glDeleteBuffers(1, &_vbo);
+        if (_ebo)    glDeleteBuffers(1, &_ebo);
+    }
+
+    // Render mesh geometry to depth + stencil.  Call once per frame BEFORE
+    // GaussianSplatRenderer::render/renderAll.
+    void render(const sibr::Mesh* mesh, const glm::mat4& mvp) {
+        if (!mesh || mesh->vertices().empty() || mesh->triangles().empty()) return;
+
+        // Re-upload only when the mesh pointer changes (lazy upload)
+        if (mesh != _lastMesh) {
+            uploadMesh(mesh);
+            _lastMesh = mesh;
+        }
+
+        // ----- Stencil-ONLY write, colour masked, depth NOT written -----
+        //
+        // WHY glDepthMask(GL_FALSE):
+        //   After glClear(GL_DEPTH_BUFFER_BIT) the depth buffer is 1.0 (far).
+        //   If we write the mesh surface depth here, GaussianSplatRenderer
+        //   (GL_LEQUAL) would require Gaussian fragments to be at or in FRONT
+        //   of the mesh surface.  Main-cloud Gaussians are volumetric blobs
+        //   whose 3D centres may sit slightly BEHIND (inside) the mesh surface.
+        //   Their projected clip-space depth > mesh depth → GL_LEQUAL fails →
+        //   almost every fragment is discarded → the "blocked ring" artefact.
+        //
+        //   By NOT writing depth, the buffer stays at 1.0.  GL_LEQUAL then
+        //   passes for every Gaussian (depth < 1.0 always), so the entire
+        //   billboard is drawn.  Silhouette clipping is handled by the stencil
+        //   test; surface binding is handled by the UV [0,1] check + back-face
+        //   normal check in the fragment shader.
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+
+        glDisable(GL_DEPTH_TEST);   // no depth test needed for stencil write
+        glDepthMask(GL_FALSE);      // do NOT overwrite depth buffer
+
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_ALWAYS, 1, 0xFF);   // always pass, write 1
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        glStencilMask(0xFF);
+
+        glUseProgram(_progID);
+        glUniformMatrix4fv(_locMVP, 1, GL_FALSE, glm::value_ptr(mvp));
+
+        glBindVertexArray(_vao);
+        glDrawElements(GL_TRIANGLES, _indexCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+
+        // Restore colour write and depth; leave stencil test enabled
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_DEPTH_TEST);
+    }
+
+private:
+    void init() {
+        // Minimal vertex-only shader: just transforms positions.
+        const std::string vs = R"(
+            #version 330 core
+            layout(location = 0) in vec3 aPos;
+            uniform mat4 uMVP;
+            void main() { gl_Position = uMVP * vec4(aPos, 1.0); }
+        )";
+        const std::string fs = R"(
+            #version 330 core
+            void main() {}
+        )";
+        GLuint sv = detail::compileGLShader(vs, GL_VERTEX_SHADER);
+        GLuint sf = detail::compileGLShader(fs, GL_FRAGMENT_SHADER);
+        _progID = detail::linkProgram(sv, sf);
+        _locMVP = glGetUniformLocation(_progID, "uMVP");
+
+        glGenVertexArrays(1, &_vao);
+        glGenBuffers(1, &_vbo);
+        glGenBuffers(1, &_ebo);
+    }
+
+    void uploadMesh(const sibr::Mesh* mesh) {
+        const auto& verts = mesh->vertices();
+        const auto& tris  = mesh->triangles();
+
+        std::vector<float> vdata;
+        vdata.reserve(verts.size() * 3);
+        for (const auto& v : verts) {
+            vdata.push_back(v.x());
+            vdata.push_back(v.y());
+            vdata.push_back(v.z());
+        }
+
+        std::vector<uint32_t> idata;
+        idata.reserve(tris.size() * 3);
+        for (const auto& t : tris) {
+            idata.push_back(t[0]);
+            idata.push_back(t[1]);
+            idata.push_back(t[2]);
+        }
+        _indexCount = (GLsizei)idata.size();
+
+        glBindVertexArray(_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, _vbo);
+        glBufferData(GL_ARRAY_BUFFER, vdata.size() * sizeof(float), vdata.data(), GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idata.size() * sizeof(uint32_t), idata.data(), GL_STATIC_DRAW);
+
+        glBindVertexArray(0);
+    }
+
+    GLuint _progID     = 0;
+    GLuint _vao        = 0;
+    GLuint _vbo        = 0;
+    GLuint _ebo        = 0;
+    GLint  _locMVP     = -1;
+    GLsizei _indexCount = 0;
+    const sibr::Mesh* _lastMesh = nullptr;
+};
 
 class GaussianSplatRenderer {
 public:
@@ -802,36 +938,40 @@ private:
     ) {
         if (!texture || texture->handle() == 0) return;
 
-        int totalSize = geoPoints.size() + appPoints.size();
+        int totalSize = (int)(geoPoints.size() + appPoints.size());
         if (totalSize == 0) return;
 
+        // Upload SSBO if dirty
         if (isDirty) {
             if (ssbo == 0) { glGenBuffers(1, &ssbo); }
-            
+
             std::vector<GaussianAttr> packed(totalSize);
             for (int i = 0; i < totalSize; ++i) {
-                const ProjectedGaussian* p = (i < geoPoints.size()) ? &geoPoints[i] : &appPoints[i - geoPoints.size()];
+                const ProjectedGaussian* p = (i < (int)geoPoints.size())
+                    ? &geoPoints[i]
+                    : &appPoints[i - (int)geoPoints.size()];
                 packed[i].pos_opacity = glm::vec4(p->position, p->opacity);
                 packed[i].rot         = p->rotation;
                 packed[i].scale_uvx   = glm::vec4(p->scale, p->uv.x);
                 packed[i].du_uvy      = glm::vec4(p->dU, p->uv.y);
                 packed[i].dv          = glm::vec4(p->dV, 0.0f);
             }
-            
+
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
             glBufferData(GL_SHADER_STORAGE_BUFFER, packed.size() * sizeof(GaussianAttr), packed.data(), GL_STATIC_DRAW);
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-            
+
             isDirty = false;
         }
 
+        // Sort back-to-front for correct alpha blending
         std::vector<int> indices(totalSize);
         std::iota(indices.begin(), indices.end(), 0);
-
         std::sort(indices.begin(), indices.end(), [&](int a, int b) {
-            const ProjectedGaussian* pA = (a < geoPoints.size()) ? &geoPoints[a] : &appPoints[a - geoPoints.size()];
-            const ProjectedGaussian* pB = (b < geoPoints.size()) ? &geoPoints[b] : &appPoints[b - geoPoints.size()];
-            
+            const ProjectedGaussian* pA = (a < (int)geoPoints.size())
+                ? &geoPoints[a] : &appPoints[a - (int)geoPoints.size()];
+            const ProjectedGaussian* pB = (b < (int)geoPoints.size())
+                ? &geoPoints[b] : &appPoints[b - (int)geoPoints.size()];
             float za = view[0][2]*pA->position.x + view[1][2]*pA->position.y + view[2][2]*pA->position.z + view[3][2];
             float zb = view[0][2]*pB->position.x + view[1][2]*pB->position.y + view[2][2]*pB->position.z + view[3][2];
             return za < zb;
@@ -846,7 +986,6 @@ private:
         glGenVertexArrays(1, &vao);
         glBindVertexArray(vao);
 
-        // 使用 2D Quad 作為渲染載體
         glBindBuffer(GL_ARRAY_BUFFER, _quadVBO);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
         glEnableVertexAttribArray(0);
@@ -855,7 +994,7 @@ private:
         glVertexAttribIPointer(1, 1, GL_INT, sizeof(int), (void*)0);
         glEnableVertexAttribArray(1);
         glVertexAttribDivisor(1, 1);
-        
+
         glBindVertexArray(0);
 
         float focalX = proj[0][0] * vpW * 0.5f;
@@ -866,38 +1005,67 @@ private:
         glm::vec3 camPos  = glm::vec3(invView[3]);
 
         glUseProgram(_progID);
-        glUniformMatrix4fv(_locView,     1, GL_FALSE, glm::value_ptr(view));
-        glUniformMatrix4fv(_locProj,     1, GL_FALSE, glm::value_ptr(proj));
-        glUniformMatrix4fv(_locInvView,  1, GL_FALSE, glm::value_ptr(invView));
-        glUniformMatrix4fv(_locInvProj,  1, GL_FALSE, glm::value_ptr(invProj));
-        glUniform3fv(_locCamPos,         1, glm::value_ptr(camPos));
-        glUniform1f(_locFocalX,  focalX);
-        glUniform1f(_locFocalY,  focalY);
-        glUniform1f(_locW,       vpW);
-        glUniform1f(_locH,       vpH);
-        glUniform1f(_locAlpha,   alpha);
+        glUniformMatrix4fv(_locView,    1, GL_FALSE, glm::value_ptr(view));
+        glUniformMatrix4fv(_locProj,    1, GL_FALSE, glm::value_ptr(proj));
+        glUniformMatrix4fv(_locInvView, 1, GL_FALSE, glm::value_ptr(invView));
+        glUniformMatrix4fv(_locInvProj, 1, GL_FALSE, glm::value_ptr(invProj));
+        glUniform3fv(_locCamPos,        1, glm::value_ptr(camPos));
+        glUniform1f(_locFocalX, focalX);
+        glUniform1f(_locFocalY, focalY);
+        glUniform1f(_locW,      vpW);
+        glUniform1f(_locH,      vpH);
+        glUniform1f(_locAlpha,  alpha);
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture->handle());
-        
+
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
 
-        // ====================================================================
-        // 恢復 3DGS 平滑混合，避免深度遮擋帶來的硬邊緣與拼圖感
-        // ====================================================================
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LEQUAL);
-        glDepthMask(GL_FALSE);          
+        // ------------------------------------------------------------------
+        // Depth + stencil state for surface-bound rendering
+        //
+        // Depth test (GL_LEQUAL):
+        //   The depth buffer was pre-filled by MeshDepthStencilRenderer.
+        //   Gaussian fragments at the surface pass (same depth ± precision).
+        //   Fragments behind the mesh are culled.
+        //
+        // Stencil test (GL_EQUAL 1):
+        //   MeshDepthStencilRenderer wrote stencil=1 at every pixel covered
+        //   by the mesh.  Gaussian billboard quads that extend beyond the
+        //   mesh silhouette land on pixels with stencil=0 and are discarded.
+        //   This is the key fix for the "texture floating over background" bug.
+        //
+        // Depth mask = false: Gaussians do not overwrite the pre-filled depth.
+        // Stencil mask = 0:   Gaussians do not modify the stencil.
+        // ------------------------------------------------------------------
+        // Depth test disabled: prepass no longer writes depth, so the buffer
+        // holds 1.0 (far) everywhere. Relying on depth would be meaningless.
+        // Surface binding is guaranteed by:
+        //   (a) stencil == 1  → only renders inside mesh silhouette
+        //   (b) fragment shader UV [0,1] clip  → only where UV is valid
+        //   (c) fragment shader back-face discard  → correct orientation
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_EQUAL, 1, 0xFF);    // pass only where mesh was rendered
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        glStencilMask(0x00);                 // don't write stencil
+
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_CULL_FACE);
 
         glBindVertexArray(vao);
         glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)totalSize);
         glBindVertexArray(0);
 
-        glDepthMask(GL_TRUE);
+        // Restore state
         glDisable(GL_BLEND);
+        glDisable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_DEPTH_TEST);
+
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
 
@@ -936,15 +1104,11 @@ private:
             uniform float uW;
             uniform float uH;
 
-            out vec2  vDelta;    
-            out vec3  vConic;    
+            out vec2  vDelta;
+            out vec3  vConic;
             out float vOpacity;
             out vec2  vNDC;
 
-            // ==========================================================
-            // [架構修正] 絕對平坦傳遞 (Absolute Flat Interpolation)
-            // 強制使用 flat，阻止 OpenGL 進行 1/w 透視插值。保證平面幾何常數在整個 fragment 中絕對一致！
-            // ==========================================================
             flat out vec3  vCenter;
             flat out vec2  vUV_center;
             flat out vec3  v_dU;
@@ -953,28 +1117,26 @@ private:
 
             void main() {
                 GaussianAttr attr = gData[aIndex];
-                vec3 aPos = attr.pos_opacity.xyz;
+                vec3 aPos     = attr.pos_opacity.xyz;
                 float aOpacity = attr.pos_opacity.w;
-                vec4 aRot = attr.rot;
-                vec3 aScale = attr.scale_uvx.xyz;
-                vec2 aUV = vec2(attr.scale_uvx.w, attr.du_uvy.w);
-                vec3 a_dU = attr.du_uvy.xyz;
-                vec3 a_dV = attr.dv.xyz;
+                vec4 aRot     = attr.rot;
+                vec3 aScale   = attr.scale_uvx.xyz;
+                vec2 aUV      = vec2(attr.scale_uvx.w, attr.du_uvy.w);
+                vec3 a_dU     = attr.du_uvy.xyz;
+                vec3 a_dV     = attr.dv.xyz;
 
-                // 綁定平面幾何常數
-                vCenter = aPos;
+                vCenter    = aPos;
                 vUV_center = aUV;
-                v_dU = a_dU;
-                v_dV = a_dV;
-                
-                // 由 U V 梯度外積求出絕對網格法線
+                v_dU       = a_dU;
+                v_dV       = a_dV;
+
                 vec3 N_mesh = cross(a_dU, a_dV);
-                float lenN = length(N_mesh);
-                vNormal = (lenN > 1e-8) ? (N_mesh / lenN) : vec3(0.0, 1.0, 0.0);
-                vOpacity = aOpacity;
+                float lenN  = length(N_mesh);
+                vNormal     = (lenN > 1e-8) ? (N_mesh / lenN) : vec3(0.0, 1.0, 0.0);
+                vOpacity    = aOpacity;
 
                 vec4 posV = uView * vec4(aPos, 1.0);
-                float tz = posV.z;
+                float tz  = posV.z;
                 if (tz >= -0.1) { gl_Position = vec4(0,0,2,1); return; }
                 float tx = posV.x, ty = posV.y, tz2 = tz*tz;
 
@@ -985,9 +1147,9 @@ private:
                     vec3(2.0*(qx*qy-qw*qz), 1.0-2.0*(qx*qx+qz*qz), 2.0*(qy*qz+qw*qx)),
                     vec3(2.0*(qx*qz+qw*qy), 2.0*(qy*qz-qw*qx), 1.0-2.0*(qx*qx+qy*qy))
                 );
-                mat3 S   = mat3(sc.x,0,0, 0,sc.y,0, 0,0,sc.z);
+                mat3 S    = mat3(sc.x,0,0, 0,sc.y,0, 0,0,sc.z);
                 mat3 M_cov = R * S;
-                mat3 Sig = M_cov * transpose(M_cov);
+                mat3 Sig  = M_cov * transpose(M_cov);
 
                 mat3 J = mat3(
                     vec3(uFocalX/tz,  0.0, 0.0),
@@ -1006,15 +1168,14 @@ private:
 
                 vConic = vec3(c/det, -b/det, a/det);
 
-                float mid  = 0.5*(a+c);
-                float disc = sqrt(max(0.1, mid*mid - det));
-                float rad  = ceil(3.0 * sqrt(mid + disc));
+                float radX = ceil(3.0 * sqrt(a));
+                float radY = ceil(3.0 * sqrt(c));
 
                 vec4  posC      = uProj * posV;
                 vec2  centerNDC = posC.xy / posC.w;
-                vec2  delta     = aQuad * rad;
+                vec2  delta     = aQuad * vec2(radX, radY);
                 vNDC = centerNDC + delta*(2.0/vec2(uW,uH));
-                
+
                 gl_Position = vec4(vNDC, posC.z/posC.w, 1.0);
                 vDelta = delta;
             }
@@ -1026,15 +1187,15 @@ private:
             in vec3  vConic;
             in float vOpacity;
             in vec2  vNDC;
-            
+
             flat in vec3  vCenter;
             flat in vec2  vUV_center;
             flat in vec3  v_dU;
             flat in vec3  v_dV;
             flat in vec3  vNormal;
-            
+
             out vec4 FragColor;
-            
+
             uniform sampler2D uTexture;
             uniform float     uAlpha;
             uniform mat4      uInvView;
@@ -1042,7 +1203,6 @@ private:
             uniform vec3      uCamPos;
 
             void main() {
-                // 1. 基本高斯柔和邊緣剔除
                 float dx = vDelta.x, dy = vDelta.y;
                 float power = -0.5*(vConic.x*dx*dx + 2.0*vConic.y*dx*dy + vConic.z*dy*dy);
                 if (power > 0.0) discard;
@@ -1050,33 +1210,27 @@ private:
                 float alpha = min(0.99, (1.0/(1.0+exp(-vOpacity))) * exp(power));
                 if (alpha < 1.0/255.0) discard;
 
-                // ==========================================================
-                // [架構修正] 射線-切線平面幾何重建 (Ray-Tangent-Plane Intersection)
-                // 摒棄 3D 橢球表面。將相機射線直接投影到「絕對平滑的網格切線面」上。
-                // 保證相鄰高斯點的 UV 完美無縫接合。
-                // ==========================================================
-                vec4 target = uInvProj * vec4(vNDC.x, vNDC.y, 1.0, 1.0);
-                vec3 rayDirView = normalize(target.xyz / target.w);
-                vec3 rayDir = normalize((uInvView * vec4(rayDirView, 0.0)).xyz);
+                float denom = dot(vNormal, normalize((uInvView * vec4(
+                    normalize((uInvProj * vec4(vNDC.x, vNDC.y, 1.0, 1.0)).xyz), 0.0)).xyz));
+                if (denom >= -1e-4) discard;
 
-                float denom = dot(vNormal, rayDir);
-                if (abs(denom) < 1e-4) discard; // 防止視角與表面平行時的撕裂破圖 (魚鱗狀)
-                
-                float t = dot(vNormal, vCenter - uCamPos) / denom;
-                if (t < 0.0) discard; 
+                vec4 clipH = uInvProj * vec4(vNDC.x, vNDC.y, 1.0, 1.0);
+                clipH /= clipH.w;
+                vec3 rayDir = normalize((uInvView * vec4(normalize(clipH.xyz), 0.0)).xyz);
+                float t_hit = dot(vCenter - uCamPos, vNormal) / denom;
+                vec3 hitPos  = uCamPos + t_hit * rayDir;
+                vec3 offset  = hitPos - vCenter;
 
-                vec3 P_intersect = uCamPos + t * rayDir;
-                vec3 dP = P_intersect - vCenter;
-
-                vec2 exactUV = vUV_center + vec2(dot(v_dU, dP), dot(v_dV, dP));
-
-                // ==========================================================
-                // [架構修正] 嚴格物理範圍遮罩 (Strict Boundary Masking)
-                // 一刀切斷所有超出 [0,1] 矩形與 0.48 半徑圓形的像素，徹底消滅貼圖溢出。
-                // ==========================================================
+                float len2U  = dot(v_dU, v_dU);
+                float len2V  = dot(v_dV, v_dV);
+                float deltaU = (len2U > 1e-12) ? dot(offset, v_dU) / len2U : 0.0;
+                float deltaV = (len2V > 1e-12) ? dot(offset, v_dV) / len2V : 0.0;
+                vec2 exactUV = vUV_center + vec2(deltaU, deltaV);
+                //有改動：增加了對exactUV的衍生變量uv_dx和uv_dy的計算，並在discard條件中加入了對exactUV的範圍檢查，以確保只渲染UV坐標在[0,1]範圍內的片段。
+                vec2 uv_dx = dFdx(exactUV);
+                vec2 uv_dy = dFdy(exactUV);
+                //
                 if (exactUV.x < 0.0 || exactUV.x > 1.0 || exactUV.y < 0.0 || exactUV.y > 1.0) discard;
-                vec2 centerOffset = exactUV - vec2(0.5);
-                if (dot(centerOffset, centerOffset) > 0.2304) discard; // 0.48^2
 
                 vec4 c = texture(uTexture, exactUV);
                 if (c.a < 0.01) discard;

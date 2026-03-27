@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact sibr@inria.fr and/or George.Drettakis@inria.fr
@@ -19,12 +19,15 @@
 # include <core/view/ViewBase.hpp>
 # include <core/renderer/CopyRenderer.hpp>
 # include <core/renderer/PointBasedRenderer.hpp>
+# include <core/graphics/Image.hpp>
 # include <memory>
 # include <core/graphics/Texture.hpp>
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 #include <functional>
 #include <unordered_map>
+#include <map>
+#include <array>
 # include "GaussianSurfaceRenderer.hpp"
 
 namespace CudaRasterizer
@@ -32,16 +35,11 @@ namespace CudaRasterizer
 	class Rasterizer;
 }
 
-namespace sibr { 
+namespace sibr {
 
 	class BufferCopyRenderer;
 	class BufferCopyRenderer2;
 
-	/**
-	 * \class GaussianView
-	 * \brief Renders 3D Gaussian splats. Does NOT draw overlay points;
-	 *        overlay point rendering is handled by MeshGaussianView in main.cpp.
-	 */
 	class SIBR_EXP_ULR_EXPORT GaussianView : public sibr::ViewBase
 	{
 		SIBR_CLASS_PTR(GaussianView);
@@ -52,28 +50,36 @@ namespace sibr {
 		             const char* file, bool* message_read, int sh_degree,
 		             bool white_bg = false, bool useInterop = true, int device = 0);
 
-		void setScene(const sibr::BasicIBRScene::Ptr & newScene);
+		void setScene(const sibr::BasicIBRScene::Ptr& newScene);
 
 		void onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camera& eye) override;
 		void onUpdate(Input& input) override;
 		void onGUI() override;
 
-		/** Update Gaussian colors (SH DC) for the given original PLY indices.
-		 *  Uses inverse mapping to handle Morton-sorted buffer and SH domain conversion.
-		 */
-		void updateGaussianColorsBulk(const std::vector<int>& originalIndices, const std::vector<sibr::Vector3f>& colors);
+		int getCount() const { return count; }
 
-		/** Update Gaussian colours by matching world-space positions.
-		 *  This is the correct method when the caller has geo/app sub-cloud points
-		 *  whose indices do NOT directly map to point_cloud.ply indices.
-		 *  Builds a position->sortedIndex hash at construction time; call once per bake.
-		 *  Higher-order SH bands are zeroed for baked Gaussians (pure diffuse texture).
-		 */
-		void updateGaussianColorsByWorldPos(
-			const std::vector<sibr::Vector3f>& worldPositions,
-			const std::vector<sibr::Vector3f>& colors);
+		const std::vector<sibr::Vector3f>& getCpuPositions();
 
-		const std::shared_ptr<sibr::BasicIBRScene> & getScene() const { return _scene; }
+		void downloadGaussianData(
+			std::vector<float>& outRot,
+			std::vector<float>& outScale,
+			std::vector<float>& outOpacity);
+
+		// 新版：上傳 per-Gaussian UV + dU + dV + optional texture
+		void setUVsAndTexture(
+			const std::vector<sibr::Vector2f>& uvs,
+			const std::vector<sibr::Vector3f>& dUs,
+			const std::vector<sibr::Vector3f>& dVs,
+			sibr::Texture2DRGBA::Ptr texPtr);
+
+		void suppressGaussiansInRegion(
+			const std::vector<sibr::Vector2f>& uvs,
+			const sibr::Vector3f& center,
+			float suppressRadius);
+
+		void restoreOpacities();
+
+		const std::shared_ptr<sibr::BasicIBRScene>& getScene() const { return _scene; }
 
 		virtual ~GaussianView() override;
 
@@ -99,12 +105,18 @@ namespace sibr {
 		float* shs_cuda;
 		int* rect_cuda;
 
-		// Inverse mapping: original PLY index -> sorted GPU index
+		float* uvs_cuda = nullptr;
+		float* dU_cuda = nullptr;
+		float* dV_cuda = nullptr;
+
+		cudaTextureObject_t tex_cuda = 0;
+		cudaArray_t tex_array = nullptr;
+		sibr::Texture2DRGBA::Ptr _current_tex;
+
 		std::vector<int> _plyToSorted;
 
-		// Position -> sorted GPU index (built at load time for world-pos baking)
-		// Key = hash of raw float bits of (x, y, z).
-		std::unordered_map<uint64_t, int> _posToSorted;
+		std::vector<sibr::Vector3f> _cpuPos;
+		std::vector<float> _cpuOpacityCache;
 
 		GLuint imageBuffer;
 		cudaGraphicsResource_t imageBufferCuda;

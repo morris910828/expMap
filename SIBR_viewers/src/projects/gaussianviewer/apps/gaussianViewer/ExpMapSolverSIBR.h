@@ -15,7 +15,10 @@
 #include <imgui/imgui.h>
 #include "texture.h"
 
-inline glm::vec3 toGlm(const sibr::Vector3f& v) { return glm::vec3(v.x(), v.y(), v.z()); }
+// Helper to convert SIBR vector to GLM
+inline glm::vec3 toGlm(const sibr::Vector3f& v) { 
+    return glm::vec3(v.x(), v.y(), v.z()); 
+}
 
 struct ProjectionStats {
     int appTotal = 0;
@@ -103,7 +106,27 @@ public:
     const TextureLoader& GetTextureLoader() const { return _textureLoader; }
     TextureLoader& GetTextureLoader() { return _textureLoader; }
 
+    bool ConsumeTextureDirty() {
+        if (_textureDirty) { _textureDirty = false; return true; }
+        return false;
+    }
+
     const ProjectionStats& GetProjectionStats() const { return _projectionStats; }
+
+    // Call this from main.cpp after building _texGaussians so that
+    // SaveCurrentSlot stores the same main-cloud Gaussians that the live
+    // renderer uses, making before/after Save visually identical.
+    void SetMainGaussiansForNextSave(const std::vector<ProjectedGaussian>& g) {
+        _pendingMainGaussians = g;
+    }
+
+    // Set the UV positions of Gaussians that are inside the sphere but
+    // failed to receive a texture UV (suppressed / no-triangle-hit).
+    // These will be shown as green dots on the UV canvas.
+    void SetSuppressedUVs(const std::vector<glm::vec2>& uvs) {
+        _suppressedUVs = uvs;
+    }
+    void ClearSuppressedUVs() { _suppressedUVs.clear(); }
 
     int SaveCurrentSlot(const std::string& name = "") {
         if (_validTriangles.empty() || !_textureLoader.getTexture()) return -1;
@@ -114,11 +137,19 @@ public:
         slot.texturePath = _textureLoader.getPath();
         slot.alpha       = 1.f;
         slot.visible     = true;
-        
-        slot.geoPoints   = _projectedGeoPoints;
-        slot.appPoints   = _projectedAppPoints;
-        slot.ssbo        = 0;
-        slot.isDirty     = true;
+
+        // Use the main-cloud Gaussians (set via SetMainGaussiansForNextSave)
+        // instead of the aux geo/app point clouds, so the saved slot renders
+        // identically to what was visible before saving.
+        if (!_pendingMainGaussians.empty()) {
+            slot.geoPoints = _pendingMainGaussians;
+            slot.appPoints = {};
+        } else {
+            slot.geoPoints = _projectedGeoPoints;
+            slot.appPoints = _projectedAppPoints;
+        }
+        slot.ssbo    = 0;
+        slot.isDirty = true;
         
         _slots.push_back(std::move(slot));
         return (int)_slots.size() - 1;
@@ -166,6 +197,7 @@ public:
 
         if (_liveSSBO) { glDeleteBuffers(1, &_liveSSBO); _liveSSBO = 0; }
         _liveDirty = true;
+        _suppressedUVs.clear();
     }
     
     void OnRaycastHit(const sibr::Vector3f& hitPos, float radius, int hitTriID) {
@@ -181,7 +213,7 @@ public:
             hitNormal.normalize();
         }
         
-        Compute(hitPos, hitNormal, radius);
+        Compute(hitPos, hitNormal, radius, hitTriID);
     }
 
 
@@ -231,7 +263,7 @@ public:
         else return _extraNodeNormals[id - _mesh->vertices().size()];
     }
 
-    void Compute(const sibr::Vector3f& hitPos, const sibr::Vector3f& hitNormal, float radius) {
+    void Compute(const sibr::Vector3f& hitPos, const sibr::Vector3f& hitNormal, float radius, int hitTriID = -1) {
         if(!_mesh) return;
 
         _vertexData.clear();
@@ -254,32 +286,32 @@ public:
         _dijkstraPath.clear();
 
         glm::vec3 target = toGlm(hitPos);
-        int seedIdx = -1;
-        float minD = 1e9f;
-        const auto& verts = _mesh->vertices();
-        const auto& normals = _mesh->normals();
-        
-        for(size_t i=0; i<verts.size(); ++i) {
-            float d = glm::distance(target, toGlm(verts[i]));
-            if(d < minD) { minD = d; seedIdx = (int)i; }
-        }
-
-        if(seedIdx == -1) return;
 
         auto comp = [&](int a, int b){ return _vertexData[a].cost > _vertexData[b].cost; };
         std::priority_queue<int, std::vector<int>, decltype(comp)> pq(comp);
 
-        glm::vec3 seedN = (normals.size() > seedIdx) ? toGlm(normals[seedIdx]) : toGlm(hitNormal);
-        _seedFrame = TangentFrame(toGlm(verts[seedIdx]), seedN);
+        _seedFrame = TangentFrame(target, toGlm(hitNormal));
 
-        ExpVertex vSeed;
-        vSeed.id = seedIdx;
-        vSeed.cost = 0.0f;
-        vSeed.uv = {0.0f, 0.0f};
-        vSeed.tangentX = _seedFrame.axes[0]; 
-
-        _vertexData[seedIdx] = vSeed;
-        pq.push(seedIdx);
+        if (hitTriID >= 0 && hitTriID < _mesh->triangles().size()) {
+            const auto& tri = _mesh->triangles()[hitTriID];
+            for (int k = 0; k < 3; ++k) {
+                int vIdx = (int)tri[k];
+                glm::vec3 vPos = toGlm(_mesh->vertices()[vIdx]);
+                
+                ExpVertex vSeed;
+                vSeed.id = vIdx;
+                vSeed.cost = glm::distance(target, vPos);
+                
+                glm::vec3 localPos = _seedFrame.toLocal(vPos - target);
+                vSeed.uv = glm::vec2(localPos.x, localPos.y);
+                vSeed.tangentX = _seedFrame.axes[0]; 
+                
+                _vertexData[vIdx] = vSeed;
+                pq.push(vIdx);
+            }
+        } else {
+            return;
+        }
 
         float maxCostFound = 0.0f;
 
@@ -310,10 +342,34 @@ public:
 
             refineUVsTriangleUnfolding(3);
 
+            glm::vec2 exactHitUV(0.0f, 0.0f);
+            if (hitTriID >= 0 && hitTriID < _mesh->triangles().size()) {
+                const auto& t = _mesh->triangles()[hitTriID];
+                if (_vertexData.count(t[0]) && _vertexData.count(t[1]) && _vertexData.count(t[2])) {
+                    glm::vec3 v0 = toGlm(_mesh->vertices()[t[0]]);
+                    glm::vec3 v1 = toGlm(_mesh->vertices()[t[1]]);
+                    glm::vec3 v2 = toGlm(_mesh->vertices()[t[2]]);
+                    
+                    glm::vec3 v0v1 = v1 - v0, v0v2 = v2 - v0, pVec = target - v0;
+                    float d00 = glm::dot(v0v1, v0v1), d01 = glm::dot(v0v1, v0v2), d11 = glm::dot(v0v2, v0v2);
+                    float d20 = glm::dot(pVec, v0v1), d21 = glm::dot(pVec, v0v2);
+                    float denom = d00 * d11 - d01 * d01;
+                    
+                    if (std::abs(denom) > 1e-9f) {
+                        float v = (d11 * d20 - d01 * d21) / denom;
+                        float w = (d00 * d21 - d01 * d20) / denom;
+                        float u = 1.0f - v - w;
+                        exactHitUV = u * _vertexData[t[0]].uv + v * _vertexData[t[1]].uv + w * _vertexData[t[2]].uv;
+                    }
+                }
+            }
+
             _uvScale = 0.45f / maxCostFound;
-            for (const auto& [id, vd] : _vertexData) {
-                if (vd.frozen)
+            for (auto& [id, vd] : _vertexData) {
+                if (vd.frozen) {
+                    vd.uv -= exactHitUV; 
                     _displayUVs[id] = vd.uv * _uvScale + glm::vec2(0.5f, 0.5f);
+                }
             }
 
             const auto& tris = _mesh->triangles();
@@ -368,7 +424,11 @@ public:
                 std::sort(goodRatios.begin(), goodRatios.end());
                 medRatio = goodRatios[goodRatios.size() / 2];
             }
-            _autoThreshold = std::max(1.5f, medRatio * 2.0f);
+            // Cap the threshold: large-radius Expmap can produce wildly
+            // distorted triangles whose medRatio is huge.  Without an upper
+            // bound _autoThreshold can let completely broken UV triangles
+            // through, which is the root cause of the yellow-blob artifact.
+            _autoThreshold = std::min(std::max(1.5f, medRatio * 2.0f), 6.0f);
 
             for (auto& c : cands) {
                 bool correctWind = expectPos ? (c.signedAreaUV > 0.f) : (c.signedAreaUV < 0.f);
@@ -405,6 +465,7 @@ public:
 
                                 if (ImGui::MenuItem(displayName.c_str())) {
                                     _textureLoader.LoadImage(imagePath);
+                                    _textureDirty = true;
                                 }
                             }
                         }
@@ -448,10 +509,7 @@ public:
 
             if (_displayUVs.empty()) {
                 ImGui::TextColored(ImVec4(1,1,0,1), "Right-click on the mesh to compute UV.");
-                ImGui::End();
-                return;
-            }
-
+            } else {
             ImGui::Text("Tris: %lu | App: %d/%d | Geo: %d/%d", 
                         _validTriangles.size(),
                         _projectionStats.appProjected,
@@ -494,6 +552,7 @@ public:
 
             ImGui::SameLine();
             if (ImGui::Button("Reset View")) { _viewScale = 1.0f; _viewOffset = ImVec2(0,0); }
+            } // end else (_displayUVs not empty)
             
             ImGui::Checkbox("Fill", &_drawFilled);
             ImGui::SameLine();
@@ -503,6 +562,8 @@ public:
             ImGui::Checkbox("Show App", &_showAppPoints);
             ImGui::SameLine();
             ImGui::Checkbox("Show Geo", &_showGeoPoints);
+            ImGui::SameLine();
+            ImGui::Checkbox("Show Suppressed", &_showSuppressedPoints);
 
             ImVec2 p = ImGui::GetCursorScreenPos();
             ImVec2 sz = ImGui::GetContentRegionAvail();
@@ -517,14 +578,20 @@ public:
             if (isHovered) {
                 float wheel = ImGui::GetIO().MouseWheel;
                 if (wheel != 0.0f) {
+                    // 1. 記錄縮放前滑鼠相對於畫布中心的距離
+                    float lx = mousePos.x - (p.x + sz.x * 0.5f + _viewOffset.x);
+                    float ly = mousePos.y - (p.y + sz.y * 0.5f + _viewOffset.y);
+                    
+                    // 2. 進行縮放
                     float zoomFactor = 1.1f;
+                    float oldScale = _viewScale;
                     if (wheel < 0.0f) _viewScale /= zoomFactor;
                     else              _viewScale *= zoomFactor;
-                }
-                if (ImGui::IsMouseDragging(2) || ImGui::IsMouseDragging(1)) {
-                    ImVec2 delta = ImGui::GetIO().MouseDelta;
-                    _viewOffset.x += delta.x;
-                    _viewOffset.y += delta.y;
+                    
+                    // 3. 計算縮放比例並補償 Offset，確保滑鼠指著的 UV 點在縮放後依然在滑鼠下方
+                    float ratio = _viewScale / oldScale;
+                    _viewOffset.x -= lx * (ratio - 1.0f);
+                    _viewOffset.y -= ly * (ratio - 1.0f);
                 }
             }
 
@@ -607,13 +674,35 @@ public:
                 return ImVec2(p.x + sz.x*0.5f + lx + _viewOffset.x, p.y + sz.y*0.5f + ly + _viewOffset.y);
             };
 
+            // Safe margin beyond canvas edge at which we still allow drawing
+            // (triangles that straddle the border need to be rendered).
+            // Beyond CANVAS_GUARD pixels we hard-clamp to prevent ImGui
+            // DrawList artifacts (white streaks, text ghosts) that occur when
+            // vertex coordinates are extremely large (thousands of pixels away).
+            const float CANVAS_GUARD = sz.x + sz.y; // generous: one full canvas size
+            auto ClampPx = [&](ImVec2 v) -> ImVec2 {
+                float xMin = p.x - CANVAS_GUARD, xMax = p.x + sz.x + CANVAS_GUARD;
+                float yMin = p.y - CANVAS_GUARD, yMax = p.y + sz.y + CANVAS_GUARD;
+                v.x = std::max(xMin, std::min(xMax, v.x));
+                v.y = std::max(yMin, std::min(yMax, v.y));
+                return v;
+            };
+
             for(const auto& t : _validTriangles) {
                 glm::vec2 uv1 = _displayUVs[t[0]];
                 glm::vec2 uv2 = _displayUVs[t[1]];
                 glm::vec2 uv3 = _displayUVs[t[2]];
                 ImVec2 ip1 = TransformUV(uv1); ImVec2 ip2 = TransformUV(uv2); ImVec2 ip3 = TransformUV(uv3);
 
-                if ((ip1.x < p.x && ip2.x < p.x && ip3.x < p.x) || (ip1.x > p.x+sz.x && ip2.x > p.x+sz.x)) continue;
+                // Full 4-side canvas cull: skip only when ALL 3 vertices are
+                // outside the same edge of the canvas (completely off-screen).
+                float canvasX0 = p.x, canvasX1 = p.x + sz.x;
+                float canvasY0 = p.y, canvasY1 = p.y + sz.y;
+                if (ip1.x < canvasX0 && ip2.x < canvasX0 && ip3.x < canvasX0) continue;
+                if (ip1.x > canvasX1 && ip2.x > canvasX1 && ip3.x > canvasX1) continue;
+                if (ip1.y < canvasY0 && ip2.y < canvasY0 && ip3.y < canvasY0) continue;
+                if (ip1.y > canvasY1 && ip2.y > canvasY1 && ip3.y > canvasY1) continue;
+
                 if (_cullBackFace) {
                     float area = (ip2.x - ip1.x) * (ip3.y - ip1.y) - (ip3.x - ip1.x) * (ip2.y - ip1.y);
                     if (area > 0.0f) continue;
@@ -630,6 +719,12 @@ public:
                                           edgeRatio(t[2],t[0])});
                     if (maxR > _autoThreshold) continue;
                 }
+
+                // Clamp to guard region before submitting to ImGui DrawList.
+                // This prevents the "white streaks / text ghost" artifact that
+                // ImGui produces when triangle vertices are thousands of pixels
+                // outside the window (a known ImGui DrawList limitation).
+                ip1 = ClampPx(ip1); ip2 = ClampPx(ip2); ip3 = ClampPx(ip3);
 
                 if (_drawFilled) dl->AddTriangleFilled(ip1, ip2, ip3, IM_COL32(255, 215, 0, 80));
                 else dl->AddTriangle(ip1, ip2, ip3, IM_COL32(255, 215, 0, 200), 1.0f);
@@ -658,6 +753,20 @@ public:
                     float pointRadius = isSelected ? 4.0f : 3.0f;
                     
                     dl->AddCircleFilled(pos, pointRadius, pointColor);
+                }
+            }
+
+            // Draw suppressed Gaussians as green dots on the UV canvas.
+            // These are in-sphere Gaussians that failed triangle projection,
+            // so they have no texture UV and were suppressed (opacity = 0).
+            // Their UV is computed by clamping to the nearest triangle boundary.
+            if (_showSuppressedPoints) {
+                for (const auto& uv : _suppressedUVs) {
+                    if (uv.x < -1.0f || uv.x > 2.0f || uv.y < -1.0f || uv.y > 2.0f) continue;
+                    ImVec2 pos = TransformUV(uv);
+                    // Outer ring (darker green) + inner fill (bright green)
+                    dl->AddCircleFilled(pos, 4.0f, IM_COL32(0, 180, 0, 200));
+                    dl->AddCircleFilled(pos, 2.5f, IM_COL32(0, 255, 80, 255));
                 }
             }
 
@@ -946,17 +1055,6 @@ private:
             int projected = 0;
 
             for (size_t i = 0; i < numPoints; ++i) {
-                // ==========================================================
-                // [架構修正] 嚴格物理尺度過濾 (Scale Culling)
-                // 強制剔除體積過大的浮游點，切斷導致「貼圖嚴重向外溢出」的傳播媒介
-                // ==========================================================
-                if (i < props.size()) {
-                    float maxScaleRaw = std::max({props[i].scale[0], props[i].scale[1], props[i].scale[2]});
-                    if (std::exp(maxScaleRaw) > radius * 0.15f) {
-                        continue; 
-                    }
-                }
-
                 glm::vec3 pt(cloud[i*3], cloud[i*3+1], cloud[i*3+2]);
                 
                 if (glm::dot(pt - center, pt - center) > r2) {
@@ -1074,26 +1172,25 @@ private:
                     glm::vec3 E2 = v2_tri - v0_tri;
                     glm::vec2 dUV1 = uv1_tri - uv0_tri;
                     glm::vec2 dUV2 = uv2_tri - uv0_tri;
-                    glm::vec3 N_tri = glm::normalize(glm::cross(E1, E2));
 
-                    glm::mat3 M_T = glm::transpose(glm::mat3(E1, E2, N_tri));
-                    float detM = glm::determinant(M_T);
+                    // Standard TBN tangent convention - same as texture_gs in main.cpp:
+                    //   dU = dPos/dU  (tangent,   magnitude = world_dist / UV_unit)
+                    //   dV = dPos/dV  (bitangent, magnitude = world_dist / UV_unit)
+                    // Shader recovers UV delta via: deltaU = dot(offset, dU) / dot(dU, dU)
+                    float du1 = dUV1.x, dv1 = dUV1.y;
+                    float du2 = dUV2.x, dv2 = dUV2.y;
+                    float det2 = du1 * dv2 - du2 * dv1;
                     glm::vec3 dU(0.f), dV(0.f);
-                    if (std::abs(detM) > 1e-9f) {
-                        glm::mat3 M_inv = glm::inverse(M_T);
-                        dU = M_inv * glm::vec3(dUV1.x, dUV2.x, 0.0f);
-                        dV = M_inv * glm::vec3(dUV1.y, dUV2.y, 0.0f);
+                    if (std::abs(det2) > 1e-9f) {
+                        dU = ( dv2 * E1 - dv1 * E2) / det2;
+                        dV = (-du2 * E1 + du1 * E2) / det2;
                     }
 
                     ProjectedGaussian pg;
                     pg.originalIndex = (int)i;
                     pg.uv            = bestUV;
-                    // ==========================================================
-                    // [架構修正] 強制吸附 (Geometric Snapping)
-                    // 將高斯點真正的 3D 位置取代為網格表面上的精確投影點。
-                    // 這使得 Fragment Shader 發射的切線面絕對平滑無縫。
-                    // ==========================================================
                     pg.position      = bestProjPos; 
+                    pg.originalPos   = pt;
                     pg.dU            = dU;          
                     pg.dV            = dV;          
                     
@@ -1292,7 +1389,7 @@ private:
     float  _viewScale     = 1.0f;
     bool   _drawFilled    = true;
     bool   _cullBackFace  = true;
-    bool   _showBackgroundTexture = false;
+    bool   _showBackgroundTexture = true;
     
     bool   _showAppPoints = true;
     bool   _showGeoPoints = true;
@@ -1312,7 +1409,9 @@ private:
     bool _isSelecting = false;
     
     TextureLoader _textureLoader;
+    bool _textureDirty = false;
     std::vector<TextureSlotData> _slots;
+    std::vector<ProjectedGaussian> _pendingMainGaussians;
     
     std::vector<float>        _appCloudData;
     std::vector<int>          _appCloudFids;
@@ -1326,6 +1425,11 @@ private:
 
     GLuint _liveSSBO = 0;
     bool   _liveDirty = true;
+
+    // UV positions of Gaussians that are in-sphere but got no texture UV.
+    // Shown as green dots on the UV canvas.
+    std::vector<glm::vec2> _suppressedUVs;
+    bool _showSuppressedPoints = true;
 };
 
 #endif
