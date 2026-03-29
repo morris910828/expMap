@@ -322,6 +322,11 @@ public:
 
             if(_vertexData[currIdx].cost > radius) continue;
 
+            // [事實修正 1] 嚴格禁止展開路徑越過與種子點法線夾角超過 81 度 (cos=0.15) 的區域。
+            // 從物理源頭斬斷拓撲摺疊，強制放棄曲率過大的背面展開。
+            glm::vec3 currN = glm::normalize(getNormal(currIdx));
+            if (glm::dot(currN, toGlm(hitNormal)) < 0.15f) continue;
+
             maxCostFound = std::max(maxCostFound, _vertexData[currIdx].cost);
 
             for(int neighbor : _adj[currIdx]) {
@@ -342,6 +347,7 @@ public:
 
             refineUVsTriangleUnfolding(3);
 
+            // 1. 計算點擊中心在局部展開空間中的座標 (作為原點偏移)
             glm::vec2 exactHitUV(0.0f, 0.0f);
             if (hitTriID >= 0 && hitTriID < _mesh->triangles().size()) {
                 const auto& t = _mesh->triangles()[hitTriID];
@@ -364,11 +370,31 @@ public:
                 }
             }
 
-            _uvScale = 0.45f / maxCostFound;
+            // 2. 將所有頂點 UV 移至以點擊點為中心，並計算展開形狀的包圍盒 (Bounding Box)
+            glm::vec2 uvMin(1e9f), uvMax(-1e9f);
             for (auto& [id, vd] : _vertexData) {
                 if (vd.frozen) {
                     vd.uv -= exactHitUV; 
-                    _displayUVs[id] = vd.uv * _uvScale + glm::vec2(0.5f, 0.5f);
+                    uvMin = glm::min(uvMin, vd.uv);
+                    uvMax = glm::max(uvMax, vd.uv);
+                }
+            }
+
+            // 3. 計算自動縮放係數，確保解算範圍撐滿貼圖
+            float uvWidth  = uvMax.x - uvMin.x;
+            float uvHeight = uvMax.y - uvMin.y;
+            float maxDim   = std::max(uvWidth, uvHeight);
+            
+            // 使用 0.95f 作為目標覆蓋率，保留 5% 邊界餘量以利 GUI 觀察
+            _uvScale = (maxDim > 1e-7f) ? (0.95f / maxDim) : 1.0f;
+
+            // 4. 計算形狀幾何中心，並映射至 [0, 1] 畫布空間
+            glm::vec2 uvCenter = (uvMin + uvMax) * 0.5f;
+
+            for (auto& [id, vd] : _vertexData) {
+                if (vd.frozen) {
+                    // 將形狀中心對齊畫布中心 (0.5, 0.5)
+                    _displayUVs[id] = (vd.uv - uvCenter) * _uvScale + glm::vec2(0.5f, 0.5f);
                 }
             }
 
@@ -397,7 +423,7 @@ public:
                 if (d01 < 1e-6f && d12 < 1e-6f && d20 < 1e-6f) continue;
 
                 float signedAreaUV = (uv1.x-uv0.x)*(uv2.y-uv0.y) - (uv1.y-uv0.y)*(uv2.x-uv0.x);
-                if (std::abs(signedAreaUV) < 1e-12f) continue;
+                if (std::abs(signedAreaUV) < 1e-6f) continue;
 
                 float r01 = (d01 > 1e-6f) ? (glm::distance(uv0,uv1)/_uvScale) / d01 : 0.f;
                 float r12 = (d12 > 1e-6f) ? (glm::distance(uv1,uv2)/_uvScale) / d12 : 0.f;
@@ -424,10 +450,6 @@ public:
                 std::sort(goodRatios.begin(), goodRatios.end());
                 medRatio = goodRatios[goodRatios.size() / 2];
             }
-            // Cap the threshold: large-radius Expmap can produce wildly
-            // distorted triangles whose medRatio is huge.  Without an upper
-            // bound _autoThreshold can let completely broken UV triangles
-            // through, which is the root cause of the yellow-blob artifact.
             _autoThreshold = std::min(std::max(1.5f, medRatio * 2.0f), 6.0f);
 
             for (auto& c : cands) {
@@ -517,31 +539,6 @@ public:
                         _projectionStats.geoProjected,
                         _projectionStats.geoTotal);
             
-            if (ImGui::TreeNode("Projection Statistics")) {
-                ImGui::TextColored(ImVec4(0, 1, 1, 1), "APP Points:");
-                ImGui::Text("  Total: %d", _projectionStats.appTotal);
-                ImGui::Text("  Projected: %d", _projectionStats.appProjected);
-                ImGui::Text("  Out of radius: %d", _projectionStats.appOutOfRadius);
-                ImGui::Text("  Invalid face_id: %d", _projectionStats.appInvalidFid);
-                ImGui::Text("  Face_id not in range: %d", _projectionStats.appFidOutOfRange);
-                
-                if (_projectionStats.appTotal > 0) {
-                    float appRate = (float)_projectionStats.appProjected / _projectionStats.appTotal * 100.0f;
-                    ImGui::TextColored(ImVec4(1, 1, 0, 1), "  Projection rate: %.1f%%", appRate);
-                }
-                
-                ImGui::TextColored(ImVec4(1, 0.5, 0.5, 1), "GEO Points:");
-                ImGui::Text("  Total: %d", _projectionStats.geoTotal);
-                ImGui::Text("  Projected: %d", _projectionStats.geoProjected);
-                ImGui::Text("  Out of radius: %d", _projectionStats.geoOutOfRadius);
-                
-                if (_projectionStats.geoTotal > 0) {
-                    float geoRate = (float)_projectionStats.geoProjected / _projectionStats.geoTotal * 100.0f;
-                    ImGui::TextColored(ImVec4(1, 1, 0, 1), "  Projection rate: %.1f%%", geoRate);
-                }
-                
-                ImGui::TreePop();
-            }
             
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Hold CTRL + Left Click to pick Start/End Points");
             ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Hold SHIFT + Drag to select area");
@@ -679,7 +676,7 @@ public:
             // Beyond CANVAS_GUARD pixels we hard-clamp to prevent ImGui
             // DrawList artifacts (white streaks, text ghosts) that occur when
             // vertex coordinates are extremely large (thousands of pixels away).
-            const float CANVAS_GUARD = sz.x + sz.y; // generous: one full canvas size
+            const float CANVAS_GUARD = sz.x + sz.y;
             auto ClampPx = [&](ImVec2 v) -> ImVec2 {
                 float xMin = p.x - CANVAS_GUARD, xMax = p.x + sz.x + CANVAS_GUARD;
                 float yMin = p.y - CANVAS_GUARD, yMax = p.y + sz.y + CANVAS_GUARD;
@@ -730,29 +727,153 @@ public:
                 else dl->AddTriangle(ip1, ip2, ip3, IM_COL32(255, 215, 0, 200), 1.0f);
             }
 
+            static bool showEllipses = true;
+            static float ellipseAlpha = 0.1f;
+            static float ellipseSigma = 3.0f; // 顯示 3-Sigma 分布範圍
+            
+            ImGui::Checkbox("Show Covariance Ellipses", &showEllipses);
+            ImGui::SameLine();
+            ImGui::PushItemWidth(100.0f);
+            ImGui::SliderFloat("Alpha##ell", &ellipseAlpha, 0.0f, 1.0f);
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            ImGui::PushItemWidth(100.0f);
+            ImGui::SliderFloat("Sigma##ell", &ellipseSigma, 1.0f, 5.0f);
+            ImGui::PopItemWidth();
+
+            auto drawRotatedEllipse = [&](ImDrawList* dl, ImVec2 center, float a, float b, float theta, ImU32 color, ImU32 fillColor) {
+                // [事實修正 1：最小可視保證] 
+                // 移除原有的 return 丟棄機制。若數值崩潰 (NaN) 或極小，強制賦予 0.5 像素的最小半徑。
+                if (std::isnan(a) || std::isnan(b)) { a = 0.5f; b = 0.5f; }
+                a = std::max(a, 0.5f);
+                b = std::max(b, 0.5f);
+                
+                int num_segments = 6;
+                float max_r = std::max(a, b);
+                if (max_r > 4.0f)  num_segments = 10;
+                if (max_r > 12.0f) num_segments = 16;
+                if (max_r > 30.0f) num_segments = 24;
+                if (max_r > 100.0f) num_segments = 36; 
+
+                float cos_th = cosf(theta), sin_th = sinf(theta);
+                std::vector<ImVec2> points(num_segments);
+                for (int i = 0; i < num_segments; ++i) {
+                    float phi = 2.0f * IM_PI * (float)i / (float)num_segments;
+                    float ex = a * cosf(phi), ey = b * sinf(phi);
+                    points[i] = ImVec2(center.x + ex * cos_th - ey * sin_th, center.y + ex * sin_th + ey * cos_th);
+                }
+                dl->AddConvexPolyFilled(points.data(), num_segments, fillColor);
+                dl->AddPolyline(points.data(), num_segments, color, true, 1.0f);
+            };
+
+            auto computeUVEllipse = [&](const ProjectedGaussian& pt, float& a_uv, float& b_uv, float& angle) -> bool {
+                glm::vec3 s = glm::exp(pt.scale);
+                float r = pt.rotation.x, x = pt.rotation.y, y = pt.rotation.z, z = pt.rotation.w; 
+                glm::mat3 R = glm::mat3(
+                    1.f-2.f*(y*y+z*z), 2.f*(x*y+r*z), 2.f*(x*z-r*y),
+                    2.f*(x*y-r*z), 1.f-2.f*(x*x+z*z), 2.f*(y*z+r*x),
+                    2.f*(x*z+r*y), 2.f*(y*z-r*x), 1.f-2.f*(x*x+y*y)
+                );
+                glm::mat3 Sigma3D = R * glm::mat3(s.x*s.x, 0, 0,  0, s.y*s.y, 0,  0, 0, s.z*s.z) * glm::transpose(R);
+
+                glm::vec3 N = glm::cross(pt.dU, pt.dV);
+                float len2N = glm::dot(N, N);
+                glm::vec3 rowU(0.f), rowV(0.f);
+                
+                if (len2N > 1e-12f) {
+                    rowU = glm::cross(pt.dV, N) / len2N;
+                    rowV = glm::cross(N, pt.dU) / len2N;
+                } else {
+                    float lU = glm::dot(pt.dU, pt.dU), lV = glm::dot(pt.dV, pt.dV);
+                    rowU = (lU > 1e-12f) ? pt.dU / lU : glm::vec3(0.f);
+                    rowV = (lV > 1e-12f) ? pt.dV / lV : glm::vec3(0.f);
+                }
+
+                float c00 = glm::dot(rowU, Sigma3D * rowU);
+                float c01 = glm::dot(rowU, Sigma3D * rowV);
+                float c11 = glm::dot(rowV, Sigma3D * rowV);
+
+                float Trace = c00 + c11, Det = c00 * c11 - c01 * c01;
+                float detSqrt = std::sqrt(std::max(0.0f, Trace * Trace / 4.0f - Det));
+                a_uv = std::sqrt(std::max(0.0f, Trace / 2.0f + detSqrt));
+                b_uv = std::sqrt(std::max(0.0f, Trace / 2.0f - detSqrt));
+                angle = 0.5f * std::atan2(2.0f * c01, c00 - c11);
+
+                a_uv = std::min(a_uv, 5.0f);
+                b_uv = std::min(b_uv, 5.0f);
+                
+                return true;
+            };
+
+            // 取得畫布實體邊界
+            float canvasX0 = p.x, canvasX1 = p.x + sz.x;
+            float canvasY0 = p.y, canvasY1 = p.y + sz.y;
+
+            // 繪製 Geo 點 (紅色) 與橢圓
             if (_showGeoPoints) {
                 for (const auto& pt : _projectedGeoPoints) {
-                    if (pt.uv.x < -1.0f || pt.uv.x > 2.0f || pt.uv.y < -1.0f || pt.uv.y > 2.0f) continue;
+                    // [絕對事實 3：嚴格 UV 範圍剔除] 飛出貼圖邊界的無效點直接捨棄
+                    // 寬鬆 UV 範圍：邊緣投影點可能稍微超出 [0,1]，仍需顯示
+                    if (pt.uv.x < -0.15f || pt.uv.x > 1.15f || pt.uv.y < -0.15f || pt.uv.y > 1.15f) continue;
+                    
+                    float a_uv = 0.f, b_uv = 0.f, angle = 0.f;
+                    bool validEllipse = false;
+                    if (showEllipses) {
+                        validEllipse = computeUVEllipse(pt, a_uv, b_uv, angle);
+                    }
+
+                    float canvasScale = dim * _viewScale * ellipseSigma;
+                    float maxRadiusPx = validEllipse ? (std::max(a_uv, b_uv) * canvasScale) : 3.0f;
+                    
                     ImVec2 pos = TransformUV(pt.uv);
                     
-                    bool isSelected = std::find(_selectedGeoIndices.begin(), _selectedGeoIndices.end(), pt.originalIndex) != _selectedGeoIndices.end();
-                    ImU32 pointColor = isSelected ? IM_COL32(255, 255, 0, 255) : IM_COL32(255, 50, 50, 255);
-                    float pointRadius = isSelected ? 4.0f : 3.0f;
+                    if (pos.x + maxRadiusPx < canvasX0 || pos.x - maxRadiusPx > canvasX1 ||
+                        pos.y + maxRadiusPx < canvasY0 || pos.y - maxRadiusPx > canvasY1) {
+                        continue;
+                    }
                     
-                    dl->AddCircleFilled(pos, pointRadius, pointColor);
+                    bool isSelected = std::find(_selectedGeoIndices.begin(), _selectedGeoIndices.end(), pt.originalIndex) != _selectedGeoIndices.end();
+                    ImU32 baseColor = isSelected ? IM_COL32(255, 255, 0, 255) : IM_COL32(255, 50, 50, 255);
+                    
+                    if (validEllipse) {
+                        ImU32 strokeColor = isSelected ? IM_COL32(255, 255, 0, 200) : IM_COL32(255, 50, 50, 200);
+                        ImU32 fillColor   = isSelected ? IM_COL32(255, 255, 0, (int)(ellipseAlpha * 255)) : IM_COL32(255, 50, 50, (int)(ellipseAlpha * 255));
+                        drawRotatedEllipse(dl, pos, a_uv * canvasScale, b_uv * canvasScale, -angle, strokeColor, fillColor);
+                    }
+                    dl->AddCircleFilled(pos, isSelected ? 3.0f : 1.5f, baseColor);
                 }
             }
 
+            // 繪製 App 點 (藍色) 與橢圓
             if (_showAppPoints) {
                 for (const auto& pt : _projectedAppPoints) {
-                    if (pt.uv.x < -1.0f || pt.uv.x > 2.0f || pt.uv.y < -1.0f || pt.uv.y > 2.0f) continue;
+                    if (pt.uv.x < -0.15f || pt.uv.x > 1.15f || pt.uv.y < -0.15f || pt.uv.y > 1.15f) continue;
+                    
+                    float a_uv = 0.f, b_uv = 0.f, angle = 0.f;
+                    bool validEllipse = false;
+                    if (showEllipses) {
+                        validEllipse = computeUVEllipse(pt, a_uv, b_uv, angle);
+                    }
+
+                    float canvasScale = dim * _viewScale * ellipseSigma;
+                    float maxRadiusPx = validEllipse ? (std::max(a_uv, b_uv) * canvasScale) : 3.0f;
+                    
                     ImVec2 pos = TransformUV(pt.uv);
                     
-                    bool isSelected = std::find(_selectedAppIndices.begin(), _selectedAppIndices.end(), pt.originalIndex) != _selectedAppIndices.end();
-                    ImU32 pointColor = isSelected ? IM_COL32(255, 255, 0, 255) : IM_COL32(0, 255, 255, 255);
-                    float pointRadius = isSelected ? 4.0f : 3.0f;
+                    if (pos.x + maxRadiusPx < canvasX0 || pos.x - maxRadiusPx > canvasX1 ||
+                        pos.y + maxRadiusPx < canvasY0 || pos.y - maxRadiusPx > canvasY1) {
+                        continue;
+                    }
                     
-                    dl->AddCircleFilled(pos, pointRadius, pointColor);
+                    bool isSelected = std::find(_selectedAppIndices.begin(), _selectedAppIndices.end(), pt.originalIndex) != _selectedAppIndices.end();
+                    ImU32 baseColor = isSelected ? IM_COL32(255, 255, 0, 255) : IM_COL32(0, 150, 255, 255);
+                    
+                    if (validEllipse) {
+                        ImU32 strokeColor = isSelected ? IM_COL32(255, 255, 0, 200) : IM_COL32(0, 150, 255, 200);
+                        ImU32 fillColor   = isSelected ? IM_COL32(255, 255, 0, (int)(ellipseAlpha * 255)) : IM_COL32(0, 150, 255, (int)(ellipseAlpha * 255));
+                        drawRotatedEllipse(dl, pos, a_uv * canvasScale, b_uv * canvasScale, -angle, strokeColor, fillColor);
+                    }
+                    dl->AddCircleFilled(pos, isSelected ? 3.0f : 1.5f, baseColor);
                 }
             }
 
@@ -1069,94 +1190,94 @@ private:
                 glm::vec3 bestProjPos(0, 0, 0);
                 glm::vec3 bestProjNormal(0, 1, 0);
 
-                if (use_fids) {
-                    int face_id = fids[i];
-                    
-                    if (face_id < 0 || face_id >= (int)_mesh->triangles().size()) {
-                        invalidFid++;
-                        continue;
-                    }
-                    
-                    if (!_validTriangleIndicesSet.count(face_id)) {
-                        fidOutOfRange++;
-                        continue;
-                    }
-                    
-                    const auto& t = _mesh->triangles()[face_id];
-                    glm::vec3 v0 = toGlm(_mesh->vertices()[t[0]]);
-                    glm::vec3 v1 = toGlm(_mesh->vertices()[t[1]]);
-                    glm::vec3 v2 = toGlm(_mesh->vertices()[t[2]]);
-                    glm::vec3 pVec = pt - v0;
-                    glm::vec3 v0v1 = v1 - v0; 
-                    glm::vec3 v0v2 = v2 - v0;
-                    float d00 = glm::dot(v0v1, v0v1); 
-                    float d01 = glm::dot(v0v1, v0v2); 
-                    float d11 = glm::dot(v0v2, v0v2);
-                    float d20 = glm::dot(pVec, v0v1); 
-                    float d21 = glm::dot(pVec, v0v2); 
-                    float denom = d00 * d11 - d01 * d01;
-                    
-                    if (std::abs(denom) > 1e-9f) {
-                        float v = (d11 * d20 - d01 * d21) / denom; 
-                        float w = (d00 * d21 - d01 * d20) / denom; 
-                        float u = 1.0f - v - w;
-                        
-                        bestUV = u * _displayUVs.at(t[0]) + v * _displayUVs.at(t[1]) + w * _displayUVs.at(t[2]);
-                        bestProjPos = u * v0 + v * v1 + w * v2;
-                        
-                        glm::vec3 n0 = toGlm(_mesh->normals()[t[0]]);
-                        glm::vec3 n1 = toGlm(_mesh->normals()[t[1]]);
-                        glm::vec3 n2 = toGlm(_mesh->normals()[t[2]]);
-                        bestProjNormal = glm::normalize(u * n0 + v * n1 + w * n2);
-
-                        bestTriGlobalID = face_id; 
-                        found = true;
-                    }
-                } else {
+                // ── 共用：在所有有效三角形裡找最近投影 ───────────────────────────
+                // 供 GEO 路徑直接使用，以及 APP 路徑在 fid 無效/超出範圍時 fallback 使用。
+                // 平面距離容忍度改為 0.3 * radius（原為 0.1），讓稍微懸浮在表面上的
+                // 邊緣 Gaussian 也能投影成功。
+                auto searchNearestValidTri = [&]() {
                     for (int globalTIdx : _validTriIDs) {
                         const auto& t = _mesh->triangles()[globalTIdx];
                         glm::vec3 v0 = toGlm(_mesh->vertices()[t[0]]);
                         glm::vec3 v1 = toGlm(_mesh->vertices()[t[1]]);
                         glm::vec3 v2 = toGlm(_mesh->vertices()[t[2]]);
-                        glm::vec3 n = glm::cross(v1 - v0, v2 - v0); 
-                        if (glm::length(n) < 1e-9) continue; 
+                        glm::vec3 n = glm::cross(v1 - v0, v2 - v0);
+                        if (glm::length(n) < 1e-9f) continue;
                         n = glm::normalize(n);
-                        if (std::abs(glm::dot(pt - v0, n)) > 0.1f * radius) continue; 
+                        if (std::abs(glm::dot(pt - v0, n)) > 0.3f * radius) continue;
                         glm::vec3 pProj = pt - n * glm::dot(pt - v0, n);
-                        
-                        glm::vec3 v0v1 = v1 - v0; 
-                        glm::vec3 v0v2 = v2 - v0; 
-                        glm::vec3 pVec = pProj - v0;
-                        float d00 = glm::dot(v0v1, v0v1); 
-                        float d01 = glm::dot(v0v1, v0v2); 
-                        float d11 = glm::dot(v0v2, v0v2);
-                        float d20 = glm::dot(pVec, v0v1); 
-                        float d21 = glm::dot(pVec, v0v2); 
+
+                        glm::vec3 v0v1 = v1 - v0, v0v2 = v2 - v0, pVec = pProj - v0;
+                        float d00 = glm::dot(v0v1, v0v1), d01 = glm::dot(v0v1, v0v2), d11 = glm::dot(v0v2, v0v2);
+                        float d20 = glm::dot(pVec, v0v1), d21 = glm::dot(pVec, v0v2);
                         float denom = d00 * d11 - d01 * d01;
-                        
-                        if (std::abs(denom) > 1e-9f) {
-                            float v = (d11 * d20 - d01 * d21) / denom; 
-                            float w = (d00 * d21 - d01 * d20) / denom; 
-                            float u = 1.0f - v - w;
-                            if (u >= -0.01f && v >= -0.01f && w >= -0.01f && 
-                                u <= 1.01f && v <= 1.01f && w <= 1.01f) {
-                                
-                                float dist = glm::distance(pt, pProj);
-                                if (dist < bestDist) { 
-                                    bestDist = dist; 
-                                    bestUV = u * _displayUVs.at(t[0]) + v * _displayUVs.at(t[1]) + w * _displayUVs.at(t[2]); 
-                                    bestProjPos = pProj; 
-                                    bestTriGlobalID = globalTIdx; 
-                                    found = true; 
-                                    
-                                    glm::vec3 n0 = toGlm(_mesh->normals()[t[0]]);
-                                    glm::vec3 n1 = toGlm(_mesh->normals()[t[1]]);
-                                    glm::vec3 n2 = toGlm(_mesh->normals()[t[2]]);
-                                    bestProjNormal = glm::normalize(u * n0 + v * n1 + w * n2);
-                                }
-                            }
+                        if (std::abs(denom) < 1e-9f) continue;
+
+                        float bv = (d11 * d20 - d01 * d21) / denom;
+                        float bw = (d00 * d21 - d01 * d20) / denom;
+                        float bu = 1.0f - bv - bw;
+                        // 允許稍微超出三角形邊界（-0.05 容差），讓邊緣的 Gaussian 能投影
+                        if (bu < -0.05f || bv < -0.05f || bw < -0.05f) continue;
+                        // 夾回 [0,1] 保證 UV 插值不會飛出範圍
+                        bu = glm::clamp(bu, 0.f, 1.f);
+                        bv = glm::clamp(bv, 0.f, 1.f);
+                        bw = glm::clamp(bw, 0.f, 1.f);
+                        float bsum = bu + bv + bw;
+                        if (bsum > 1e-9f) { bu /= bsum; bv /= bsum; bw /= bsum; }
+
+                        float dist = glm::distance(pt, pProj);
+                        if (dist < bestDist) {
+                            bestDist      = dist;
+                            bestUV        = bu * _displayUVs.at(t[0]) + bv * _displayUVs.at(t[1]) + bw * _displayUVs.at(t[2]);
+                            bestProjPos   = pProj;
+                            bestTriGlobalID = globalTIdx;
+                            found         = true;
+                            glm::vec3 n0 = toGlm(_mesh->normals()[t[0]]);
+                            glm::vec3 n1 = toGlm(_mesh->normals()[t[1]]);
+                            glm::vec3 n2 = toGlm(_mesh->normals()[t[2]]);
+                            bestProjNormal = glm::normalize(bu * n0 + bv * n1 + bw * n2);
                         }
                     }
+                };
+
+                if (use_fids) {
+                    int face_id = fids[i];
+
+                    if (face_id < 0 || face_id >= (int)_mesh->triangles().size()) {
+                        // fid 完全無效 → 搜尋最近有效三角形
+                        invalidFid++;
+                        searchNearestValidTri();
+                    } else if (!_validTriangleIndicesSet.count(face_id)) {
+                        // fid 指向的三角形被 edge-ratio / winding 過濾掉
+                        // (邊緣/角落三角形最常發生) → fallback 搜尋最近有效三角形
+                        fidOutOfRange++;
+                        searchNearestValidTri();
+                    } else {
+                        // 正常路徑：直接用 fid 三角形做重心插值
+                        const auto& t = _mesh->triangles()[face_id];
+                        glm::vec3 v0 = toGlm(_mesh->vertices()[t[0]]);
+                        glm::vec3 v1 = toGlm(_mesh->vertices()[t[1]]);
+                        glm::vec3 v2 = toGlm(_mesh->vertices()[t[2]]);
+                        glm::vec3 pVec = pt - v0;
+                        glm::vec3 v0v1 = v1 - v0, v0v2 = v2 - v0;
+                        float d00 = glm::dot(v0v1, v0v1), d01 = glm::dot(v0v1, v0v2), d11 = glm::dot(v0v2, v0v2);
+                        float d20 = glm::dot(pVec, v0v1), d21 = glm::dot(pVec, v0v2);
+                        float denom = d00 * d11 - d01 * d01;
+                        if (std::abs(denom) > 1e-9f) {
+                            float bv = (d11 * d20 - d01 * d21) / denom;
+                            float bw = (d00 * d21 - d01 * d20) / denom;
+                            float bu = 1.0f - bv - bw;
+                            bestUV        = bu * _displayUVs.at(t[0]) + bv * _displayUVs.at(t[1]) + bw * _displayUVs.at(t[2]);
+                            bestProjPos   = bu * v0 + bv * v1 + bw * v2;
+                            glm::vec3 n0  = toGlm(_mesh->normals()[t[0]]);
+                            glm::vec3 n1  = toGlm(_mesh->normals()[t[1]]);
+                            glm::vec3 n2  = toGlm(_mesh->normals()[t[2]]);
+                            bestProjNormal = glm::normalize(bu * n0 + bv * n1 + bw * n2);
+                            bestTriGlobalID = face_id;
+                            found = true;
+                        }
+                    }
+                } else {
+                    searchNearestValidTri();
                 }
 
                 if (found) {
@@ -1173,19 +1294,16 @@ private:
                     glm::vec2 dUV1 = uv1_tri - uv0_tri;
                     glm::vec2 dUV2 = uv2_tri - uv0_tri;
 
-                    // Standard TBN tangent convention - same as texture_gs in main.cpp:
-                    //   dU = dPos/dU  (tangent,   magnitude = world_dist / UV_unit)
-                    //   dV = dPos/dV  (bitangent, magnitude = world_dist / UV_unit)
-                    // Shader recovers UV delta via: deltaU = dot(offset, dU) / dot(dU, dU)
                     float du1 = dUV1.x, dv1 = dUV1.y;
                     float du2 = dUV2.x, dv2 = dUV2.y;
                     float det2 = du1 * dv2 - du2 * dv1;
                     glm::vec3 dU(0.f), dV(0.f);
+                    
+                    // [必須還原] 刪除所有對 dU, dV 的長度鉗制
                     if (std::abs(det2) > 1e-9f) {
                         dU = ( dv2 * E1 - dv1 * E2) / det2;
                         dV = (-du2 * E1 + du1 * E2) / det2;
                     }
-
                     ProjectedGaussian pg;
                     pg.originalIndex = (int)i;
                     pg.uv            = bestUV;
@@ -1225,14 +1343,6 @@ private:
                         _adj[newNodeID].push_back(v[k]);
                         _adj[v[k]].push_back(newNodeID);
                     }
-
-                    if (triToExtraNodes.count(bestTriGlobalID)) {
-                        for (int siblingID : triToExtraNodes[bestTriGlobalID]) {
-                            _adj[newNodeID].push_back(siblingID);
-                            _adj[siblingID].push_back(newNodeID);
-                        }
-                    }
-                    triToExtraNodes[bestTriGlobalID].push_back(newNodeID);
                     
                     projected++;
                 }

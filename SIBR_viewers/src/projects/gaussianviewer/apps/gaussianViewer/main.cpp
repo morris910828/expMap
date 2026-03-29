@@ -62,6 +62,14 @@ public:
                                                     _appRenderer.getFids(),
                                                     _appRenderer.getGaussianProps());
             _wireframeRenderer.uploadMesh(_mesh);
+
+            if (_geoRenderer.isLoaded() && _appRenderer.isLoaded() && 
+                !_geoRenderer.getGaussianProps().empty() && !_appRenderer.getGaussianProps().empty()) {
+                float geo_scale = std::exp(_geoRenderer.getGaussianProps()[0].scale[0]);
+                float app_scale = std::exp(_appRenderer.getGaussianProps()[0].scale[0]);
+                std::cout << "\n[ABSOLUTE FACT] GEO Point 0 Scale: " << geo_scale << std::endl;
+                std::cout << "[ABSOLUTE FACT] APP Point 0 Scale: " << app_scale << "\n" << std::endl;
+            }
         }
         _meshColor = sibr::Vector3f(0.0f, 0.6f, 0.0f);
         _geoColor  = sibr::Vector3f(1.0f, 0.2f, 0.0f);
