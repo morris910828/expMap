@@ -31,7 +31,7 @@ public:
 
     MeshGaussianView(
         GaussianView::Ptr                   gaussianView,
-        const sibr::Mesh*                   mesh,
+        const sibr::Mesh* mesh,
         const std::string&                  geoPath,
         const std::string&                  appPath,
         sibr::InteractiveCameraHandler::Ptr camHandler
@@ -39,9 +39,7 @@ public:
           _gaussianView(gaussianView),
           _mesh(mesh),
           _camHandler(camHandler),
-          _viewport(0, 0,
-                    (float)gaussianView->getResolution().x(),
-                    (float)gaussianView->getResolution().y())
+          _viewport(0, 0, (float)gaussianView->getResolution().x(), (float)gaussianView->getResolution().y())
     {
         if (std_fs::exists(geoPath)) {
             _geoRenderer.load(geoPath);
@@ -55,321 +53,451 @@ public:
         if (_mesh) {
             _expMapSolver.Init(_mesh);
             if (_geoRenderer.isLoaded())
-                _expMapSolver.RegisterGeoPointCloud(_geoRenderer.getRawData(),
-                                                    _geoRenderer.getGaussianProps());
+                _expMapSolver.RegisterGeoPointCloud(_geoRenderer.getRawData(), _geoRenderer.getGaussianProps());
             if (_appRenderer.isLoaded())
-                _expMapSolver.RegisterAppPointCloud(_appRenderer.getRawData(),
-                                                    _appRenderer.getFids(),
-                                                    _appRenderer.getGaussianProps());
+                _expMapSolver.RegisterAppPointCloud(_appRenderer.getRawData(), _appRenderer.getFids(), _appRenderer.getGaussianProps());
             _wireframeRenderer.uploadMesh(_mesh);
-
-            if (_geoRenderer.isLoaded() && _appRenderer.isLoaded() && 
-                !_geoRenderer.getGaussianProps().empty() && !_appRenderer.getGaussianProps().empty()) {
-                float geo_scale = std::exp(_geoRenderer.getGaussianProps()[0].scale[0]);
-                float app_scale = std::exp(_appRenderer.getGaussianProps()[0].scale[0]);
-                std::cout << "\n[ABSOLUTE FACT] GEO Point 0 Scale: " << geo_scale << std::endl;
-                std::cout << "[ABSOLUTE FACT] APP Point 0 Scale: " << app_scale << "\n" << std::endl;
-            }
         }
         _meshColor = sibr::Vector3f(0.0f, 0.6f, 0.0f);
         _geoColor  = sibr::Vector3f(1.0f, 0.2f, 0.0f);
         _appColor  = sibr::Vector3f(0.0f, 0.4f, 1.0f);
+        initGaussianOutlineRenderer();
     }
 
     ~MeshGaussianView() {
         if (_liveSSBO) glDeleteBuffers(1, &_liveSSBO);
+        if (_gaussOutlineVAO)    glDeleteVertexArrays(1, &_gaussOutlineVAO);
+        if (_gaussOutlineVBO)    glDeleteBuffers(1, &_gaussOutlineVBO);
+        if (_gaussOutlineShader) glDeleteProgram(_gaussOutlineShader);
     }
 
     void onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camera& eye) override {
         if (!_gaussianView) return;
-
-        // Single-pass textured Gaussian path:
-        // CUDA now renders final textured output directly.
         _gaussianView->onRenderIBR(dst, eye);
-
         _viewport = Viewport(0, 0, (float)dst.w(), (float)dst.h());
         dst.bind();
         glViewport(0, 0, dst.w(), dst.h());
-
         const glm::mat4 mvp = glm::make_mat4(eye.viewproj().data());
-
-        // Keep only debug / visualization overlays.
+        _pointCloudRenderer.render(mvp, _pointSize, _geoRenderer, _geoColor, _showGeo, _appRenderer, _appColor, _showApp);
+        if (_showGaussianOutlines) renderGaussianOutlines(eye);
         _wireframeRenderer.render(_mesh, _expMapSolver.GetActiveTriIndices(), mvp, _showMesh);
-        _pointCloudRenderer.render(
-            mvp, _pointSize,
-            _geoRenderer, _geoColor, _showGeo,
-            _appRenderer, _appColor, _showApp);
-
-        const auto& path = _expMapSolver.GetDijkstraPath();
-        if (path.size() >= 2 && _mesh) {
-            const auto& verts = _mesh->vertices();
-            glUseProgram(0);
-            glDisable(GL_DEPTH_TEST);
-            glLineWidth(3.0f);
-            glBegin(GL_LINE_STRIP);
-            glColor3f(0.0f, 1.0f, 0.0f);
-            for (int vid : path) {
-                if (vid >= 0 && vid < (int)verts.size()) {
-                    const auto& v = verts[vid];
-                    glVertex3f(v.x(), v.y(), v.z());
-                }
-            }
-            glEnd();
-            glEnable(GL_DEPTH_TEST);
-        }
-
-        glUseProgram(0);
         dst.unbind();
     }
 
     void onUpdate(sibr::Input& input) override {
         if (!_gaussianView) return;
         _gaussianView->onUpdate(input);
-        if (input.mouseButton().isReleased(sibr::Mouse::Right))
+        if (input.mouseButton().isReleased(sibr::Mouse::Right) &&
+            input.key().isActivated(sibr::Key::LeftShift))
             performRaycast(input);
     }
 
     void onGUI() override {
         if (!_gaussianView) return;
         _gaussianView->onGUI();
-
         ImGui::Begin("Mesh & Controls");
-        ImGui::Checkbox("Show Mesh",         &_showMesh);
-        ImGui::Checkbox("Show UV Wireframe", &_wireframeRenderer._showYellowWireframe);
-        ImGui::Checkbox("Show Geo Points",   &_showGeo);
-        ImGui::Checkbox("Show App Points",   &_showApp);
-        ImGui::SliderFloat("Point Size",     &_pointSize,    1.0f, 3.0f);
-        ImGui::SliderFloat("ExpMap Radius",  &_expMapRadius, 0.05f, 2.0f);
-
+        ImGui::Checkbox("Show Mesh", &_showMesh);
+        ImGui::Checkbox("Show Yellow Wireframe", &_wireframeRenderer._showYellowWireframe);
+        ImGui::Checkbox("Show Geo Points", &_showGeo);
+        ImGui::Checkbox("Show App Points", &_showApp);
+        ImGui::SliderFloat("Point Size", &_pointSize, 1.0f, 3.0f);
+        ImGui::SliderFloat("ExpMap Radius", &_expMapRadius, 0.05f, 5.0f);
+        ImGui::Separator();
+        ImGui::Checkbox("Show Gaussian Outlines", &_showGaussianOutlines);
+        ImGui::Separator();
+        {
+            bool prevShowTex = _showTexture;
+            ImGui::Checkbox("Show Texture", &_showTexture);
+            if (_showTexture != prevShowTex && !_lastAllUVs.empty()) {
+                _gaussianView->setUVsAndTexture(
+                    _lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists,
+                    _showTexture ? _texPtr : nullptr
+                );
+            }
+        }
+        ImGui::Separator();
         if (ImGui::Button("Clear ExpMap")) {
-            _gaussianView->restoreOpacities();   // restore suppressed Gaussian opacities
+            _gaussianView->restoreOpacities();
             _texGaussians.clear();
-            _liveSSBODirty = true;
             _expMapSolver.ClearRaycastState();
-            _texPtr = nullptr;
-
             std::vector<sibr::Vector2f> empty_uvs(_gaussianView->getCount(), sibr::Vector2f(-1.f, -1.f));
             std::vector<sibr::Vector3f> empty_dUs(_gaussianView->getCount(), sibr::Vector3f(0.f, 0.f, 0.f));
             std::vector<sibr::Vector3f> empty_dVs(_gaussianView->getCount(), sibr::Vector3f(0.f, 0.f, 0.f));
-            _gaussianView->setUVsAndTexture(empty_uvs, empty_dUs, empty_dVs, nullptr);
-        }
-
-        ImGui::Separator();
-        const auto& slots = _expMapSolver.GetAllSlots();
-        if (!slots.empty())
-            ImGui::TextColored(ImVec4(0.3f,1.f,0.5f,1.f),
-                "Saved Slots: %lu (manage in ExpMap UV window)", slots.size());
-        ImGui::Separator();
-        const auto& activeTris = _expMapSolver.GetActiveTris();
-        if (!activeTris.empty()) {
-            ImGui::TextColored(ImVec4(1.f,1.f,0.f,1.f),
-                "UV Region: %lu triangles", activeTris.size());
-            if (_texPtr)
-                ImGui::TextColored(ImVec4(0.5f,1.f,1.f,1.f),
-                    "Texture: %s", _expMapSolver.GetTextureLoader().getPath().c_str());
-            else
-                ImGui::TextColored(ImVec4(1.f,0.5f,0.5f,1.f),
-                    "No texture loaded (use File > Load Background)");
-            if (!_texGaussians.empty())
-                ImGui::TextColored(ImVec4(0.5f,1.f,0.5f,1.f),
-                    "Live: %d main-cloud Gaussians", (int)_texGaussians.size());
-        } else {
-            ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1.f),
-                "Right-click to select UV region");
+            std::vector<float>          empty_sd(_gaussianView->getCount(), 1e9f);
+            _gaussianView->setUVsAndTexture(empty_uvs, empty_dUs, empty_dVs, empty_sd, nullptr);
         }
         ImGui::End();
-
         _expMapSolver.RenderUI();
-
-        // If the user picked a new texture in the ExpMap UI, immediately push it
-        // to the GPU without requiring another right-click.
         if (_expMapSolver.ConsumeTextureDirty()) {
             _texPtr = _expMapSolver.GetTextureLoader().getTexture();
-            if (!_lastAllUVs.empty()) {
-                _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _texPtr);
-            }
+            if (!_lastAllUVs.empty()) _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, _texPtr);
         }
     }
 
 private:
+    // -------------------------------------------------------------------------
+    // Gaussian outline rendering (3-D ellipses in the mesh tangent plane)
+    // -------------------------------------------------------------------------
+    void initGaussianOutlineRenderer() {
+        const std::string vsSrc = R"(
+#version 330 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+void main() { gl_Position = uMVP * vec4(aPos, 1.0); }
+)";
+        const std::string fsSrc = R"(
+#version 330 core
+uniform vec4 uColor;
+out vec4 fragColor;
+void main() { fragColor = uColor; }
+)";
+        GLuint vs = detail::compileGLShader(vsSrc, GL_VERTEX_SHADER);
+        GLuint fs = detail::compileGLShader(fsSrc, GL_FRAGMENT_SHADER);
+        _gaussOutlineShader = detail::linkProgram(vs, fs);
+
+        GLint linkOK = 0;
+        glGetProgramiv(_gaussOutlineShader, GL_LINK_STATUS, &linkOK);
+        if (!linkOK) {
+            GLchar log[512]; glGetProgramInfoLog(_gaussOutlineShader, 512, nullptr, log);
+            std::cerr << "[GaussianOutline] Shader link error: " << log << "\n";
+            glDeleteProgram(_gaussOutlineShader);
+            _gaussOutlineShader = 0;
+            return;
+        }
+
+        glGenVertexArrays(1, &_gaussOutlineVAO);
+        glGenBuffers(1, &_gaussOutlineVBO);
+        glBindVertexArray(_gaussOutlineVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, _gaussOutlineVBO);
+        glBufferData(GL_ARRAY_BUFFER, 34 * sizeof(glm::vec3), nullptr, GL_DYNAMIC_DRAW); // pre-allocate
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        std::cout << "[GaussianOutline] Shader initialized OK. Prog=" << _gaussOutlineShader
+                  << " VAO=" << _gaussOutlineVAO << " VBO=" << _gaussOutlineVBO << "\n";
+    }
+
+    void renderGaussianOutlines(const sibr::Camera& eye) {
+        if (!_gaussOutlineShader || !_gaussOutlineVAO) return;
+
+        const auto& geoPoints = _expMapSolver.GetProjectedGeoPoints();
+        const auto& appPoints = _expMapSolver.GetProjectedAppPoints();
+        const auto& selGeo    = _expMapSolver.GetSelectedGeoIndices();
+        const auto& selApp    = _expMapSolver.GetSelectedAppIndices();
+        if (selGeo.empty() && selApp.empty()) return;
+
+        std::set<int> geoSet(selGeo.begin(), selGeo.end());
+        std::set<int> appSet(selApp.begin(), selApp.end());
+
+        static constexpr float kPi = 3.14159265358979323846f;
+        static constexpr int   SEGS = 32;
+
+        // Camera position in world space (for depth sorting)
+        const glm::vec3 camPos(eye.position().x(), eye.position().y(), eye.position().z());
+
+        // ---------------------------------------------------------------
+        // Draw the 1-sigma ellipse footprint of the Gaussian projected onto
+        // the mesh tangent plane.  Center = true 3D position (pg.position).
+        // The 3D covariance Σ = R·diag(s²)·R^T is projected onto the
+        // orthonormal tangent basis (t1, t2) built from mesh dU/dV vectors,
+        // then eigendecomposed to get the exact semi-axes on that plane.
+        // ---------------------------------------------------------------
+        auto makeRing = [&](const ProjectedGaussian& pg) -> std::vector<glm::vec3> {
+            // Quaternion layout: rotation.x=w, .y=x, .z=y, .w=z
+            const float qw = pg.rotation.x, qx = pg.rotation.y;
+            const float qy = pg.rotation.z, qz = pg.rotation.w;
+
+            // Rotation matrix (GLM column-major): R[i] = world direction of axis i
+            const glm::mat3 R(
+                1.f-2.f*(qy*qy+qz*qz),  2.f*(qx*qy+qw*qz),   2.f*(qx*qz-qw*qy),
+                2.f*(qx*qy-qw*qz),    1.f-2.f*(qx*qx+qz*qz),  2.f*(qy*qz+qw*qx),
+                2.f*(qx*qz+qw*qy),    2.f*(qy*qz-qw*qx),   1.f-2.f*(qx*qx+qy*qy)
+            );
+
+            const float s0 = std::exp(pg.scale.x);
+            const float s1 = std::exp(pg.scale.y);
+            const float s2 = std::exp(pg.scale.z);
+
+            // Build orthonormal tangent basis (t1, t2) from mesh dU/dV vectors
+            glm::vec3 t1 = pg.dU;
+            const float lenU = glm::length(t1);
+            if (lenU < 1e-7f) {
+                // Fallback: no surface info, draw principal cross-section
+                float sArr[3] = {s0, s1, s2};
+                int idx[3] = {0, 1, 2};
+                if (sArr[idx[0]] < sArr[idx[1]]) std::swap(idx[0], idx[1]);
+                if (sArr[idx[0]] < sArr[idx[2]]) std::swap(idx[0], idx[2]);
+                if (sArr[idx[1]] < sArr[idx[2]]) std::swap(idx[1], idx[2]);
+                std::vector<glm::vec3> ring(SEGS);
+                for (int i = 0; i < SEGS; ++i) {
+                    const float phi = 2.f * kPi * i / SEGS;
+                    ring[i] = pg.position + sArr[idx[0]]*std::cos(phi)*R[idx[0]]
+                                          + sArr[idx[1]]*std::sin(phi)*R[idx[1]];
+                }
+                return ring;
+            }
+            t1 /= lenU;
+
+            glm::vec3 t2 = pg.dV - glm::dot(pg.dV, t1) * t1;
+            const float lenV = glm::length(t2);
+            if (lenV < 1e-7f) {
+                glm::vec3 arb = (std::abs(t1.x) < 0.9f) ? glm::vec3(1,0,0) : glm::vec3(0,1,0);
+                t2 = glm::normalize(glm::cross(t1, arb));
+            } else {
+                t2 /= lenV;
+            }
+
+            // Project 3D covariance Σ = R·diag(s²)·R^T onto tangent plane.
+            const glm::mat3 Rt = glm::transpose(R);
+            auto SigmaV = [&](const glm::vec3& v) -> glm::vec3 {
+                glm::vec3 u = Rt * v;
+                return R * glm::vec3(s0*s0*u.x, s1*s1*u.y, s2*s2*u.z);
+            };
+
+            // 2×2 projected covariance: Σ₂D = [[a,b],[b,c]]
+            const glm::vec3 St1 = SigmaV(t1), St2 = SigmaV(t2);
+            const float a2d = glm::dot(t1, St1);
+            const float b2d = glm::dot(t1, St2);
+            const float c2d = glm::dot(t2, St2);
+
+            // Eigendecompose 2×2 symmetric matrix → semi-axes lengths
+            const float disc = std::sqrt(std::max(0.f, 0.25f*(a2d-c2d)*(a2d-c2d) + b2d*b2d));
+            const float lam1 = std::max(0.f, 0.5f*(a2d+c2d) + disc);
+            const float lam2 = std::max(0.f, 0.5f*(a2d+c2d) - disc);
+            const float semiA = std::sqrt(lam1);
+            const float semiB = std::sqrt(lam2);
+
+            // Eigenvector for lam1 in tangent-plane coords → world-space axes
+            glm::vec2 ev1;
+            if (std::abs(b2d) > 1e-8f) {
+                ev1 = glm::normalize(glm::vec2(b2d, lam1 - a2d));
+            } else {
+                ev1 = (a2d >= c2d) ? glm::vec2(1.f, 0.f) : glm::vec2(0.f, 1.f);
+            }
+            const glm::vec2 ev2(-ev1.y, ev1.x);
+
+            const glm::vec3 axisA = semiA * (ev1.x * t1 + ev1.y * t2);
+            const glm::vec3 axisB = semiB * (ev2.x * t1 + ev2.y * t2);
+
+            std::vector<glm::vec3> ring(SEGS);
+            for (int i = 0; i < SEGS; ++i) {
+                const float phi = 2.f * kPi * i / SEGS;
+                ring[i] = pg.position + std::cos(phi)*axisA + std::sin(phi)*axisB;
+            }
+            return ring;
+        };
+
+        // Upload ring + center and draw (filled fan + outline)
+        // Fill alpha is kept very low (0.12) so that when many overlapping
+        // ellipses swap depth-sort order the blended colour barely changes,
+        // eliminating the per-frame flickering. Each ellipse therefore always
+        // appears at a nearly uniform transparency regardless of overlap count.
+        static constexpr float kFillAlpha    = 0.11f;
+        static constexpr float kOutlineAlpha = 0.90f;
+
+        auto drawOne = [&](const std::vector<glm::vec3>& ring,
+                            const glm::vec3& center,
+                            GLint colorLoc,
+                            float cr, float cg, float cb) {
+            // Filled triangle fan: center, p0…pN-1, p0
+            std::vector<glm::vec3> fan;
+            fan.reserve(SEGS + 2);
+            fan.push_back(center);
+            fan.insert(fan.end(), ring.begin(), ring.end());
+            fan.push_back(ring[0]);
+
+            glUniform4f(colorLoc, cr, cg, cb, kFillAlpha);
+            glBufferData(GL_ARRAY_BUFFER,
+                         (GLsizeiptr)(fan.size() * sizeof(glm::vec3)),
+                         fan.data(), GL_STREAM_DRAW);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, (GLsizei)fan.size());
+
+            // Outline
+            glUniform4f(colorLoc, cr, cg, cb, kOutlineAlpha);
+            glBufferData(GL_ARRAY_BUFFER,
+                         (GLsizeiptr)(ring.size() * sizeof(glm::vec3)),
+                         ring.data(), GL_STREAM_DRAW);
+            glDrawArrays(GL_LINE_LOOP, 0, (GLsizei)ring.size());
+        };
+
+        // ---------------------------------------------------------------
+        // Collect all selected Gaussians (geo + app) and sort back-to-front
+        // so semi-transparent ellipses blend correctly.
+        // ---------------------------------------------------------------
+        struct DrawItem {
+            const ProjectedGaussian* pg;
+            bool isGeo;
+            float depth;  // squared distance from camera (for sorting)
+        };
+        std::vector<DrawItem> items;
+        items.reserve(geoSet.size() + appSet.size());
+
+        for (const auto& pg : geoPoints) {
+            if (!geoSet.count(pg.originalIndex)) continue;
+            glm::vec3 d = pg.position - camPos;
+            items.push_back({&pg, true, glm::dot(d, d)});
+        }
+        for (const auto& pg : appPoints) {
+            if (!appSet.count(pg.originalIndex)) continue;
+            glm::vec3 d = pg.position - camPos;
+            items.push_back({&pg, false, glm::dot(d, d)});
+        }
+
+        // Back-to-front (largest depth first → drawn first, so near ones on top)
+        std::sort(items.begin(), items.end(),
+                  [](const DrawItem& a, const DrawItem& b){ return a.depth > b.depth; });
+
+        // ---- setup GL state ----
+        // Unbind SSBO slot 0 left by the Gaussian copy-renderer
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+
+        glm::mat4 mvp = glm::make_mat4(eye.viewproj().data());
+
+        GLboolean depthWas = GL_FALSE, blendWas = GL_FALSE;
+        glGetBooleanv(GL_DEPTH_TEST, &depthWas);
+        glGetBooleanv(GL_BLEND,      &blendWas);
+
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        glUseProgram(_gaussOutlineShader);
+        GLint mvpLoc   = glGetUniformLocation(_gaussOutlineShader, "uMVP");
+        GLint colorLoc = glGetUniformLocation(_gaussOutlineShader, "uColor");
+        if (mvpLoc == -1 || colorLoc == -1) {
+            std::cerr << "[GaussianOutline] Uniform not found: uMVP=" << mvpLoc
+                      << " uColor=" << colorLoc << "\n";
+        }
+        glUniformMatrix4fv(mvpLoc, 1, GL_FALSE, glm::value_ptr(mvp));
+
+        glBindVertexArray(_gaussOutlineVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, _gaussOutlineVBO);
+
+        // Draw in depth-sorted order (back → front)
+        int drawnGeo = 0, drawnApp = 0;
+        for (const auto& item : items) {
+            if (item.isGeo) {
+                drawOne(makeRing(*item.pg), item.pg->position, colorLoc, 1.f, 0.2f, 0.2f);
+                ++drawnGeo;
+            } else {
+                drawOne(makeRing(*item.pg), item.pg->position, colorLoc, 0.2f, 0.5f, 1.f);
+                ++drawnApp;
+            }
+        }
+
+        // Log once per selection change
+        static size_t lastSelTotal = 0;
+        size_t curSelTotal = selGeo.size() + selApp.size();
+        if (curSelTotal != lastSelTotal) {
+            lastSelTotal = curSelTotal;
+            std::cout << "[GaussianOutline] drew geo=" << drawnGeo
+                      << " app=" << drawnApp << "\n";
+        }
+
+        // ---- restore GL state ----
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+        if (!blendWas)  glDisable(GL_BLEND);
+        if (depthWas)   glEnable(GL_DEPTH_TEST);
+    }
+
+    // -------------------------------------------------------------------------
+
     void performRaycast(const sibr::Input& input) {
         if (!_mesh || !_camHandler) return;
-
-        // --- Build camera ray ---
         const auto& cam = _camHandler->getCamera();
-        sibr::Vector2f mp(
-            static_cast<float>(input.mousePosition().x()),
-            static_cast<float>(input.mousePosition().y())
-        );
-        float ndcX =  (2.f * mp.x()) / _viewport.finalWidth()  - 1.f;
+        sibr::Vector2f mp((float)input.mousePosition().x(), (float)input.mousePosition().y());
+        float ndcX = (2.f * mp.x()) / _viewport.finalWidth() - 1.f;
         float ndcY = 1.f - (2.f * mp.y()) / _viewport.finalHeight();
-
         sibr::Matrix4f invVP = cam.viewproj().inverse();
         sibr::Vector4f nearPt = invVP * sibr::Vector4f(ndcX, ndcY, -1.f, 1.f);
         sibr::Vector4f farPt  = invVP * sibr::Vector4f(ndcX, ndcY,  1.f, 1.f);
-        nearPt /= nearPt.w();
-        farPt  /= farPt.w();
-
-        sibr::Vector3f rayOrigin = cam.position();
+        nearPt /= nearPt.w(); farPt /= farPt.w();
         sibr::Vector3f rayDir(farPt.x()-nearPt.x(), farPt.y()-nearPt.y(), farPt.z()-nearPt.z());
         rayDir.normalize();
 
-        // --- Moller-Trumbore intersection ---
-        const auto& verts     = _mesh->vertices();
+        float minDist = 1e9f; int hitTriID = -1; sibr::Vector3f hitPos;
+        const auto& verts = _mesh->vertices();
         const auto& triangles = _mesh->triangles();
-        float minDist = 1e9f;
-        int hitTriID = -1;
-        sibr::Vector3f hitPos;
-
         for (size_t t = 0; t < triangles.size(); ++t) {
             const auto& tri = triangles[t];
-            sibr::Vector3f e1 = verts[tri[1]] - verts[tri[0]];
-            sibr::Vector3f e2 = verts[tri[2]] - verts[tri[0]];
-            sibr::Vector3f h  = rayDir.cross(e2);
-            float a = e1.dot(h);
-            if (a > -1e-6f && a < 1e-6f) continue;
-
-            float f = 1.f / a;
-            sibr::Vector3f s = rayOrigin - verts[tri[0]];
-            float u = f * s.dot(h);
-            if (u < 0.f || u > 1.f) continue;
-
-            sibr::Vector3f q = s.cross(e1);
-            float v = f * rayDir.dot(q);
-            if (v < 0.f || u + v > 1.f) continue;
-
-            float td = f * e2.dot(q);
-            if (td > 1e-6f && td < minDist) {
-                minDist = td;
-                hitTriID = (int)t;
-                hitPos  = rayOrigin + rayDir * td;
-            }
+            sibr::Vector3f e1 = verts[tri[1]] - verts[tri[0]], e2 = verts[tri[2]] - verts[tri[0]], h = rayDir.cross(e2);
+            float a = e1.dot(h); if (std::abs(a) < 1e-6f) continue;
+            float f = 1.f/a; sibr::Vector3f s = cam.position() - verts[tri[0]];
+            float u = f * s.dot(h); if (u < 0.f || u > 1.f) continue;
+            sibr::Vector3f q = s.cross(e1); float v = f * rayDir.dot(q); if (v < 0.f || u + v > 1.f) continue;
+            float td = f * e2.dot(q); if (td > 1e-6f && td < minDist) { minDist = td; hitTriID = (int)t; hitPos = cam.position() + rayDir * td; }
         }
+        if (hitTriID < 0) return;
 
-        if (hitTriID < 0) {
-            std::cout << "[INFO] Raycast missed\n";
-            return;
-        }
-
-        // --- Update ExpMap solver (computes UV layout) ---
         _expMapSolver.OnRaycastHit(hitPos, _expMapRadius, hitTriID);
-
-        const auto& texLoader = _expMapSolver.GetTextureLoader();
-        if (!texLoader.getTexture()) {
-            std::cout << "[INFO] No texture.\n";
-            return;
-        }
-        _texPtr = texLoader.getTexture();
+        _texPtr = _expMapSolver.GetTextureLoader().getTexture();
+        if (!_texPtr) return;
 
         const std::set<int>& activeSet = _expMapSolver.GetActiveTriIndices();
-        if (activeSet.empty()) {
-            std::cout << "[INFO] No active tris.\n";
-            return;
-        }
-
-        std::vector<int> validTriIDs(activeSet.begin(), activeSet.end());
         const std::map<int, glm::vec2>& glmUVMap = _expMapSolver.GetDisplayUVs();
-
-        // --- Download main Gaussian cloud data ---
-        const std::vector<sibr::Vector3f>& cpuPos = _gaussianView->getCpuPositions();
         const int nGauss = _gaussianView->getCount();
-
+        const auto& cpuPos = _gaussianView->getCpuPositions();
         std::vector<float> cpuRot, cpuScale, cpuOpacity;
         _gaussianView->downloadGaussianData(cpuRot, cpuScale, cpuOpacity);
 
-        // --- Build per-triangle UV + tangent frame cache ---
-        struct TriInfo {
-            glm::vec3 v0, v1, v2, e1, e2, n, dU, dV;
-            float d00, d01, d11;
-            glm::vec2 uv0, uv1, uv2;
-            bool valid;
-        };
-
+        struct TriInfo { glm::vec3 v0, v1, v2, e1, e2, n, dU, dV; float d00, d01, d11; glm::vec2 uv0, uv1, uv2; bool valid; int vi0, vi1, vi2; };
         std::vector<TriInfo> triCache;
-        triCache.reserve(validTriIDs.size());
-
-        for (int triID : validTriIDs) {
-            TriInfo ti;
-            ti.valid = false;
-
-            if (triID < 0 || triID >= (int)triangles.size()) {
-                triCache.push_back(ti);
-                continue;
-            }
-
-            const auto& tri = triangles[triID];
-            if (!glmUVMap.count(tri[0]) || !glmUVMap.count(tri[1]) || !glmUVMap.count(tri[2])) {
-                triCache.push_back(ti);
-                continue;
-            }
-
+        for (int triID : activeSet) {
+            TriInfo ti; ti.valid = false; const auto& tri = triangles[triID];
+            ti.vi0 = tri[0]; ti.vi1 = tri[1]; ti.vi2 = tri[2];
+            if (!glmUVMap.count(tri[0]) || !glmUVMap.count(tri[1]) || !glmUVMap.count(tri[2])) { triCache.push_back(ti); continue; }
             ti.v0 = {verts[tri[0]].x(), verts[tri[0]].y(), verts[tri[0]].z()};
             ti.v1 = {verts[tri[1]].x(), verts[tri[1]].y(), verts[tri[1]].z()};
             ti.v2 = {verts[tri[2]].x(), verts[tri[2]].y(), verts[tri[2]].z()};
-            ti.e1 = ti.v1 - ti.v0;
-            ti.e2 = ti.v2 - ti.v0;
-
-            glm::vec3 rn = glm::cross(ti.e1, ti.e2);
-            float ln = glm::length(rn);
-            if (ln < 1e-9f) {
-                triCache.push_back(ti);
-                continue;
-            }
-
-            ti.n = rn / ln;
-            ti.d00 = glm::dot(ti.e1, ti.e1);
-            ti.d01 = glm::dot(ti.e1, ti.e2);
-            ti.d11 = glm::dot(ti.e2, ti.e2);
-            ti.uv0 = glmUVMap.at(tri[0]);
-            ti.uv1 = glmUVMap.at(tri[1]);
-            ti.uv2 = glmUVMap.at(tri[2]);
-
-            // World-space UV tangent frame
-            float du1 = ti.uv1.x - ti.uv0.x;
-            float dv1 = ti.uv1.y - ti.uv0.y;
-            float du2 = ti.uv2.x - ti.uv0.x;
-            float dv2 = ti.uv2.y - ti.uv0.y;
-            float det = du1 * dv2 - du2 * dv1;
-            if (std::abs(det) < 1e-9f) {
-                triCache.push_back(ti);
-                continue;
-            }
-
-            ti.dU = ( dv2 * ti.e1 - dv1 * ti.e2) / det;
-            ti.dV = (-du2 * ti.e1 + du1 * ti.e2) / det;
-            ti.valid = true;
-            triCache.push_back(ti);
+            ti.e1 = ti.v1 - ti.v0; ti.e2 = ti.v2 - ti.v0;
+            glm::vec3 rn = glm::cross(ti.e1, ti.e2); float ln = glm::length(rn);
+            if (ln < 1e-9f) { triCache.push_back(ti); continue; }
+            ti.n = rn/ln; ti.d00 = glm::dot(ti.e1, ti.e1); ti.d01 = glm::dot(ti.e1, ti.e2); ti.d11 = glm::dot(ti.e2, ti.e2);
+            ti.uv0 = glmUVMap.at(tri[0]); ti.uv1 = glmUVMap.at(tri[1]); ti.uv2 = glmUVMap.at(tri[2]);
+            float du1 = ti.uv1.x - ti.uv0.x, dv1 = ti.uv1.y - ti.uv0.y, du2 = ti.uv2.x - ti.uv0.x, dv2 = ti.uv2.y - ti.uv0.y, det = du1*dv2 - du2*dv1;
+            if (std::abs(det) < 1e-9f) { triCache.push_back(ti); continue; }
+            ti.dU = (dv2*ti.e1 - dv1*ti.e2)/det; ti.dV = (-du2*ti.e1 + du1*ti.e2)/det; ti.valid = true; triCache.push_back(ti);
         }
+
+        // Build per-vertex averaged tangents (average dU/dV from all adjacent triangles)
+        std::map<int, glm::vec3> vertDU, vertDV;
+        std::map<int, int> vertTangentCount;
+        for (const auto& ti : triCache) {
+            if (!ti.valid) continue;
+            for (int vi : {ti.vi0, ti.vi1, ti.vi2}) {
+                vertDU[vi] += ti.dU;
+                vertDV[vi] += ti.dV;
+                vertTangentCount[vi]++;
+            }
+        }
+        for (auto& [vi, du] : vertDU) { int c = vertTangentCount[vi]; if (c > 1) du /= float(c); }
+        for (auto& [vi, dv] : vertDV) { int c = vertTangentCount[vi]; if (c > 1) dv /= float(c); }
 
         const float r2 = _expMapRadius * _expMapRadius;
         const glm::vec3 ctr(hitPos.x(), hitPos.y(), hitPos.z());
-
-        _texGaussians.clear();
-        _texGaussians.reserve(4096);
-
         std::vector<sibr::Vector2f> all_uvs(nGauss, sibr::Vector2f(-1.f, -1.f));
         std::vector<sibr::Vector3f> all_dUs(nGauss, sibr::Vector3f(0.f, 0.f, 0.f));
         std::vector<sibr::Vector3f> all_dVs(nGauss, sibr::Vector3f(0.f, 0.f, 0.f));
+        std::vector<float>          all_surfDists(nGauss, 1e9f);
+        _texGaussians.clear();
 
-        // Every Gaussian inside the sphere gets UV from its nearest triangle
-        // (no planeDist or margin filter). This ensures all in-sphere Gaussians
-        // that can be projected receive a texture UV and are not suppressed.
-        // The only Gaussians left suppressed are those with no valid triangle at all.
-
+        // Assign UV to ALL Gaussians within the sphere, regardless of surface distance.
+        // Each Gaussian is projected onto the closest valid triangle to obtain its UV.
         for (int k = 0; k < nGauss; ++k) {
             glm::vec3 p(cpuPos[k].x(), cpuPos[k].y(), cpuPos[k].z());
             if (glm::dot(p - ctr, p - ctr) > r2) continue;
 
             float best = 1e18f;
-            glm::vec2 bestUV(0.f, 0.f);
-            glm::vec3 bestDU(0.f), bestDV(0.f);
+            glm::vec2 bUV(0.f, 0.f);
+            glm::vec3 bDU(0.f), bDV(0.f);
             bool found = false;
 
-            float bestOutDist = 1e18f;
-            glm::vec2 bestOutUV(0.f, 0.f);
-            glm::vec3 bestOutDU(0.f), bestOutDV(0.f);
-
-            for (const TriInfo& ti : triCache) {
+            for (const auto& ti : triCache) {
                 if (!ti.valid) continue;
 
                 float planeDist = glm::dot(p - ti.v0, ti.n);
@@ -383,170 +511,70 @@ private:
                 float bw = (ti.d00 * d21 - ti.d01 * d20) / den;
                 float bu = 1.f - bv - bw;
 
-                const float margin = -0.05f;
-                if (bu >= margin && bv >= margin && bw >= margin) {
+                if (bu >= -0.001f && bv >= -0.001f && bw >= -0.001f) {
                     float d2 = planeDist * planeDist;
                     if (d2 < best) {
                         best = d2;
-                        bestUV = bu * ti.uv0 + bv * ti.uv1 + bw * ti.uv2;
-                        bestDU = ti.dU;
-                        bestDV = ti.dV;
+                        bUV = bu * ti.uv0 + bv * ti.uv1 + bw * ti.uv2;
+                        glm::vec3 du0 = vertDU.count(ti.vi0) ? vertDU.at(ti.vi0) : ti.dU;
+                        glm::vec3 du1 = vertDU.count(ti.vi1) ? vertDU.at(ti.vi1) : ti.dU;
+                        glm::vec3 du2 = vertDU.count(ti.vi2) ? vertDU.at(ti.vi2) : ti.dU;
+                        glm::vec3 dv0 = vertDV.count(ti.vi0) ? vertDV.at(ti.vi0) : ti.dV;
+                        glm::vec3 dv1 = vertDV.count(ti.vi1) ? vertDV.at(ti.vi1) : ti.dV;
+                        glm::vec3 dv2 = vertDV.count(ti.vi2) ? vertDV.at(ti.vi2) : ti.dV;
+                        bDU = bu * du0 + bv * du1 + bw * du2;
+                        bDV = bu * dv0 + bv * dv1 + bw * dv2;
                         found = true;
                     }
-                } 
-                else {
-                    float cu = std::max(0.f, bu);
-                    float cv = std::max(0.f, bv);
-                    float cw = std::max(0.f, bw);
-                    float sum = cu + cv + cw;
-                    if (sum > 1e-6f) { cu /= sum; cv /= sum; cw /= sum; }
-
-                    glm::vec3 clampedP = cu * ti.v0 + cv * ti.v1 + cw * ti.v2;
-                    float d2 = glm::dot(p - clampedP, p - clampedP);
-
-                    if (d2 < bestOutDist) {
-                        bestOutDist = d2;
-                        bestOutUV = cu * ti.uv0 + cv * ti.uv1 + cw * ti.uv2;
-                        bestOutDU = ti.dU;
-                        bestOutDV = ti.dV;
-                    }
                 }
-            }
-            if (!found && bestOutDist < r2) {
-                bestUV = bestOutUV;
-                bestDU = bestOutDU;
-                bestDV = bestOutDV;
-                found = true;
             }
 
             if (!found) continue;
 
-            all_uvs[k] = {bestUV.x, bestUV.y};
-            all_dUs[k] = sibr::Vector3f(bestDU.x, bestDU.y, bestDU.z);
-            all_dVs[k] = sibr::Vector3f(bestDV.x, bestDV.y, bestDV.z);
+            all_uvs[k]  = { bUV.x, bUV.y };
+            all_dUs[k]  = { bDU.x, bDU.y, bDU.z };
+            all_dVs[k]  = { bDV.x, bDV.y, bDV.z };
+            all_surfDists[k] = std::sqrt(best);
 
             ProjectedGaussian pg;
-            pg.originalIndex = k;
-            pg.position      = p;
-            pg.uv            = bestUV;
-            pg.dU            = bestDU;
-            pg.dV            = bestDV;
-            pg.originalPos   = p;
-
-            float distToCenter = glm::length(p - ctr);
-            float fadeStartRadius = _expMapRadius * 0.8f;
-            float alphaMultiplier = 1.0f;
-
-            if (distToCenter > fadeStartRadius) {
-                float t = 1.0f - ((distToCenter - fadeStartRadius) / (_expMapRadius - fadeStartRadius));
-                alphaMultiplier = t * t * (3.0f - 2.0f * t);
-            }
-
-            float opc = std::max(1e-4f, std::min(1.f - 1e-4f, cpuOpacity[k] * alphaMultiplier));
+            pg.originalIndex = k; pg.position = p; pg.uv = bUV; pg.dU = bDU; pg.dV = bDV;
+            float opc = std::max(1e-4f, std::min(1.f - 1e-4f, cpuOpacity[k]));
             pg.opacity = std::log(opc / (1.f - opc));
-
-            pg.scale = glm::vec3(
-                std::log(std::max(1e-9f, cpuScale[3 * k + 0])),
-                std::log(std::max(1e-9f, cpuScale[3 * k + 1])),
-                std::log(std::max(1e-9f, cpuScale[3 * k + 2]))
-            );
-
-            pg.rotation = glm::vec4(
-                cpuRot[4 * k + 0],
-                cpuRot[4 * k + 1],
-                cpuRot[4 * k + 2],
-                cpuRot[4 * k + 3]
-            );
-
+            pg.scale = { std::log(std::max(1e-9f, cpuScale[3*k])),
+                         std::log(std::max(1e-9f, cpuScale[3*k+1])),
+                         std::log(std::max(1e-9f, cpuScale[3*k+2])) };
+            pg.rotation = { cpuRot[4*k], cpuRot[4*k+1], cpuRot[4*k+2], cpuRot[4*k+3] };
             _texGaussians.push_back(pg);
         }
 
-        _liveSSBODirty = true;
+        _expMapSolver.ClearSuppressedUVs();
+        _lastAllUVs = all_uvs; _lastAllDUs = all_dUs; _lastAllDVs = all_dVs;
+        _lastAllSurfDists = all_surfDists;
         _expMapSolver.SetMainGaussiansForNextSave(_texGaussians);
-
-        // Collect suppressed UV positions for debug visualization.
-        // These are in-sphere Gaussians with no valid triangle at all (triCache empty
-        // or all degenerate). Show as green dots on UV canvas.
-        {
-            std::vector<glm::vec2> suppressedUVs;
-            suppressedUVs.reserve(64);
-            for (int k = 0; k < nGauss; ++k) {
-                if (all_uvs[k].x() >= 0.f && all_uvs[k].y() >= 0.f) continue;
-                glm::vec3 p(cpuPos[k].x(), cpuPos[k].y(), cpuPos[k].z());
-                if (glm::dot(p - ctr, p - ctr) > r2) continue;
-                // Try to find nearest UV for visualization only
-                float best = 1e18f;
-                glm::vec2 bestUV(-1.f, -1.f);
-                for (const auto& ti : triCache) {
-                    if (!ti.valid) continue;
-                    float pd = glm::dot(p - ti.v0, ti.n);
-                    glm::vec3 pv = (p - ti.n * pd) - ti.v0;
-                    float den = ti.d00 * ti.d11 - ti.d01 * ti.d01;
-                    if (std::abs(den) < 1e-9f) continue;
-                    float d20 = glm::dot(pv, ti.e1), d21 = glm::dot(pv, ti.e2);
-                    float bv = (ti.d11*d20 - ti.d01*d21)/den;
-                    float bw = (ti.d00*d21 - ti.d01*d20)/den;
-                    float bu = 1.f - bv - bw;
-                    bu = std::max(0.f,bu); bv = std::max(0.f,bv); bw = std::max(0.f,bw);
-                    float bs = bu+bv+bw; if (bs < 1e-9f) continue;
-                    bu/=bs; bv/=bs; bw/=bs;
-                    glm::vec3 nr = bu*ti.v0 + bv*ti.v1 + bw*ti.v2;
-                    float d2 = glm::dot(p-nr, p-nr);
-                    if (d2 < best) { best = d2; bestUV = bu*ti.uv0 + bv*ti.uv1 + bw*ti.uv2; }
-                }
-                if (bestUV.x >= 0.f && bestUV.x <= 1.f && bestUV.y >= 0.f && bestUV.y <= 1.f)
-                    suppressedUVs.push_back(bestUV);
-            }
-            _expMapSolver.SetSuppressedUVs(suppressedUVs);
-            std::cout << "[INFO] Textured=" << _texGaussians.size()
-                      << " Suppressed=" << suppressedUVs.size()
-                      << " Total=" << nGauss << "\n";
-        }
-
-        // Suppress in-sphere Gaussians that have no UV (no valid triangle found).
-        _gaussianView->suppressGaussiansInRegion(all_uvs, hitPos, _expMapRadius);
-
-        // Cache UV data so we can re-apply if the user swaps the texture later.
-        _lastAllUVs = all_uvs;
-        _lastAllDUs = all_dUs;
-        _lastAllDVs = all_dVs;
-
-        // Single-pass CUDA render with texture.
-        _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, _texPtr);
+        _gaussianView->restoreOpacities();
+        _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, all_surfDists, _texPtr);
     }
 
-    // ---- members ----
     GaussianView::Ptr               _gaussianView;
-    SimplePointRenderer             _geoRenderer;
-    SimplePointRenderer             _appRenderer;
+    SimplePointRenderer             _geoRenderer, _appRenderer;
     PointCloudRenderer              _pointCloudRenderer;
     MeshWireframeRenderer           _wireframeRenderer;
-    GaussianSplatRenderer           _gaussianSplatRenderer;
-    MeshDepthStencilRenderer        _meshDepthStencilRenderer;
     ExpMapSolverSIBR                _expMapSolver;
-
-    const sibr::Mesh*                   _mesh;
+    const sibr::Mesh* _mesh;
     sibr::InteractiveCameraHandler::Ptr _camHandler;
-    sibr::Viewport                      _viewport;
-
+    sibr::Viewport                  _viewport;
     sibr::Vector3f _meshColor, _geoColor, _appColor;
-    bool   _showMesh     = false;
-    bool   _showGeo      = false;
-    bool   _showApp      = false;
-    float  _pointSize    = 1.0f;
-    float  _expMapRadius = 0.5f;
-
-    // Kept for compatibility with existing slot / debug flow.
+    bool   _showMesh = false, _showGeo = false, _showApp = false;
+    float  _pointSize = 1.0f, _expMapRadius = 0.5f;
+    bool   _showGaussianOutlines = false;
+    bool   _showTexture = true;
+    GLuint _gaussOutlineVAO = 0, _gaussOutlineVBO = 0, _gaussOutlineShader = 0;
     std::vector<ProjectedGaussian>  _texGaussians;
-    GLuint                          _liveSSBO      = 0;
-    bool                            _liveSSBODirty = true;
+    GLuint _liveSSBO = 0;
     sibr::Texture2DRGBA::Ptr        _texPtr;
-
-    // Cached per-Gaussian UV data from the last raycast, so we can re-apply
-    // when the user swaps the texture without clicking again.
     std::vector<sibr::Vector2f>     _lastAllUVs;
-    std::vector<sibr::Vector3f>     _lastAllDUs;
-    std::vector<sibr::Vector3f>     _lastAllDVs;
+    std::vector<sibr::Vector3f>     _lastAllDUs, _lastAllDVs;
+    std::vector<float>              _lastAllSurfDists;
 };
 
 // =============================================================================

@@ -134,12 +134,12 @@ namespace sibr {
 		_paramStage.set(0);
 		mesh.render(G);
 
-		// Simple additive blendnig (no order)
+		// Standard alpha blending for better transparency handling
 		glDrawBuffers(1, drawBuffers);
 		glDepthMask(GL_FALSE);
 		glEnable(GL_BLEND);
 		glBlendEquation(GL_FUNC_ADD);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 		_paramStage.set(1);
 		mesh.render(G);
 

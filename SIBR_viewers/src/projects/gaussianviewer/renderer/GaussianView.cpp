@@ -335,7 +335,7 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camer
 			image_cuda = fallbackBufferCuda;
 		}
 
-		int*   rects  = _fastCulling ? rect_cuda       : nullptr;
+		int* rects  = _fastCulling ? rect_cuda       : nullptr;
 		float* boxmin = _cropping   ? (float*)&_boxmin : nullptr;
 		float* boxmax = _cropping   ? (float*)&_boxmax : nullptr;
 
@@ -349,7 +349,7 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camer
 			tan_fovx, tan_fovy,
 			false, image_cuda, _antialiasing,
 			nullptr, rects, boxmin, boxmax,
-			uvs_cuda, dU_cuda, dV_cuda, tex_cuda
+			uvs_cuda, dU_cuda, dV_cuda, surfaceDist_cuda, tex_cuda
 		);
 
 		if (!_interop_failed) {
@@ -463,80 +463,63 @@ void sibr::GaussianView::downloadGaussianData(
 	cudaMemcpy(outOpacity.data(), opacity_cuda, sizeof(float) * count,     cudaMemcpyDeviceToHost);
 }
 
-// =============================================================================
-// suppressGaussiansInRegion
-//
-// MODIFICATION: Previously only suppressed Gaussians that were inside the
-// suppress sphere AND had no valid UV (u < 0 or v < 0).  This was insufficient
-// because:
-//   1. Gaussians with a UV that falls outside [0,1] still render as SH colour
-//      (the texture path rejects them), so they bleed their green SH colour
-//      into the textured region just as much as UV-less Gaussians do.
-//   2. The suppress radius was often too small to cover all the "halo" splats
-//      that visually bleed around the textured patch.
-//
-// New logic: suppress any Gaussian that is inside the sphere AND does NOT have
-// a UV that lies strictly within [0,1]² (i.e. it will not be covered by the
-// texture path).  Gaussians with a valid, in-range UV keep their opacity so
-// that they participate in the texture rendering.
-// =============================================================================
 void sibr::GaussianView::suppressGaussiansInRegion(
-	const std::vector<sibr::Vector2f>& uvs,
-	const sibr::Vector3f& center,
-	float suppressRadius)
+    const std::vector<sibr::Vector2f>& uvs,
+    const sibr::Vector3f& center,
+    float suppressRadius,
+    const std::vector<float>& surfaceDists)
 {
-	if ((int)uvs.size() != count) return;
+    if ((int)uvs.size() != count) return;
+    getCpuPositions();
+    if ((int)_cpuOpacityCache.size() != count) {
+        _cpuOpacityCache.resize(count);
+        cudaMemcpy(_cpuOpacityCache.data(), opacity_cuda, sizeof(float) * count, cudaMemcpyDeviceToHost);
+    }
 
-	getCpuPositions();
+    const bool hasSurfDist = ((int)surfaceDists.size() == count);
+    std::vector<float> modOpc(_cpuOpacityCache);
 
-	if ((int)_cpuOpacityCache.size() != count) {
-		_cpuOpacityCache.resize(count);
-		cudaMemcpy(_cpuOpacityCache.data(), opacity_cuda,
-		           sizeof(float) * count, cudaMemcpyDeviceToHost);
-	}
+    const float suppressRadius2 = suppressRadius * suppressRadius;
 
-	const float r2 = suppressRadius * suppressRadius;
-	std::vector<float> modOpc(_cpuOpacityCache);
-	int suppressed = 0;
+    for (int i = 0; i < count; ++i) {
+        if (uvs[i].x() >= 0.f) continue; // has UV -> keep original opacity
 
-	for (int i = 0; i < count; ++i) {
-		sibr::Vector3f d = _cpuPos[i] - center;
-		bool inSphere = (d.squaredNorm() <= r2);
+        // Only suppress Gaussians physically inside the expmap sphere.
+        // Gaussians outside the region belong to the rest of the model and must be untouched.
+        const sibr::Vector3f& p = _cpuPos[i];
+        float dx = p.x() - center.x(), dy = p.y() - center.y(), dz = p.z() - center.z();
+        if (dx*dx + dy*dy + dz*dz > suppressRadius2) continue;
 
-		if (!inSphere) continue;  // outside the region — leave untouched
-
-		// A Gaussian is considered "texture-covered" only if its UV lies
-		// strictly inside [0,1]².  Anything outside that range will fall
-		// back to SH colour in the CUDA kernel and must be suppressed.
-		float u = uvs[i].x();
-		float v = uvs[i].y();
-		bool uvInRange = (u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f);
-
-		if (!uvInRange) {
-			modOpc[i] = 0.f;
-			++suppressed;
-		}
-		// else: Gaussian has a valid UV inside [0,1]² → keep opacity so it
-		// participates in texture rendering.
-	}
-
-	SIBR_LOG << "[GaussianView] suppressGaussiansInRegion: suppressed "
-	         << suppressed << " / " << count << " Gaussians." << std::endl;
-
-	cudaMemcpy(opacity_cuda, modOpc.data(),
-	           sizeof(float) * count, cudaMemcpyHostToDevice);
+        if (hasSurfDist && surfaceDists[i] < suppressRadius) {
+            // Inside sphere, no UV: smooth falloff — dist=0 -> factor=1, dist=radius -> factor~0.05
+            float t = surfaceDists[i] / suppressRadius;
+            float factor = std::exp(-3.0f * t * t);
+            modOpc[i] *= factor;
+        } else {
+            // Inside sphere but no surface distance recorded -> fully transparent
+            modOpc[i] = 0.f;
+        }
+    }
+    cudaMemcpy(opacity_cuda, modOpc.data(), sizeof(float) * count, cudaMemcpyHostToDevice);
 }
 
-// =============================================================================
-// restoreOpacities
-// =============================================================================
-void sibr::GaussianView::restoreOpacities()
+void sibr::GaussianView::restoreOpacities() {
+    if ((int)_cpuOpacityCache.size() != count) return;
+    cudaMemcpy(opacity_cuda, _cpuOpacityCache.data(), sizeof(float) * count, cudaMemcpyHostToDevice);
+    _cpuOpacityCache.clear();
+}
+
+void sibr::GaussianView::updateGeometry(
+    const std::vector<sibr::Vector3f>& positions,
+    const std::vector<sibr::Vector4f>& rotations,
+    const std::vector<sibr::Vector3f>& scales)
 {
-	if ((int)_cpuOpacityCache.size() != count) return;
-	cudaMemcpy(opacity_cuda, _cpuOpacityCache.data(),
-	           sizeof(float) * count, cudaMemcpyHostToDevice);
-	_cpuOpacityCache.clear();
-	SIBR_LOG << "[GaussianView] Restored " << count << " opacities." << std::endl;
+    if ((int)positions.size() == count)
+        cudaMemcpy(pos_cuda,   positions.data(), sizeof(float) * count * 3, cudaMemcpyHostToDevice);
+    if ((int)rotations.size() == count)
+        cudaMemcpy(rot_cuda,   rotations.data(), sizeof(float) * count * 4, cudaMemcpyHostToDevice);
+    if ((int)scales.size() == count)
+        cudaMemcpy(scale_cuda, scales.data(),    sizeof(float) * count * 3, cudaMemcpyHostToDevice);
 }
 
 // =============================================================================
@@ -546,13 +529,16 @@ void sibr::GaussianView::setUVsAndTexture(
 	const std::vector<sibr::Vector2f>& uvs,
 	const std::vector<sibr::Vector3f>& dUs,
 	const std::vector<sibr::Vector3f>& dVs,
+	const std::vector<float>&          surfaceDists,
 	sibr::Texture2DRGBA::Ptr texPtr)
 {
-	if ((int)uvs.size() != count || (int)dUs.size() != count || (int)dVs.size() != count) {
+	if ((int)uvs.size() != count || (int)dUs.size() != count ||
+	    (int)dVs.size() != count || (int)surfaceDists.size() != count) {
 		SIBR_ERR << "[GaussianView::setUVsAndTexture] size mismatch: "
 		         << "uvs=" << uvs.size()
 		         << " dUs=" << dUs.size()
 		         << " dVs=" << dVs.size()
+		         << " surfaceDists=" << surfaceDists.size()
 		         << " count=" << count;
 		return;
 	}
@@ -563,6 +549,8 @@ void sibr::GaussianView::setUVsAndTexture(
 		CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&dU_cuda, sizeof(float) * count * 3));
 	if (!dV_cuda)
 		CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&dV_cuda, sizeof(float) * count * 3));
+	if (!surfaceDist_cuda)
+		CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&surfaceDist_cuda, sizeof(float) * count));
 
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
 		uvs_cuda,
@@ -580,6 +568,12 @@ void sibr::GaussianView::setUVsAndTexture(
 		dV_cuda,
 		dVs.data(),
 		sizeof(float) * count * 3,
+		cudaMemcpyHostToDevice));
+
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
+		surfaceDist_cuda,
+		surfaceDists.data(),
+		sizeof(float) * count,
 		cudaMemcpyHostToDevice));
 
 	if (_current_tex != texPtr) {
@@ -622,17 +616,84 @@ void sibr::GaussianView::setUVsAndTexture(
 			resDesc.res.array.array = tex_array;
 
 			cudaTextureDesc texDesc{};
-			texDesc.addressMode[0]   = cudaAddressModeClamp;
-			texDesc.addressMode[1]   = cudaAddressModeClamp;
+			// Border mode: UV outside [0,1] returns transparent (0,0,0,0) instead of clamping
+			// This avoids edge artifacts without needing manual alpha cutoff.
+			texDesc.addressMode[0]   = cudaAddressModeBorder;
+			texDesc.addressMode[1]   = cudaAddressModeBorder;
+			texDesc.borderColor[0]   = 0.f;   // R
+			texDesc.borderColor[1]   = 0.f;   // G
+			texDesc.borderColor[2]   = 0.f;   // B
+			texDesc.borderColor[3]   = 0.f;   // A = 0 -> fully transparent outside boundary
 			texDesc.filterMode       = cudaFilterModeLinear;
 			texDesc.readMode         = cudaReadModeElementType;
 			texDesc.normalizedCoords = 1;
 			texDesc.maxAnisotropy    = 16;
-			texDesc.mipmapFilterMode = cudaFilterModeLinear;
+			texDesc.mipmapFilterMode = cudaFilterModePoint; // lock to mip level 0
+			texDesc.maxMipmapLevelClamp = 0;
 
 			CUDA_SAFE_CALL_ALWAYS(cudaCreateTextureObject(&tex_cuda, &resDesc, &texDesc, NULL));
 		}
 	}
+
+	// ==========================================================================
+	// [DEBUG] UV coverage check: mark Gaussians without UV assignment as pure green
+	// Output color = SH_C0 * sh[0] + 0.5; SH_C0 = 0.28209479177387814
+	// Pure green (R=0, G=1, B=0): sh_R=-1.7725, sh_G=1.7725, sh_B=-1.7725
+	// Note: this permanently modifies shs_cuda until next setUVsAndTexture call.
+	// Set DEBUG_MARK_NO_UV to 0 after confirming UV coverage.
+	// ==========================================================================
+#define DEBUG_MARK_NO_UV 0
+#if DEBUG_MARK_NO_UV
+	{
+		// degree 3 -> 16 coefficients x 3 channels = 48 floats per Gaussian
+		const int SH_TOTAL = 16 * 3;
+
+		std::vector<float> shs_host((size_t)count * SH_TOTAL);
+		CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
+			shs_host.data(),
+			shs_cuda,
+			sizeof(float) * count * SH_TOTAL,
+			cudaMemcpyDeviceToHost));
+
+		const float SH_C0 = 0.28209479177387814f;
+		const float sh_R  = (0.0f - 0.5f) / SH_C0;   // -> R=0
+		const float sh_G  = (1.0f - 0.5f) / SH_C0;   // -> G=1
+		const float sh_B  = (0.0f - 0.5f) / SH_C0;   // -> B=0
+
+		int no_uv_count = 0;
+		for (int i = 0; i < count; i++)
+		{
+			const float u = uvs[i].x();
+			const float v = uvs[i].y();
+
+			if (u < -0.5f || v < -0.5f)
+			{
+				// Overwrite DC component (layout: shs[0]=R, shs[1]=G, shs[2]=B)
+				shs_host[i * SH_TOTAL + 0] = sh_R;
+				shs_host[i * SH_TOTAL + 1] = sh_G;
+				shs_host[i * SH_TOTAL + 2] = sh_B;
+				// Zero out higher-order SH to prevent view-dependent color shift
+				for (int j = 3; j < SH_TOTAL; j++)
+					shs_host[i * SH_TOTAL + j] = 0.0f;
+				no_uv_count++;
+			}
+		}
+
+		SIBR_LOG << "[GaussianView] UV coverage: "
+		         << (count - no_uv_count) << " / " << count
+		         << " Gaussians have UV  ("
+		         << no_uv_count << " marked green, "
+		         << (100.f * (count - no_uv_count) / (float)count) << "% covered)"
+		         << std::endl;
+
+		// Upload back to GPU
+		CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
+			shs_cuda,
+			shs_host.data(),
+			sizeof(float) * count * SH_TOTAL,
+			cudaMemcpyHostToDevice));
+	}
+#endif // DEBUG_MARK_NO_UV
 }
 
 sibr::GaussianView::~GaussianView()
@@ -648,9 +709,10 @@ sibr::GaussianView::~GaussianView()
 	cudaFree(background_cuda);
 	cudaFree(rect_cuda);
 
-	if (uvs_cuda) cudaFree(uvs_cuda);
-	if (dU_cuda)  cudaFree(dU_cuda);
-	if (dV_cuda)  cudaFree(dV_cuda);
+	if (uvs_cuda)          cudaFree(uvs_cuda);
+	if (dU_cuda)           cudaFree(dU_cuda);
+	if (dV_cuda)           cudaFree(dV_cuda);
+	if (surfaceDist_cuda)  cudaFree(surfaceDist_cuda);
 
 	if (tex_cuda)  cudaDestroyTextureObject(tex_cuda);
 	if (tex_array) cudaFreeArray(tex_array);

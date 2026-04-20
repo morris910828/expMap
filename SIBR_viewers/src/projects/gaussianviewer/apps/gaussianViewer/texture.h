@@ -114,11 +114,107 @@ public:
     TextureLoader() = default;
 
     bool LoadImage(const std::string& path) {
-        sibr::ImageRGBA image;
-        if (!image.load(path)) return false;
-        _texture.reset(new sibr::Texture2DRGBA(image, SIBR_GPU_LINEAR_SAMPLING));
+        if (!_originalImage.load(path)) return false;
+        _texture.reset(new sibr::Texture2DRGBA(_originalImage, SIBR_GPU_LINEAR_SAMPLING));
         _path = path;
         return true;
+    }
+
+    sibr::Texture2DRGBA::Ptr generateCudaTexture(const std::vector<sibr::Vector3u>& tris, const std::map<int, glm::vec2>& uvs) {
+        if (_originalImage.w() == 0 || _originalImage.h() == 0) return nullptr;
+        int W = _originalImage.w();
+        int H = _originalImage.h();
+
+        sibr::ImageRGBA maskedImage(W, H);
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                maskedImage(x, y) = _originalImage(x, y);
+            }
+        }
+
+        if (!tris.empty() && !uvs.empty()) {
+            std::vector<uint8_t> mask(W * H, 0);
+
+            for (const auto& t : tris) {
+                if (!uvs.count(t[0]) || !uvs.count(t[1]) || !uvs.count(t[2])) continue;
+                glm::vec2 p0 = uvs.at(t[0]);
+                glm::vec2 p1 = uvs.at(t[1]);
+                glm::vec2 p2 = uvs.at(t[2]);
+
+                p0.x *= (W - 1); p0.y *= (H - 1);
+                p1.x *= (W - 1); p1.y *= (H - 1);
+                p2.x *= (W - 1); p2.y *= (H - 1);
+
+                int minX = std::max(0, (int)std::floor(std::min({p0.x, p1.x, p2.x})));
+                int maxX = std::min(W - 1, (int)std::ceil(std::max({p0.x, p1.x, p2.x})));
+                int minY = std::max(0, (int)std::floor(std::min({p0.y, p1.y, p2.y})));
+                int maxY = std::min(H - 1, (int)std::ceil(std::max({p0.y, p1.y, p2.y})));
+
+                auto edge = [](const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
+                    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                };
+
+                if (edge(p0, p1, p2) < 0) std::swap(p1, p2);
+
+                for (int y = minY; y <= maxY; ++y) {
+                    for (int x = minX; x <= maxX; ++x) {
+                        glm::vec2 p(x + 0.5f, y + 0.5f);
+                        float w0 = edge(p1, p2, p);
+                        float w1 = edge(p2, p0, p);
+                        float w2 = edge(p0, p1, p);
+                        if (w0 >= -1.0f && w1 >= -1.0f && w2 >= -1.0f) {
+                            mask[y * W + x] = 1;
+                        }
+                    }
+                }
+            }
+
+            // 貼圖膨脹 (Texture Dilation)：
+            // 將有效三角形內的顏色向外擴展到相鄰像素，
+            // 防止雙線性採樣在三角形邊緣時混入錯誤的顏色（造成模糊/重疊）。
+            // 膨脹後的像素 RGB 與相鄰有效像素相同，但 Alpha 保持為 0（透明）。
+            const int DILATION_PASSES = 4;
+            for (int pass = 0; pass < DILATION_PASSES; ++pass) {
+                std::vector<uint8_t> prevMask = mask; // 快照：僅以上一輪為來源
+                const int dx4[] = {-1, 1,  0, 0};
+                const int dy4[] = { 0, 0, -1, 1};
+                for (int y = 0; y < H; ++y) {
+                    for (int x = 0; x < W; ++x) {
+                        if (prevMask[y * W + x] != 0) continue; // 已有效，跳過
+                        for (int d = 0; d < 4; ++d) {
+                            int nx = x + dx4[d], ny = y + dy4[d];
+                            if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                            if (prevMask[ny * W + nx] != 0) {
+                                // 複製鄰近有效像素的 RGB，但不改 Alpha（保持 0）
+                                maskedImage(x, y).x() = maskedImage(nx, ny).x();
+                                maskedImage(x, y).y() = maskedImage(nx, ny).y();
+                                maskedImage(x, y).z() = maskedImage(nx, ny).z();
+                                mask[y * W + x] = 2; // 標記為「已膨脹但非三角形內」
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 設定 Alpha：三角形內 = 255（不透明），其餘 = 0（透明）
+            for (int y = 0; y < H; ++y) {
+                for (int x = 0; x < W; ++x) {
+                    if (mask[y * W + x] == 0) {
+                        // 完全空白：RGB 也設為 0，避免邊緣偶發的顏色殘留
+                        maskedImage(x, y).x() = 0;
+                        maskedImage(x, y).y() = 0;
+                        maskedImage(x, y).z() = 0;
+                        maskedImage(x, y).w() = 0;
+                    } else if (mask[y * W + x] == 2) {
+                        // 膨脹像素：RGB 已填入，Alpha 設為 0（CUDA 不用 alpha，但語義正確）
+                        maskedImage(x, y).w() = 0;
+                    }
+                    // mask == 1：三角形內原始像素，保持不變
+                }
+            }
+        }
+        return std::make_shared<sibr::Texture2DRGBA>(maskedImage, SIBR_GPU_LINEAR_SAMPLING);
     }
 
     std::vector<std::string> scanForImages(const std::string& directory) const {
@@ -141,6 +237,7 @@ public:
     const std::string&              getPath()    const { return _path; }
 
 private:
+    sibr::ImageRGBA          _originalImage;
     sibr::Texture2DRGBA::Ptr _texture;
     std::string              _path;
 };
@@ -178,10 +275,11 @@ public:
         if (!file.is_open()) return;
 
         std::string line;
-        long vertex_count    = 0;
-        int  face_id_offset  = -1;
-        int  property_count  = 0;
-        bool is_binary       = false;
+        long vertex_count   = 0;
+        int  face_id_byte_offset = -1;
+        bool face_id_is_int = false;
+        int  byte_offset    = 0;
+        bool is_binary      = false;
 
         while (std::getline(file, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -195,27 +293,42 @@ public:
                 ss >> token;
                 if (token == "vertex") ss >> vertex_count;
             } else if (token == "property") {
-                std::string type, name; ss >> type;
-                if (type != "float") return;
-                ss >> name;
-                if (name == "face_id") face_id_offset = property_count;
-                property_count++;
+                std::string type, name; ss >> type >> name;
+                int sz = 0;
+                if      (type == "float"  || type == "int"   || type == "uint")  sz = 4;
+                else if (type == "double" || type == "int64" || type == "uint64") sz = 8;
+                else if (type == "short"  || type == "ushort") sz = 2;
+                else if (type == "char"   || type == "uchar")  sz = 1;
+                else sz = 4; // fallback assumption
+
+                if (name == "face_id") {
+                    face_id_byte_offset = byte_offset;
+                    face_id_is_int = (type == "int" || type == "uint");
+                }
+                byte_offset += sz;
             } else if (token == "end_header") {
                 break;
             }
         }
 
-        if (!is_binary || vertex_count == 0 || face_id_offset == -1) return;
+        if (!is_binary || vertex_count == 0 || face_id_byte_offset == -1) return;
 
         _fids.clear();
         _fids.reserve(vertex_count);
-        size_t stride = property_count * sizeof(float);
+        const int stride = byte_offset;
         std::vector<char> buf(stride);
-        float* fbuf = reinterpret_cast<float*>(buf.data());
         for (long i = 0; i < vertex_count; ++i) {
             file.read(buf.data(), stride);
             if (!file) return;
-            _fids.push_back(static_cast<int>(fbuf[face_id_offset]));
+            int fid;
+            if (face_id_is_int) {
+                int32_t v; std::memcpy(&v, buf.data() + face_id_byte_offset, sizeof(int32_t));
+                fid = v;
+            } else {
+                float v; std::memcpy(&v, buf.data() + face_id_byte_offset, sizeof(float));
+                fid = static_cast<int>(v);
+            }
+            _fids.push_back(fid);
         }
     }
 
@@ -425,9 +538,12 @@ public:
                     pushEdges(tris[idx], verts, normals, lines);
 
             if (!lines.empty()) {
+                // Always draw on top of everything (3DGS, mesh, point clouds).
+                glDepthFunc(GL_ALWAYS);
                 glLineWidth(2.5f);
                 glUniform3f(_locColor, 1.f, 1.f, 0.f);
                 uploadAndDraw(lines);
+                glDepthFunc(GL_LEQUAL); // restore for subsequent draw calls
             }
         }
 
@@ -740,15 +856,6 @@ struct GaussianAttr {
 
 // ============================================================================
 // MeshDepthStencilRenderer
-//
-// Renders the mesh geometry to the depth buffer and stencil buffer in a
-// colour-invisible prepass.  After this call:
-//   - depth buffer  : holds the mesh surface's depth at each covered pixel
-//   - stencil buffer: = 1 at every pixel where mesh geometry was rasterised
-//
-// GaussianSplatRenderer then uses stencil-test == 1 to clip its billboard
-// quads to the exact mesh footprint, preventing them from spilling over the
-// silhouette edge onto the background.
 // ============================================================================
 class MeshDepthStencilRenderer {
 public:
@@ -760,40 +867,20 @@ public:
         if (_ebo)    glDeleteBuffers(1, &_ebo);
     }
 
-    // Render mesh geometry to depth + stencil.  Call once per frame BEFORE
-    // GaussianSplatRenderer::render/renderAll.
     void render(const sibr::Mesh* mesh, const glm::mat4& mvp) {
         if (!mesh || mesh->vertices().empty() || mesh->triangles().empty()) return;
 
-        // Re-upload only when the mesh pointer changes (lazy upload)
         if (mesh != _lastMesh) {
             uploadMesh(mesh);
             _lastMesh = mesh;
         }
 
-        // ----- Stencil-ONLY write, colour masked, depth NOT written -----
-        //
-        // WHY glDepthMask(GL_FALSE):
-        //   After glClear(GL_DEPTH_BUFFER_BIT) the depth buffer is 1.0 (far).
-        //   If we write the mesh surface depth here, GaussianSplatRenderer
-        //   (GL_LEQUAL) would require Gaussian fragments to be at or in FRONT
-        //   of the mesh surface.  Main-cloud Gaussians are volumetric blobs
-        //   whose 3D centres may sit slightly BEHIND (inside) the mesh surface.
-        //   Their projected clip-space depth > mesh depth → GL_LEQUAL fails →
-        //   almost every fragment is discarded → the "blocked ring" artefact.
-        //
-        //   By NOT writing depth, the buffer stays at 1.0.  GL_LEQUAL then
-        //   passes for every Gaussian (depth < 1.0 always), so the entire
-        //   billboard is drawn.  Silhouette clipping is handled by the stencil
-        //   test; surface binding is handled by the UV [0,1] check + back-face
-        //   normal check in the fragment shader.
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-
-        glDisable(GL_DEPTH_TEST);   // no depth test needed for stencil write
-        glDepthMask(GL_FALSE);      // do NOT overwrite depth buffer
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
 
         glEnable(GL_STENCIL_TEST);
-        glStencilFunc(GL_ALWAYS, 1, 0xFF);   // always pass, write 1
+        glStencilFunc(GL_ALWAYS, 1, 0xFF);
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
         glStencilMask(0xFF);
 
@@ -806,7 +893,6 @@ public:
 
         glUseProgram(0);
 
-        // Restore colour write and depth; leave stencil test enabled
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDepthMask(GL_TRUE);
         glEnable(GL_DEPTH_TEST);
@@ -814,7 +900,6 @@ public:
 
 private:
     void init() {
-        // Minimal vertex-only shader: just transforms positions.
         const std::string vs = R"(
             #version 330 core
             layout(location = 0) in vec3 aPos;
@@ -941,7 +1026,6 @@ private:
         int totalSize = (int)(geoPoints.size() + appPoints.size());
         if (totalSize == 0) return;
 
-        // Upload SSBO if dirty
         if (isDirty) {
             if (ssbo == 0) { glGenBuffers(1, &ssbo); }
 
@@ -964,7 +1048,6 @@ private:
             isDirty = false;
         }
 
-        // Sort back-to-front for correct alpha blending
         std::vector<int> indices(totalSize);
         std::iota(indices.begin(), indices.end(), 0);
         std::sort(indices.begin(), indices.end(), [&](int a, int b) {
@@ -1021,36 +1104,13 @@ private:
 
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
 
-        // ------------------------------------------------------------------
-        // Depth + stencil state for surface-bound rendering
-        //
-        // Depth test (GL_LEQUAL):
-        //   The depth buffer was pre-filled by MeshDepthStencilRenderer.
-        //   Gaussian fragments at the surface pass (same depth ± precision).
-        //   Fragments behind the mesh are culled.
-        //
-        // Stencil test (GL_EQUAL 1):
-        //   MeshDepthStencilRenderer wrote stencil=1 at every pixel covered
-        //   by the mesh.  Gaussian billboard quads that extend beyond the
-        //   mesh silhouette land on pixels with stencil=0 and are discarded.
-        //   This is the key fix for the "texture floating over background" bug.
-        //
-        // Depth mask = false: Gaussians do not overwrite the pre-filled depth.
-        // Stencil mask = 0:   Gaussians do not modify the stencil.
-        // ------------------------------------------------------------------
-        // Depth test disabled: prepass no longer writes depth, so the buffer
-        // holds 1.0 (far) everywhere. Relying on depth would be meaningless.
-        // Surface binding is guaranteed by:
-        //   (a) stencil == 1  → only renders inside mesh silhouette
-        //   (b) fragment shader UV [0,1] clip  → only where UV is valid
-        //   (c) fragment shader back-face discard  → correct orientation
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
 
         glEnable(GL_STENCIL_TEST);
-        glStencilFunc(GL_EQUAL, 1, 0xFF);    // pass only where mesh was rendered
+        glStencilFunc(GL_EQUAL, 1, 0xFF); 
         glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-        glStencilMask(0x00);                 // don't write stencil
+        glStencilMask(0x00);
 
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1059,7 +1119,6 @@ private:
         glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)totalSize);
         glBindVertexArray(0);
 
-        // Restore state
         glDisable(GL_BLEND);
         glDisable(GL_STENCIL_TEST);
         glStencilMask(0xFF);
@@ -1141,6 +1200,8 @@ private:
                 float tx = posV.x, ty = posV.y, tz2 = tz*tz;
 
                 vec3  sc = exp(aScale);
+                if (sc.x > 0.05 || sc.y > 0.05) { gl_Position = vec4(0,0,2,1); return; }
+                
                 float qw=aRot.x, qx=aRot.y, qy=aRot.z, qz=aRot.w;
                 mat3 R = mat3(
                     vec3(1.0-2.0*(qy*qy+qz*qz), 2.0*(qx*qy+qw*qz), 2.0*(qx*qz-qw*qy)),
@@ -1208,7 +1269,7 @@ private:
                 if (power > 0.0) discard;
 
                 float alpha = min(0.99, (1.0/(1.0+exp(-vOpacity))) * exp(power));
-                if (alpha < 1.0/255.0) discard;
+                if (alpha < 0.1) discard; 
 
                 float denom = dot(vNormal, normalize((uInvView * vec4(
                     normalize((uInvProj * vec4(vNDC.x, vNDC.y, 1.0, 1.0)).xyz), 0.0)).xyz));
@@ -1226,10 +1287,10 @@ private:
                 float deltaU = (len2U > 1e-12) ? dot(offset, v_dU) / len2U : 0.0;
                 float deltaV = (len2V > 1e-12) ? dot(offset, v_dV) / len2V : 0.0;
                 vec2 exactUV = vUV_center + vec2(deltaU, deltaV);
-                //有改動：增加了對exactUV的衍生變量uv_dx和uv_dy的計算，並在discard條件中加入了對exactUV的範圍檢查，以確保只渲染UV坐標在[0,1]範圍內的片段。
+                
                 vec2 uv_dx = dFdx(exactUV);
                 vec2 uv_dy = dFdy(exactUV);
-                //
+                
                 if (exactUV.x < 0.0 || exactUV.x > 1.0 || exactUV.y < 0.0 || exactUV.y > 1.0) discard;
 
                 vec4 c = texture(uTexture, exactUV);

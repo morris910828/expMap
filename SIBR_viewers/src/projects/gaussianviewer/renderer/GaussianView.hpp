@@ -65,19 +65,26 @@ namespace sibr {
 			std::vector<float>& outScale,
 			std::vector<float>& outOpacity);
 
-		// 新版：上傳 per-Gaussian UV + dU + dV + optional texture
+		// 新版：上傳 per-Gaussian UV + dU + dV + surfaceDist + optional texture
 		void setUVsAndTexture(
 			const std::vector<sibr::Vector2f>& uvs,
 			const std::vector<sibr::Vector3f>& dUs,
 			const std::vector<sibr::Vector3f>& dVs,
+			const std::vector<float>&          surfaceDists,
 			sibr::Texture2DRGBA::Ptr texPtr);
 
 		void suppressGaussiansInRegion(
 			const std::vector<sibr::Vector2f>& uvs,
 			const sibr::Vector3f& center,
-			float suppressRadius);
+			float suppressRadius,
+			const std::vector<float>& surfaceDists = {});
 
 		void restoreOpacities();
+
+		void updateGeometry(
+			const std::vector<sibr::Vector3f>& positions,
+			const std::vector<sibr::Vector4f>& rotations,
+			const std::vector<sibr::Vector3f>& scales);
 
 		const std::shared_ptr<sibr::BasicIBRScene>& getScene() const { return _scene; }
 
@@ -108,6 +115,7 @@ namespace sibr {
 		float* uvs_cuda = nullptr;
 		float* dU_cuda = nullptr;
 		float* dV_cuda = nullptr;
+		float* surfaceDist_cuda = nullptr;
 
 		cudaTextureObject_t tex_cuda = 0;
 		cudaArray_t tex_array = nullptr;

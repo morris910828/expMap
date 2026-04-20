@@ -84,9 +84,13 @@ void main(void) {
 	vec4 newPos = MVP * vec4(intersection, 1);
 	newPos /= newPos.w;
 
-	gl_FragDepth = newPos.z;
+	gl_FragDepth = newPos.z - 0.000005f;
 
 	float a = stage == 0 ? 1.0 : 0.05f;
+	
+	if (a < alpha_limit) {
+		discard;
+	}
 
 	out_color = vec4(align * colorVert, a);
 	out_id = boxID;
