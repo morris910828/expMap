@@ -322,7 +322,7 @@ public:
 
             if(_vertexData[currIdx].cost > radius) continue;
             glm::vec3 currN = glm::normalize(getNormal(currIdx));
-            if (glm::dot(currN, toGlm(hitNormal)) < 0.15f) continue;
+            if (glm::dot(currN, toGlm(hitNormal)) < 0.0f) continue;
 
             maxCostFound = std::max(maxCostFound, _vertexData[currIdx].cost);
 
@@ -441,13 +441,13 @@ public:
                 std::sort(goodRatios.begin(), goodRatios.end());
                 medRatio = goodRatios[goodRatios.size() / 2];
             }
-            _autoThreshold = std::min(std::max(1.5f, medRatio * 2.0f), 6.0f);
+            _autoThreshold = std::min(std::max(1.5f, medRatio * 2.0f), 12.0f);
 
-            // 第一輪：過濾 winding 方向錯誤及 edge ratio 過大的三角形
+            // Pass 1: filter triangles with wrong winding or too-large edge ratio
             struct PassedCand {
                 sibr::Vector3u t;
                 int   idx;
-                float distFromCenter; // UV 中心距離，用於優先排序
+                float distFromCenter; // distance from UV centroid to center (0.5,0.5), for sorting
             };
             std::vector<PassedCand> passed;
             passed.reserve(cands.size());
@@ -457,39 +457,24 @@ public:
                 if (!correctWind)              continue;
                 if (c.maxEdgeRatio > _autoThreshold) continue;
 
-                // 計算三角形 UV 重心到中心 (0.5, 0.5) 的距離
+                // UV centroid distance to (0.5, 0.5)
                 glm::vec2 uv0 = _displayUVs[c.t[0]], uv1 = _displayUVs[c.t[1]], uv2 = _displayUVs[c.t[2]];
                 glm::vec2 centroid = (uv0 + uv1 + uv2) / 3.f;
                 float dist = glm::distance(centroid, glm::vec2(0.5f, 0.5f));
                 passed.push_back({c.t, c.idx, dist});
             }
 
-            // 由近到遠排序，優先保留靠近中心（hit point）的三角形
+            // Sort near-to-far to prioritize triangles close to the hit point
             std::sort(passed.begin(), passed.end(),
                       [](const PassedCand& a, const PassedCand& b){ return a.distFromCenter < b.distFromCenter; });
 
-            // 第二輪：逐一做 UV 空間重疊偵測，跳過與已接受三角形重疊的
+            // Accept all triangles that passed winding + edge-ratio check.
+            // UV overlap detection is O(n^2) and tends to misclassify adjacent
+            // triangles on curved surfaces as overlapping, causing holes. Skip it.
             for (auto& pc : passed) {
-                glm::vec2 newTri[3] = {
-                    _displayUVs[pc.t[0]], _displayUVs[pc.t[1]], _displayUVs[pc.t[2]]
-                };
-
-                bool overlaps = false;
-                for (const auto& accepted : _validTriangles) {
-                    glm::vec2 accTri[3] = {
-                        _displayUVs[accepted[0]], _displayUVs[accepted[1]], _displayUVs[accepted[2]]
-                    };
-                    if (uvTrianglesOverlap(newTri, accTri)) {
-                        overlaps = true;
-                        break;
-                    }
-                }
-
-                if (!overlaps) {
-                    _validTriangles.push_back(pc.t);
-                    _validTriIDs.push_back(pc.idx);
-                    _validTriangleIndicesSet.insert(pc.idx);
-                }
+                _validTriangles.push_back(pc.t);
+                _validTriIDs.push_back(pc.idx);
+                _validTriangleIndicesSet.insert(pc.idx);
             }
 
             ProjectAndInsertClouds(target, radius * 1.2f);
@@ -566,23 +551,20 @@ public:
             if (_displayUVs.empty()) {
                 ImGui::TextColored(ImVec4(1,1,0,1), "Right-click on the mesh to compute UV.");
             } else {
-            ImGui::Text("Tris: %lu | App: %d/%d | Geo: %d/%d", 
-                        _validTriangles.size(),
-                        _projectionStats.appProjected,
-                        _projectionStats.appTotal,
-                        _projectionStats.geoProjected,
-                        _projectionStats.geoTotal);
-            
-            
-            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Hold CTRL + Left Click to pick Start/End Points");
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Hold SHIFT + Drag to select area");
-            
-            if (_dijkstraPath.size() > 0) {
-                ImGui::TextColored(ImVec4(0,1,0,1), "Path Length: %lu hops", _dijkstraPath.size());
-            }
+                ImGui::Text("Tris: %lu | App: %d/%d | Geo: %d/%d", 
+                            _validTriangles.size(),
+                            _projectionStats.appProjected,
+                            _projectionStats.appTotal,
+                            _projectionStats.geoProjected,
+                            _projectionStats.geoTotal);
+                
+                
+                if (_dijkstraPath.size() > 0) {
+                    ImGui::TextColored(ImVec4(0,1,0,1), "Path Length: %lu hops", _dijkstraPath.size());
+                }
 
-            ImGui::SameLine();
-            if (ImGui::Button("Reset View")) { _viewScale = 1.0f; _viewOffset = ImVec2(0,0); }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset View")) { _viewScale = 1.0f; _viewOffset = ImVec2(0,0); }
             }
             
             ImGui::Checkbox("Fill", &_drawFilled);
@@ -711,14 +693,181 @@ public:
                 return v;
             };
 
-            for(const auto& t : _validTriangles) {
+            const int TRI_BUDGET  = 5000;
+            const int PT_BUDGET   = 3000;
+            int triStride = std::max(1, (int)_validTriangles.size()    / TRI_BUDGET);
+            int geoStride = std::max(1, (int)_projectedGeoPoints.size() / PT_BUDGET);
+            int appStride = std::max(1, (int)_projectedAppPoints.size() / PT_BUDGET);
+
+            float canvasX0 = p.x, canvasX1 = p.x + sz.x;
+            float canvasY0 = p.y, canvasY1 = p.y + sz.y;
+
+            static float maxScale3DExp = 1.0f;
+            static float minOpacity = 0.0f;
+
+            ImGui::PushItemWidth(120.0f);
+            ImGui::SliderFloat("MaxScale3D##ell", &maxScale3DExp, 0.001f, 5.0f, "%.3f");
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            ImGui::PushItemWidth(100.0f);
+            ImGui::SliderFloat("MinOpac##ell", &minOpacity, 0.0f, 1.0f, "%.2f");
+            ImGui::PopItemWidth();
+            if (triStride > 1)
+                ImGui::TextColored(ImVec4(1,0.6f,0,1), "Tri display thinned x%d", triStride);
+
+            {
+                struct GEntry {
+                    const ProjectedGaussian* pg;
+                    float absDist;
+                    bool  isGeo;
+                    bool  isSelected;
+                };
+                std::vector<GEntry> selEntries, nonSelEntries;
+
+                glm::vec3 hitN = glm::normalize(_seedFrame.axes[2]);
+                glm::vec3 hitO = _seedFrame.origin;
+
+                auto passFilter = [&](const ProjectedGaussian& pt) {
+                    if (pt.uv.x < -0.15f || pt.uv.x > 1.15f || pt.uv.y < -0.15f || pt.uv.y > 1.15f) return false;
+                    float op = 1.f / (1.f + std::exp(-pt.opacity));
+                    if (op < minOpacity) return false;
+                    glm::vec3 sExp = glm::exp(pt.scale);
+                    if (std::max({sExp.x, sExp.y, sExp.z}) > maxScale3DExp) return false;
+                    return true;
+                };
+
+                auto buildEntries = [&](const std::vector<ProjectedGaussian>& pts,
+                                        const std::vector<int>& selIds, bool isGeo) {
+                    for (const auto& pt : pts) {
+                        if (!passFilter(pt)) continue;
+                        float d = std::abs(glm::dot(pt.position - hitO, hitN));
+                        bool sel = std::find(selIds.begin(), selIds.end(), pt.originalIndex) != selIds.end();
+                        GEntry e{&pt, d, isGeo, sel};
+                        if (sel) selEntries.push_back(e);
+                        else     nonSelEntries.push_back(e);
+                    }
+                };
+
+                if (_showGeoPoints) buildEntries(_projectedGeoPoints, _selectedGeoIndices, true);
+                if (_showAppPoints) buildEntries(_projectedAppPoints, _selectedAppIndices, false);
+
+                auto byCost = [](const GEntry& a, const GEntry& b){ return a.absDist > b.absDist; };
+                std::sort(nonSelEntries.begin(), nonSelEntries.end(), byCost);
+                std::sort(selEntries.begin(),    selEntries.end(),    byCost);
+
+                float nsDistMin = nonSelEntries.empty() ? 0.f : nonSelEntries.back().absDist;
+                float nsDistMax = nonSelEntries.empty() ? 1.f : nonSelEntries.front().absDist;
+                float nsRange   = (nsDistMax - nsDistMin) > 1e-6f ? nsDistMax - nsDistMin : 1.f;
+
+                auto drawEllipse = [&](const GEntry& e, ImU32 fillCol, ImU32 outlineCol, bool outlineOnly=false) -> bool {
+                    constexpr int N_SEGS = 32;
+                    const ProjectedGaussian& pg = *e.pg;
+                    ImVec2 ctr = TransformUV(pg.uv);
+
+                    if (glm::length(pg.dU) < 1e-8f || glm::length(pg.dV) < 1e-8f) {
+                        if (ctr.x>=canvasX0&&ctr.x<=canvasX1&&ctr.y>=canvasY0&&ctr.y<=canvasY1)
+                            dl->AddCircleFilled(ctr, e.isSelected?5.f:2.5f, outlineCol, 8);
+                        return true;
+                    }
+                    glm::vec3 t1 = glm::normalize(pg.dU);
+                    glm::vec3 t2r = pg.dV - glm::dot(pg.dV, t1) * t1;
+                    if (glm::length(t2r) < 1e-8f) {
+                        if (ctr.x>=canvasX0&&ctr.x<=canvasX1&&ctr.y>=canvasY0&&ctr.y<=canvasY1)
+                            dl->AddCircleFilled(ctr, e.isSelected?5.f:2.5f, outlineCol, 8);
+                        return true;
+                    }
+                    glm::vec3 t2 = glm::normalize(t2r);
+
+                    float qw=pg.rotation.x,qx=pg.rotation.y,qy=pg.rotation.z,qz=pg.rotation.w;
+                    glm::mat3 R(
+                        1.f-2.f*(qy*qy+qz*qz),2.f*(qx*qy+qw*qz),    2.f*(qx*qz-qw*qy),
+                        2.f*(qx*qy-qw*qz),    1.f-2.f*(qx*qx+qz*qz),2.f*(qy*qz+qw*qx),
+                        2.f*(qx*qz+qw*qy),    2.f*(qy*qz-qw*qx),    1.f-2.f*(qx*qx+qy*qy)
+                    );
+                    float s0=std::exp(pg.scale.x),s1=std::exp(pg.scale.y),s2=std::exp(pg.scale.z);
+                    float a0=s0*glm::dot(R[0],t1),a1=s1*glm::dot(R[1],t1),a2=s2*glm::dot(R[2],t1);
+                    float b0=s0*glm::dot(R[0],t2),b1=s1*glm::dot(R[1],t2),b2=s2*glm::dot(R[2],t2);
+                    float s11=a0*a0+a1*a1+a2*a2,s12=a0*b0+a1*b1+a2*b2,s22=b0*b0+b1*b1+b2*b2;
+                    float tr=s11+s22,dif=s11-s22;
+                    float disc=std::sqrt(std::max(0.f,dif*dif+4.f*s12*s12));
+                    float sA=std::sqrt(std::max(0.f,(tr+disc)*0.5f));
+                    float sB=std::sqrt(std::max(0.f,(tr-disc)*0.5f));
+                    if (sA<1e-9f) return true;
+                    float theta=0.5f*std::atan2(2.f*s12,dif);
+                    float cT=std::cos(theta),sT=std::sin(theta);
+                    glm::vec3 axA=sA*(cT*t1+sT*t2),axB=sB*(-sT*t1+cT*t2);
+
+                    float jA=glm::dot(pg.dU,pg.dU),jB=glm::dot(pg.dU,pg.dV),jC=glm::dot(pg.dV,pg.dV);
+                    float detJ=jA*jC-jB*jB;
+                    if (std::abs(detJ)<1e-14f) return true;
+                    auto toUV2=[&](const glm::vec3& v)->glm::vec2{
+                        float du=glm::dot(pg.dU,v),dv=glm::dot(pg.dV,v);
+                        return glm::vec2((jC*du-jB*dv)/detJ,(-jB*du+jA*dv)/detJ);
+                    };
+                    glm::vec2 uvA=toUV2(axA),uvB=toUV2(axB);
+
+                    float sc = dim * _viewScale;
+                    float pxAx=uvA.x*sc, pxAy=-uvA.y*sc;
+                    float pxBx=uvB.x*sc, pxBy=-uvB.y*sc;
+                    float mp=pxAx*pxAx+pxAy*pxAy;
+                    float mq=pxAx*pxBx+pxAy*pxBy;
+                    float mr=pxBx*pxBx+pxBy*pxBy;
+                    float halfTr=(mp+mr)*0.5f;
+                    float halfDiff=(mp-mr)*0.5f;
+                    float discSVD=std::sqrt(halfDiff*halfDiff+mq*mq);
+                    float ra=std::sqrt(std::max(0.f,halfTr+discSVD));
+                    float rb=std::sqrt(std::max(0.f,halfTr-discSVD));
+                    if (ra<1e-6f) return true;
+                    float v1x=mq, v1y=halfTr+discSVD-mp;
+                    float v1len=std::sqrt(v1x*v1x+v1y*v1y);
+                    float ellRot;
+                    if (v1len<1e-9f) {
+                        ellRot=0.f;
+                    } else {
+                        v1x/=v1len; v1y/=v1len;
+                        float u1x=pxAx*v1x+pxBx*v1y;
+                        float u1y=pxAy*v1x+pxBy*v1y;
+                        ellRot=std::atan2(u1y,u1x);
+                    }
+                    float cosR=std::cos(ellRot),sinR=std::sin(ellRot);
+
+                    ImVec2 pts[N_SEGS];
+                    bool anyVis=false;
+                    for (int k=0;k<N_SEGS;++k){
+                        float phi=2.f*IM_PI*k/N_SEGS;
+                        float cx=ra*std::cos(phi)*cosR - rb*std::sin(phi)*sinR;
+                        float cy=ra*std::cos(phi)*sinR + rb*std::sin(phi)*cosR;
+                        pts[k]=ClampPx(ImVec2(ctr.x+cx, ctr.y+cy));
+                        if(pts[k].x>=canvasX0&&pts[k].x<=canvasX1&&
+                           pts[k].y>=canvasY0&&pts[k].y<=canvasY1) anyVis=true;
+                    }
+                    if(!anyVis&&(ctr.x<canvasX0||ctr.x>canvasX1||
+                                 ctr.y<canvasY0||ctr.y>canvasY1)) return true;
+                    if (!outlineOnly) dl->AddConvexPolyFilled(pts,N_SEGS,fillCol);
+                    dl->AddPolyline(pts,N_SEGS,outlineCol,true,1.0f);
+                };
+
+                for (int ei=0;ei<(int)nonSelEntries.size();ei++){
+                    const GEntry& e=nonSelEntries[ei];
+                    float t=1.f-(e.absDist-nsDistMin)/nsRange;
+                    ImU32 fC=e.isGeo?IM_COL32(255,120,120,150):IM_COL32(90,200,255,150);
+                    ImU32 oC=e.isGeo?IM_COL32(255,120,120,255):IM_COL32(90,200,255,255);
+                    drawEllipse(e, fC, oC, false);
+                }
+
+                for (int ei=0;ei<(int)selEntries.size();ei++){
+                    const GEntry& e=selEntries[ei];
+                    drawEllipse(e, IM_COL32(255,255,0,150), IM_COL32(255,255,0,255));
+                }
+            }
+
+            for(int ti = 0; ti < (int)_validTriangles.size(); ti += triStride) {
+                const auto& t = _validTriangles[ti];
                 glm::vec2 uv1 = _displayUVs[t[0]];
                 glm::vec2 uv2 = _displayUVs[t[1]];
                 glm::vec2 uv3 = _displayUVs[t[2]];
                 ImVec2 ip1 = TransformUV(uv1); ImVec2 ip2 = TransformUV(uv2); ImVec2 ip3 = TransformUV(uv3);
 
-                float canvasX0 = p.x, canvasX1 = p.x + sz.x;
-                float canvasY0 = p.y, canvasY1 = p.y + sz.y;
                 if (ip1.x < canvasX0 && ip2.x < canvasX0 && ip3.x < canvasX0) continue;
                 if (ip1.x > canvasX1 && ip2.x > canvasX1 && ip3.x > canvasX1) continue;
                 if (ip1.y < canvasY0 && ip2.y < canvasY0 && ip3.y < canvasY0) continue;
@@ -747,72 +896,12 @@ public:
                 else dl->AddTriangle(ip1, ip2, ip3, IM_COL32(255, 215, 0, 200), 1.0f);
             }
 
-            static float maxScale3DExp = 1.0f;
-            static float minOpacity = 0.0f;
-
-            ImGui::PushItemWidth(120.0f);
-            ImGui::SliderFloat("MaxScale3D##ell", &maxScale3DExp, 0.001f, 5.0f, "%.3f");
-            ImGui::PopItemWidth();
-            ImGui::SameLine();
-            ImGui::PushItemWidth(100.0f);
-            ImGui::SliderFloat("MinOpac##ell", &minOpacity, 0.0f, 1.0f, "%.2f");
-            ImGui::PopItemWidth();
-
-            float canvasX0 = p.x, canvasX1 = p.x + sz.x;
-            float canvasY0 = p.y, canvasY1 = p.y + sz.y;
-
-            if (_showGeoPoints) {
-                for (const auto& pt : _projectedGeoPoints) {
-                    if (pt.uv.x < -0.15f || pt.uv.x > 1.15f || pt.uv.y < -0.15f || pt.uv.y > 1.15f) continue;
-
-                    float actualOpacity = 1.0f / (1.0f + std::exp(-pt.opacity));
-                    if (actualOpacity < minOpacity) continue;
-
-                    {
-                        glm::vec3 sExp = glm::exp(pt.scale);
-                        float sMax = std::max({sExp.x, sExp.y, sExp.z});
-                        if (sMax > maxScale3DExp) continue;
-                    }
-
-                    ImVec2 pos = TransformUV(pt.uv);
-                    if (pos.x < canvasX0 || pos.x > canvasX1 || pos.y < canvasY0 || pos.y > canvasY1) continue;
-
-                    bool isSelected = std::find(_selectedGeoIndices.begin(), _selectedGeoIndices.end(), pt.originalIndex) != _selectedGeoIndices.end();
-                    // Geo Gaussians: red (selected = yellow)
-                    ImU32 color = isSelected ? IM_COL32(255, 255, 0, 255) : IM_COL32(255, 50, 50, 255);
-                    dl->AddCircleFilled(pos, isSelected ? 5.5f : 3.5f, color);
-                }
-            }
-
-            if (_showAppPoints) {
-                for (const auto& pt : _projectedAppPoints) {
-                    if (pt.uv.x < -0.15f || pt.uv.x > 1.15f || pt.uv.y < -0.15f || pt.uv.y > 1.15f) continue;
-
-                    float actualOpacity = 1.0f / (1.0f + std::exp(-pt.opacity));
-                    if (actualOpacity < minOpacity) continue;
-
-                    {
-                        glm::vec3 sExp = glm::exp(pt.scale);
-                        float sMax = std::max({sExp.x, sExp.y, sExp.z});
-                        if (sMax > maxScale3DExp) continue;
-                    }
-
-                    ImVec2 pos = TransformUV(pt.uv);
-                    if (pos.x < canvasX0 || pos.x > canvasX1 || pos.y < canvasY0 || pos.y > canvasY1) continue;
-
-                    bool isSelected = std::find(_selectedAppIndices.begin(), _selectedAppIndices.end(), pt.originalIndex) != _selectedAppIndices.end();
-                    // App Gaussians: blue (selected = yellow)
-                    ImU32 color = isSelected ? IM_COL32(255, 255, 0, 255) : IM_COL32(0, 150, 255, 255);
-                    dl->AddCircleFilled(pos, isSelected ? 5.5f : 3.5f, color);
-                }
-            }
-
             if (_showSuppressedPoints) {
                 for (const auto& uv : _suppressedUVs) {
                     if (uv.x < -1.0f || uv.x > 2.0f || uv.y < -1.0f || uv.y > 2.0f) continue;
                     ImVec2 pos = TransformUV(uv);
-                    dl->AddCircleFilled(pos, 6.0f, IM_COL32(0, 180, 0, 200));
-                    dl->AddCircleFilled(pos, 4.0f, IM_COL32(0, 255, 80, 255));
+                    dl->AddCircleFilled(pos, 5.0f, IM_COL32(0,180,0,200), 6);
+                    dl->AddCircleFilled(pos, 3.5f, IM_COL32(0,255,80,255), 6);
                 }
             }
 
@@ -940,7 +1029,6 @@ private:
         }
     }
     
-    // 2D 線段是否真正相交（排除端點相交，適用於共享邊的相鄰三角形）
     static bool segmentsProperlyIntersect(const glm::vec2& p1, const glm::vec2& p2,
                                           const glm::vec2& p3, const glm::vec2& p4) {
         auto cross2D = [](const glm::vec2& a, const glm::vec2& b) {
@@ -948,7 +1036,7 @@ private:
         };
         glm::vec2 d = p2 - p1, e = p4 - p3;
         float denom = cross2D(d, e);
-        if (std::abs(denom) < 1e-12f) return false; // 平行
+        if (std::abs(denom) < 1e-12f) return false;
         glm::vec2 r = p3 - p1;
         float t = cross2D(r, e) / denom;
         float u = cross2D(r, d) / denom;
@@ -956,7 +1044,6 @@ private:
         return t > eps && t < 1.f - eps && u > eps && u < 1.f - eps;
     }
 
-    // 點是否嚴格在三角形內部（排除邊界，正確處理相鄰三角形）
     static bool pointStrictlyInTriangle(const glm::vec2& p,
                                         const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
         float d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y);
@@ -965,19 +1052,17 @@ private:
         const float eps = 1e-6f;
         bool hasNeg = (d1 < -eps) || (d2 < -eps) || (d3 < -eps);
         bool hasPos = (d1 >  eps) || (d2 >  eps) || (d3 >  eps);
-        if (hasNeg && hasPos) return false; // 在三角形外
-        // 確認不在邊上（嚴格內部）
+        if (hasNeg && hasPos) return false;
         return (std::abs(d1) > eps) && (std::abs(d2) > eps) && (std::abs(d3) > eps);
     }
 
-    // 偵測兩個 UV 三角形的內部是否重疊（共享邊的相鄰三角形不會被誤判）
     static bool uvTrianglesOverlap(const glm::vec2 a[3], const glm::vec2 b[3]) {
-        // 頂點是否在對方三角形內部
+        // Check if any vertex of one triangle lies inside the other
         for (int i = 0; i < 3; ++i) {
             if (pointStrictlyInTriangle(a[i], b[0], b[1], b[2])) return true;
             if (pointStrictlyInTriangle(b[i], a[0], a[1], a[2])) return true;
         }
-        // 邊是否真正交叉
+        // Check if any edge pair properly intersects
         for (int i = 0; i < 3; ++i) {
             for (int j = 0; j < 3; ++j) {
                 if (segmentsProperlyIntersect(a[i], a[(i+1)%3], b[j], b[(j+1)%3]))
@@ -1093,45 +1178,35 @@ private:
 
         if (parentIdx >= (int)_mesh->vertices().size() || currIdx >= (int)_mesh->vertices().size()) return;
 
-        glm::vec3 nP  = glm::normalize(getNormal(parentIdx));
-        glm::vec3 txP = parent.tangentX; 
-        glm::vec3 tyP = glm::normalize(glm::cross(nP, txP));
+        glm::vec3 nP = glm::normalize(getNormal(parentIdx));
 
-        glm::vec3 edge = posC - posP;
-        
-        glm::vec3 edgeProj = edge - nP * glm::dot(edge, nP);
-        if (glm::length(edgeProj) > 1e-8f) {
-            edgeProj = glm::normalize(edgeProj) * edgeLen; 
-        }
+        TangentFrame centerFrame(posP, nP);
 
-        glm::vec2 deltaUV(glm::dot(edgeProj, txP), glm::dot(edgeProj, tyP));
-        curr.uv = parent.uv + deltaUV;
+        TangentFrame seedAligned = _seedFrame;
+        seedAligned.alignZAxis(centerFrame);
 
-        glm::vec3 nC      = glm::normalize(getNormal(currIdx));
-        glm::vec3 rotAxis = glm::cross(nP, nC);
-        float     axisLen = glm::length(rotAxis);
+        glm::vec3 centerAxisX = centerFrame.axes[0];
+        glm::vec3 seedAxisX   = seedAligned.axes[0];
+        float cosTheta = glm::clamp(glm::dot(centerAxisX, seedAxisX), -1.f, 1.f);
+        float fTmp     = std::max(0.f, 1.f - cosTheta * cosTheta);
+        float sinTheta = std::sqrt(fTmp);
+        glm::vec3 crossVec = glm::cross(centerAxisX, seedAxisX);
+        if (glm::dot(crossVec, nP) < 0.f) sinTheta = -sinTheta;
 
-        glm::vec3 newTx;
-        if (axisLen < 1e-8f) {
-            newTx = (glm::dot(nP, nC) >= 0.0f) ? txP : -txP;
-        } else {
-            rotAxis /= axisLen;
-            float cosA = glm::clamp(glm::dot(nP, nC), -1.0f, 1.0f);
-            float sinA = std::sqrt(std::max(0.0f, 1.0f - cosA * cosA));
-            
-            newTx = txP * cosA + glm::cross(rotAxis, txP) * sinA + 
-                    rotAxis * (glm::dot(rotAxis, txP) * (1.0f - cosA));
-        }
+        glm::mat2 matR(
+            glm::vec2( cosTheta, -sinTheta),
+            glm::vec2( sinTheta,  cosTheta)
+        );
 
-        newTx -= nC * glm::dot(newTx, nC);
-        curr.tangentX = glm::normalize(newTx);
+        glm::vec3 posC_proj = posC - nP * glm::dot(posC - posP, nP);
+        glm::vec3 localVec  = centerFrame.toLocal(posC_proj - posP);
+
+        curr.uv = parent.uv + matR * glm::vec2(localVec.x, localVec.y);
     }
 
     void ProjectAndInsertClouds(const glm::vec3& center, float radius) {
         std::map<int, std::vector<int>> triToExtraNodes;
 
-        // Helper: project point onto a known triangle and build a ProjectedGaussian.
-        // Returns false if the triangle is degenerate.
         auto projectOntoTri = [&](const glm::vec3& pt, int triIdx, size_t ptIdx,
                                    const std::vector<GaussianProps>& props,
                                    ProjectedGaussian& pg) -> bool {
@@ -1181,6 +1256,11 @@ private:
                 pg.dU = ( dv2*(v1-v0) - dv1*(v2-v0)) / det;
                 pg.dV = (-du2*(v1-v0) + du1*(v2-v0)) / det;
             }
+            {
+                glm::vec2 uvMin = glm::min(uv0, glm::min(uv1, uv2));
+                glm::vec2 uvMax = glm::max(uv0, glm::max(uv1, uv2));
+                pg.uvMaxDelta = glm::length(uvMax - uvMin) * 0.5f;
+            }
             if (ptIdx < props.size()) {
                 pg.opacity  = props[ptIdx].opacity;
                 pg.scale    = glm::vec3(props[ptIdx].scale[0], props[ptIdx].scale[1], props[ptIdx].scale[2]);
@@ -1211,35 +1291,41 @@ private:
             for (size_t i = 0; i < numPoints; ++i) {
                 glm::vec3 pt(cloud[i*3], cloud[i*3+1], cloud[i*3+2]);
 
-                // ------------------------------------------------------------------
-                // Path 1: GEO 1-to-1 (vertex index == point index)
-                // ------------------------------------------------------------------
                 if (is1to1) {
                     int vIdx = (int)i;
                     if (_displayUVs.count(vIdx)) {
-                        int bestTIdx = -1;
+                        glm::vec3 sumDU(0.f), sumDV(0.f);
+                        float sumUVMaxDelta = 0.f;
+                        int validCount = 0;
+                        int firstTIdx = -1;
                         for (int tIdx : _vertexToTriangles[vIdx]) {
-                            if (_validTriangleIndicesSet.count(tIdx)) {
-                                bestTIdx = tIdx;
-                                break;
-                            }
+                            if (!_validTriangleIndicesSet.count(tIdx)) continue;
+                            if (firstTIdx == -1) firstTIdx = tIdx;
+                            const auto& t = _mesh->triangles()[tIdx];
+                            if (!_displayUVs.count(t[0]) || !_displayUVs.count(t[1]) || !_displayUVs.count(t[2])) continue;
+                            glm::vec3 v0 = toGlm(_mesh->vertices()[t[0]]), v1 = toGlm(_mesh->vertices()[t[1]]), v2 = toGlm(_mesh->vertices()[t[2]]);
+                            glm::vec2 uv0 = _displayUVs.at(t[0]), uv1 = _displayUVs.at(t[1]), uv2 = _displayUVs.at(t[2]);
+                            float du1 = uv1.x-uv0.x, dv1 = uv1.y-uv0.y, du2 = uv2.x-uv0.x, dv2 = uv2.y-uv0.y;
+                            float det = du1*dv2 - du2*dv1;
+                            if (std::abs(det) < 1e-12f) continue;
+                            sumDU += ( dv2*(v1-v0) - dv1*(v2-v0)) / det;
+                            sumDV += (-du2*(v1-v0) + du1*(v2-v0)) / det;
+                            glm::vec2 uvMin = glm::min(uv0, glm::min(uv1, uv2));
+                            glm::vec2 uvMax = glm::max(uv0, glm::max(uv1, uv2));
+                            sumUVMaxDelta += glm::length(uvMax - uvMin) * 0.5f;
+                            ++validCount;
                         }
 
-                        if (bestTIdx != -1) {
+                        if (firstTIdx != -1) {
                             ProjectedGaussian pg;
                             pg.originalIndex = vIdx;
                             pg.uv = _displayUVs.at(vIdx);
                             pg.position = pt;
                             pg.originalPos = pt;
-
-                            const auto& t = _mesh->triangles()[bestTIdx];
-                            glm::vec3 v0 = toGlm(_mesh->vertices()[t[0]]), v1 = toGlm(_mesh->vertices()[t[1]]), v2 = toGlm(_mesh->vertices()[t[2]]);
-                            glm::vec2 uv0 = _displayUVs.at(t[0]), uv1 = _displayUVs.at(t[1]), uv2 = _displayUVs.at(t[2]);
-                            float du1 = uv1.x-uv0.x, dv1 = uv1.y-uv0.y, du2 = uv2.x-uv0.x, dv2 = uv2.y-uv0.y;
-                            float det = du1*dv2 - du2*dv1;
-                            if (std::abs(det) > 1e-12f) {
-                                pg.dU = ( dv2 * (v1-v0) - dv1 * (v2-v0)) / det;
-                                pg.dV = (-du2 * (v1-v0) + du1 * (v2-v0)) / det;
+                            if (validCount > 0) {
+                                pg.dU = sumDU / float(validCount);
+                                pg.dV = sumDV / float(validCount);
+                                pg.uvMaxDelta = sumUVMaxDelta / float(validCount);
                             }
                             if (vIdx < (int)props.size()) {
                                 pg.opacity  = props[vIdx].opacity;
@@ -1253,12 +1339,6 @@ private:
                     }
                 }
 
-                // ------------------------------------------------------------------
-                // Path 2: APP points with stored face_id — use the recorded triangle
-                // directly, bypassing sphere-radius and plane-distance filtering.
-                // This ensures ALL app points whose triangle is in the active region
-                // are included, regardless of their 3D position offset.
-                // ------------------------------------------------------------------
                 if (hasFids && !isGeo) {
                     int faceID = fids[i];
                     if (faceID >= 0 && faceID < (int)_mesh->triangles().size() &&
@@ -1271,14 +1351,9 @@ private:
                             continue;
                         }
                     }
-                    // face_id not in active region → skip (don't fall through to brute-force)
                     continue;
                 }
 
-                // ------------------------------------------------------------------
-                // Path 3: Fallback — sphere-radius filter + brute-force triangle search
-                // (used for GEO non-1:1 points and any point without valid fids)
-                // ------------------------------------------------------------------
                 float distSq = glm::dot(pt - center, pt - center);
                 if (distSq > r2) {
                     outOfRadius++;
@@ -1339,6 +1414,11 @@ private:
                     if (std::abs(det) > 1e-9f) {
                         pg.dU = ( dv2 * (v1-v0) - dv1 * (v2-v0)) / det;
                         pg.dV = (-du2 * (v1-v0) + du1 * (v2-v0)) / det;
+                    }
+                    {
+                        glm::vec2 uvMin = glm::min(uv0, glm::min(uv1, uv2));
+                        glm::vec2 uvMax = glm::max(uv0, glm::max(uv1, uv2));
+                        pg.uvMaxDelta = glm::length(uvMax - uvMin) * 0.5f;
                     }
                     if (i < props.size()) {
                         pg.opacity   = props[i].opacity;
@@ -1501,8 +1581,8 @@ private:
     bool   _cullBackFace  = true;
     bool   _showBackgroundTexture = true;
     
-    bool   _showAppPoints = true;
-    bool   _showGeoPoints = true;
+    bool   _showAppPoints  = true;
+    bool   _showGeoPoints  = true;
 
     std::vector<ProjectedGaussian> _projectedAppPoints;
     std::vector<ProjectedGaussian> _projectedGeoPoints;

@@ -25,7 +25,7 @@
 namespace fs = boost::filesystem;
 
 // ============================================================================
-// 每個 Gaussian 的物理屬性
+// Physical attributes of each Gaussian
 // ============================================================================
 struct GaussianProps {
     float opacity;
@@ -34,7 +34,7 @@ struct GaussianProps {
 };
 
 // ============================================================================
-// 投影到 UV 空間的 Gaussian 點
+// A Gaussian projected into UV space
 // ============================================================================
 struct ProjectedGaussian {
     int       originalIndex;
@@ -46,6 +46,7 @@ struct ProjectedGaussian {
     glm::vec4 rotation;
     glm::vec3 dU;
     glm::vec3 dV;
+    float     uvMaxDelta = 0.0f; // half-diagonal of triangle UV bbox, used to clamp extrapolation at seams
 };
 
 namespace detail {
@@ -169,27 +170,26 @@ public:
                 }
             }
 
-            // 貼圖膨脹 (Texture Dilation)：
-            // 將有效三角形內的顏色向外擴展到相鄰像素，
-            // 防止雙線性採樣在三角形邊緣時混入錯誤的顏色（造成模糊/重疊）。
-            // 膨脹後的像素 RGB 與相鄰有效像素相同，但 Alpha 保持為 0（透明）。
+            // Texture dilation: spread valid triangle colors into neighboring pixels
+            // to prevent bilinear sampling at triangle edges from mixing in wrong colors.
+            // Dilated pixels copy RGB from a valid neighbor but keep Alpha = 0.
             const int DILATION_PASSES = 4;
             for (int pass = 0; pass < DILATION_PASSES; ++pass) {
-                std::vector<uint8_t> prevMask = mask; // 快照：僅以上一輪為來源
+                std::vector<uint8_t> prevMask = mask; // snapshot: source is only the previous pass
                 const int dx4[] = {-1, 1,  0, 0};
                 const int dy4[] = { 0, 0, -1, 1};
                 for (int y = 0; y < H; ++y) {
                     for (int x = 0; x < W; ++x) {
-                        if (prevMask[y * W + x] != 0) continue; // 已有效，跳過
+                        if (prevMask[y * W + x] != 0) continue; // already valid, skip
                         for (int d = 0; d < 4; ++d) {
                             int nx = x + dx4[d], ny = y + dy4[d];
                             if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
                             if (prevMask[ny * W + nx] != 0) {
-                                // 複製鄰近有效像素的 RGB，但不改 Alpha（保持 0）
+                                // copy RGB from valid neighbor, leave Alpha unchanged (stays 0)
                                 maskedImage(x, y).x() = maskedImage(nx, ny).x();
                                 maskedImage(x, y).y() = maskedImage(nx, ny).y();
                                 maskedImage(x, y).z() = maskedImage(nx, ny).z();
-                                mask[y * W + x] = 2; // 標記為「已膨脹但非三角形內」
+                                mask[y * W + x] = 2; // mark as "dilated but not inside triangle"
                                 break;
                             }
                         }
@@ -197,20 +197,20 @@ public:
                 }
             }
 
-            // 設定 Alpha：三角形內 = 255（不透明），其餘 = 0（透明）
+            // Set Alpha: inside triangle = opaque, everything else = transparent
             for (int y = 0; y < H; ++y) {
                 for (int x = 0; x < W; ++x) {
                     if (mask[y * W + x] == 0) {
-                        // 完全空白：RGB 也設為 0，避免邊緣偶發的顏色殘留
+                        // fully empty: zero RGB too to avoid stray color at edges
                         maskedImage(x, y).x() = 0;
                         maskedImage(x, y).y() = 0;
                         maskedImage(x, y).z() = 0;
                         maskedImage(x, y).w() = 0;
                     } else if (mask[y * W + x] == 2) {
-                        // 膨脹像素：RGB 已填入，Alpha 設為 0（CUDA 不用 alpha，但語義正確）
+                        // dilated pixel: RGB filled, Alpha stays 0
                         maskedImage(x, y).w() = 0;
                     }
-                    // mask == 1：三角形內原始像素，保持不變
+                    // mask == 1: original pixel inside triangle, leave unchanged
                 }
             }
         }
@@ -850,7 +850,7 @@ struct GaussianAttr {
     glm::vec4 rot;
     glm::vec4 scale_uvx;
     glm::vec4 du_uvy;
-    glm::vec4 dv;
+    glm::vec4 dv;  // dv.xyz = dV tangent, dv.w = uvMaxDelta (seam clamp limit)
 };
 #pragma pack(pop)
 
@@ -1038,7 +1038,7 @@ private:
                 packed[i].rot         = p->rotation;
                 packed[i].scale_uvx   = glm::vec4(p->scale, p->uv.x);
                 packed[i].du_uvy      = glm::vec4(p->dU, p->uv.y);
-                packed[i].dv          = glm::vec4(p->dV, 0.0f);
+                packed[i].dv          = glm::vec4(p->dV, p->uvMaxDelta);
             }
 
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
@@ -1173,6 +1173,7 @@ private:
             flat out vec3  v_dU;
             flat out vec3  v_dV;
             flat out vec3  vNormal;
+            flat out float vUVMaxDelta;
 
             void main() {
                 GaussianAttr attr = gData[aIndex];
@@ -1184,10 +1185,11 @@ private:
                 vec3 a_dU     = attr.du_uvy.xyz;
                 vec3 a_dV     = attr.dv.xyz;
 
-                vCenter    = aPos;
-                vUV_center = aUV;
-                v_dU       = a_dU;
-                v_dV       = a_dV;
+                vCenter      = aPos;
+                vUV_center   = aUV;
+                v_dU         = a_dU;
+                v_dV         = a_dV;
+                vUVMaxDelta  = attr.dv.w;
 
                 vec3 N_mesh = cross(a_dU, a_dV);
                 float lenN  = length(N_mesh);
@@ -1254,6 +1256,7 @@ private:
             flat in vec3  v_dU;
             flat in vec3  v_dV;
             flat in vec3  vNormal;
+            flat in float vUVMaxDelta;
 
             out vec4 FragColor;
 
@@ -1286,6 +1289,14 @@ private:
                 float len2V  = dot(v_dV, v_dV);
                 float deltaU = (len2U > 1e-12) ? dot(offset, v_dU) / len2U : 0.0;
                 float deltaV = (len2V > 1e-12) ? dot(offset, v_dV) / len2V : 0.0;
+
+                // Clamp UV extrapolation to the assigned triangle's UV extent.
+                // Prevents tangent-frame discontinuities at UV seams from
+                // mapping pixels to the wrong texture region.
+                float maxDelta = max(vUVMaxDelta, 0.005);
+                deltaU = clamp(deltaU, -maxDelta, maxDelta);
+                deltaV = clamp(deltaV, -maxDelta, maxDelta);
+
                 vec2 exactUV = vUV_center + vec2(deltaU, deltaV);
                 
                 vec2 uv_dx = dFdx(exactUV);

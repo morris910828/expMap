@@ -194,15 +194,16 @@ void main() { fragColor = uColor; }
         static constexpr float kPi = 3.14159265358979323846f;
         static constexpr int   SEGS = 32;
 
-        // Camera position in world space (for depth sorting)
+        // Camera position & forward vector in world space (for depth sorting)
         const glm::vec3 camPos(eye.position().x(), eye.position().y(), eye.position().z());
+        // Linear depth along camera forward axis (more accurate than squared distance)
+        const sibr::Vector3f eyeDir = eye.dir();
+        const glm::vec3 camFwd(eyeDir.x(), eyeDir.y(), eyeDir.z());
 
         // ---------------------------------------------------------------
-        // Draw the 1-sigma ellipse footprint of the Gaussian projected onto
-        // the mesh tangent plane.  Center = true 3D position (pg.position).
-        // The 3D covariance Σ = R·diag(s²)·R^T is projected onto the
-        // orthonormal tangent basis (t1, t2) built from mesh dU/dV vectors,
-        // then eigendecomposed to get the exact semi-axes on that plane.
+        // Compute the exact 1-sigma ellipse ring for one Gaussian.
+        // The 3D covariance is projected onto the mesh tangent plane (dU/dV),
+        // giving the actual footprint shape, size and orientation on the surface.
         // ---------------------------------------------------------------
         auto makeRing = [&](const ProjectedGaussian& pg) -> std::vector<glm::vec3> {
             // Quaternion layout: rotation.x=w, .y=x, .z=y, .w=z
@@ -224,7 +225,6 @@ void main() { fragColor = uColor; }
             glm::vec3 t1 = pg.dU;
             const float lenU = glm::length(t1);
             if (lenU < 1e-7f) {
-                // Fallback: no surface info, draw principal cross-section
                 float sArr[3] = {s0, s1, s2};
                 int idx[3] = {0, 1, 2};
                 if (sArr[idx[0]] < sArr[idx[1]]) std::swap(idx[0], idx[1]);
@@ -249,27 +249,23 @@ void main() { fragColor = uColor; }
                 t2 /= lenV;
             }
 
-            // Project 3D covariance Σ = R·diag(s²)·R^T onto tangent plane.
             const glm::mat3 Rt = glm::transpose(R);
             auto SigmaV = [&](const glm::vec3& v) -> glm::vec3 {
                 glm::vec3 u = Rt * v;
                 return R * glm::vec3(s0*s0*u.x, s1*s1*u.y, s2*s2*u.z);
             };
 
-            // 2×2 projected covariance: Σ₂D = [[a,b],[b,c]]
             const glm::vec3 St1 = SigmaV(t1), St2 = SigmaV(t2);
             const float a2d = glm::dot(t1, St1);
             const float b2d = glm::dot(t1, St2);
             const float c2d = glm::dot(t2, St2);
 
-            // Eigendecompose 2×2 symmetric matrix → semi-axes lengths
             const float disc = std::sqrt(std::max(0.f, 0.25f*(a2d-c2d)*(a2d-c2d) + b2d*b2d));
             const float lam1 = std::max(0.f, 0.5f*(a2d+c2d) + disc);
             const float lam2 = std::max(0.f, 0.5f*(a2d+c2d) - disc);
             const float semiA = std::sqrt(lam1);
             const float semiB = std::sqrt(lam2);
 
-            // Eigenvector for lam1 in tangent-plane coords → world-space axes
             glm::vec2 ev1;
             if (std::abs(b2d) > 1e-8f) {
                 ev1 = glm::normalize(glm::vec2(b2d, lam1 - a2d));
@@ -289,11 +285,6 @@ void main() { fragColor = uColor; }
             return ring;
         };
 
-        // Upload ring + center and draw (filled fan + outline)
-        // Fill alpha is kept very low (0.12) so that when many overlapping
-        // ellipses swap depth-sort order the blended colour barely changes,
-        // eliminating the per-frame flickering. Each ellipse therefore always
-        // appears at a nearly uniform transparency regardless of overlap count.
         static constexpr float kFillAlpha    = 0.11f;
         static constexpr float kOutlineAlpha = 0.90f;
 
@@ -301,7 +292,6 @@ void main() { fragColor = uColor; }
                             const glm::vec3& center,
                             GLint colorLoc,
                             float cr, float cg, float cb) {
-            // Filled triangle fan: center, p0…pN-1, p0
             std::vector<glm::vec3> fan;
             fan.reserve(SEGS + 2);
             fan.push_back(center);
@@ -314,7 +304,6 @@ void main() { fragColor = uColor; }
                          fan.data(), GL_STREAM_DRAW);
             glDrawArrays(GL_TRIANGLE_FAN, 0, (GLsizei)fan.size());
 
-            // Outline
             glUniform4f(colorLoc, cr, cg, cb, kOutlineAlpha);
             glBufferData(GL_ARRAY_BUFFER,
                          (GLsizeiptr)(ring.size() * sizeof(glm::vec3)),
@@ -336,16 +325,16 @@ void main() { fragColor = uColor; }
 
         for (const auto& pg : geoPoints) {
             if (!geoSet.count(pg.originalIndex)) continue;
-            glm::vec3 d = pg.position - camPos;
-            items.push_back({&pg, true, glm::dot(d, d)});
+            float depth = glm::dot(pg.position - camPos, camFwd);
+            items.push_back({&pg, true, depth});
         }
         for (const auto& pg : appPoints) {
             if (!appSet.count(pg.originalIndex)) continue;
-            glm::vec3 d = pg.position - camPos;
-            items.push_back({&pg, false, glm::dot(d, d)});
+            float depth = glm::dot(pg.position - camPos, camFwd);
+            items.push_back({&pg, false, depth});
         }
 
-        // Back-to-front (largest depth first → drawn first, so near ones on top)
+        // Back-to-front (largest depth first -> drawn first, so near ones on top)
         std::sort(items.begin(), items.end(),
                   [](const DrawItem& a, const DrawItem& b){ return a.depth > b.depth; });
 
@@ -376,7 +365,7 @@ void main() { fragColor = uColor; }
         glBindVertexArray(_gaussOutlineVAO);
         glBindBuffer(GL_ARRAY_BUFFER, _gaussOutlineVBO);
 
-        // Draw in depth-sorted order (back → front)
+        // Draw in depth-sorted order (back -> front)
         int drawnGeo = 0, drawnApp = 0;
         for (const auto& item : items) {
             if (item.isGeo) {
@@ -464,20 +453,6 @@ void main() { fragColor = uColor; }
             ti.dU = (dv2*ti.e1 - dv1*ti.e2)/det; ti.dV = (-du2*ti.e1 + du1*ti.e2)/det; ti.valid = true; triCache.push_back(ti);
         }
 
-        // Build per-vertex averaged tangents (average dU/dV from all adjacent triangles)
-        std::map<int, glm::vec3> vertDU, vertDV;
-        std::map<int, int> vertTangentCount;
-        for (const auto& ti : triCache) {
-            if (!ti.valid) continue;
-            for (int vi : {ti.vi0, ti.vi1, ti.vi2}) {
-                vertDU[vi] += ti.dU;
-                vertDV[vi] += ti.dV;
-                vertTangentCount[vi]++;
-            }
-        }
-        for (auto& [vi, du] : vertDU) { int c = vertTangentCount[vi]; if (c > 1) du /= float(c); }
-        for (auto& [vi, dv] : vertDV) { int c = vertTangentCount[vi]; if (c > 1) dv /= float(c); }
-
         const float r2 = _expMapRadius * _expMapRadius;
         const glm::vec3 ctr(hitPos.x(), hitPos.y(), hitPos.z());
         std::vector<sibr::Vector2f> all_uvs(nGauss, sibr::Vector2f(-1.f, -1.f));
@@ -495,6 +470,8 @@ void main() { fragColor = uColor; }
             float best = 1e18f;
             glm::vec2 bUV(0.f, 0.f);
             glm::vec3 bDU(0.f), bDV(0.f);
+            glm::vec3 bSurfPos(0.f);  // projected point on mesh surface
+            float bUVMaxDelta = 0.0f;
             bool found = false;
 
             for (const auto& ti : triCache) {
@@ -516,14 +493,17 @@ void main() { fragColor = uColor; }
                     if (d2 < best) {
                         best = d2;
                         bUV = bu * ti.uv0 + bv * ti.uv1 + bw * ti.uv2;
-                        glm::vec3 du0 = vertDU.count(ti.vi0) ? vertDU.at(ti.vi0) : ti.dU;
-                        glm::vec3 du1 = vertDU.count(ti.vi1) ? vertDU.at(ti.vi1) : ti.dU;
-                        glm::vec3 du2 = vertDU.count(ti.vi2) ? vertDU.at(ti.vi2) : ti.dU;
-                        glm::vec3 dv0 = vertDV.count(ti.vi0) ? vertDV.at(ti.vi0) : ti.dV;
-                        glm::vec3 dv1 = vertDV.count(ti.vi1) ? vertDV.at(ti.vi1) : ti.dV;
-                        glm::vec3 dv2 = vertDV.count(ti.vi2) ? vertDV.at(ti.vi2) : ti.dV;
-                        bDU = bu * du0 + bv * du1 + bw * du2;
-                        bDV = bu * dv0 + bv * dv1 + bw * dv2;
+                        bSurfPos = bu * ti.v0 + bv * ti.v1 + bw * ti.v2;
+                        // Use per-triangle tangent directly to avoid cross-seam averaging errors.
+                        // Vertices on opposite sides of a UV seam share the same 3D position
+                        // but have different UVs; averaging dU/dV across the seam is incorrect.
+                        bDU = ti.dU;
+                        bDV = ti.dV;
+                        // UV bbox half-diagonal: limits how far the shader can extrapolate
+                        // from the Gaussian center UV, preventing seam-boundary artifacts.
+                        glm::vec2 uvMin = glm::min(glm::min(ti.uv0, ti.uv1), ti.uv2);
+                        glm::vec2 uvMax = glm::max(glm::max(ti.uv0, ti.uv1), ti.uv2);
+                        bUVMaxDelta = glm::length(uvMax - uvMin) * 0.5f;
                         found = true;
                     }
                 }
@@ -531,13 +511,15 @@ void main() { fragColor = uColor; }
 
             if (!found) continue;
 
-            all_uvs[k]  = { bUV.x, bUV.y };
-            all_dUs[k]  = { bDU.x, bDU.y, bDU.z };
-            all_dVs[k]  = { bDV.x, bDV.y, bDV.z };
-            all_surfDists[k] = std::sqrt(best);
+            all_uvs[k]      = { bUV.x, bUV.y };
+            all_dUs[k]      = { bDU.x, bDU.y, bDU.z };
+            all_dVs[k]      = { bDV.x, bDV.y, bDV.z };
+            all_surfDists[k]= std::sqrt(best);
 
             ProjectedGaussian pg;
-            pg.originalIndex = k; pg.position = p; pg.uv = bUV; pg.dU = bDU; pg.dV = bDV;
+            // position = projected onto mesh surface, removes normal offset from Gaussian to mesh
+            pg.originalIndex = k; pg.position = bSurfPos; pg.originalPos = p;
+            pg.uv = bUV; pg.dU = bDU; pg.dV = bDV; pg.uvMaxDelta = bUVMaxDelta;
             float opc = std::max(1e-4f, std::min(1.f - 1e-4f, cpuOpacity[k]));
             pg.opacity = std::log(opc / (1.f - opc));
             pg.scale = { std::log(std::max(1e-9f, cpuScale[3*k])),
