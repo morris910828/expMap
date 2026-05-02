@@ -120,6 +120,14 @@ public:
         return false;
     }
 
+    float GetSurfaceBlend() const { return _surfaceBlend; }
+    bool ConsumeSurfaceBlendDirty() {
+        bool d = _surfaceBlendDirty;
+        _surfaceBlendDirty = false;
+        return d;
+    }
+    void ResetSurfaceBlend() { _surfaceBlend = 1.0f; _surfaceBlendDirty = false; }
+
     const ProjectionStats& GetProjectionStats() const { return _projectionStats; }
 
     void SetMainGaussiansForNextSave(const std::vector<ProjectedGaussian>& g) {
@@ -577,6 +585,22 @@ public:
             ImGui::Checkbox("Show Geo", &_showGeoPoints);
             ImGui::SameLine();
             ImGui::Checkbox("Show Suppressed", &_showSuppressedPoints);
+            ImGui::SameLine();
+            ImGui::Checkbox("Surf Depth", &_showSurfaceDepth);
+            if (_showSurfaceDepth) {
+                ImGui::SameLine();
+                ImGui::PushItemWidth(100.f);
+                ImGui::SliderFloat("Max", &_surfDepthMax, 0.01f, 2.0f, "%.2f");
+                ImGui::PopItemWidth();
+            }
+
+            {
+                float prev = _surfaceBlend;
+                ImGui::PushItemWidth(-1.f);
+                ImGui::SliderFloat("Surface Blend##sb", &_surfaceBlend, 0.0f, 1.0f, "Surface Blend %.2f");
+                ImGui::PopItemWidth();
+                if (_surfaceBlend != prev) _surfaceBlendDirty = true;
+            }
 
             ImVec2 p = ImGui::GetCursorScreenPos();
             ImVec2 sz = ImGui::GetContentRegionAvail();
@@ -610,15 +634,17 @@ public:
                     _isSelecting = true;
                     float lx = mousePos.x - (p.x + sz.x * 0.5f + _viewOffset.x);
                     float ly = mousePos.y - (p.y + sz.y * 0.5f + _viewOffset.y);
-                    _selectionStart.x = (lx / (dim * _viewScale)) + 0.5f;
-                    _selectionStart.y = 1.0f - ((ly / (dim * _viewScale)) + 0.5f);
+                    float sc = dim * _viewScale;
+                    _selectionStart.x = 0.5f - ly / sc;
+                    _selectionStart.y = 0.5f - lx / sc;
                     _selectionEnd = _selectionStart;
                 }
                 if (_isSelecting && ImGui::IsMouseDragging(0)) {
                     float lx = mousePos.x - (p.x + sz.x * 0.5f + _viewOffset.x);
                     float ly = mousePos.y - (p.y + sz.y * 0.5f + _viewOffset.y);
-                    _selectionEnd.x = (lx / (dim * _viewScale)) + 0.5f;
-                    _selectionEnd.y = 1.0f - ((ly / (dim * _viewScale)) + 0.5f);
+                    float sc = dim * _viewScale;
+                    _selectionEnd.x = 0.5f - ly / sc;
+                    _selectionEnd.y = 0.5f - lx / sc;
                 }
                 if (_isSelecting && ImGui::IsMouseReleased(0)) {
                     _isSelecting = false;
@@ -632,8 +658,9 @@ public:
             if (isHovered && ImGui::IsMouseClicked(0) && ImGui::GetIO().KeyCtrl) {
                 float lx = mousePos.x - (p.x + sz.x * 0.5f + _viewOffset.x);
                 float ly = mousePos.y - (p.y + sz.y * 0.5f + _viewOffset.y);
-                float uvX = (lx / (dim * _viewScale)) + 0.5f;
-                float uvY = 1.0f - ((ly / (dim * _viewScale)) + 0.5f); 
+                float sc = dim * _viewScale;
+                float uvX = 0.5f - ly / sc;
+                float uvY = 0.5f - lx / sc;
                 glm::vec2 mouseUV(uvX, uvY);
 
                 int closestID = -1;
@@ -679,8 +706,8 @@ public:
             }
             
             auto TransformUV = [&](const glm::vec2& uv) -> ImVec2 {
-                float lx = (uv.x - 0.5f) * dim * _viewScale;
-                float ly = (1.0f - uv.y - 0.5f) * dim * _viewScale; 
+                float lx = (0.5f - uv.y) * dim * _viewScale;
+                float ly = (0.5f - uv.x) * dim * _viewScale;
                 return ImVec2(p.x + sz.x*0.5f + lx + _viewOffset.x, p.y + sz.y*0.5f + ly + _viewOffset.y);
             };
 
@@ -740,7 +767,12 @@ public:
                                         const std::vector<int>& selIds, bool isGeo) {
                     for (const auto& pt : pts) {
                         if (!passFilter(pt)) continue;
-                        float d = std::abs(glm::dot(pt.position - hitO, hitN));
+                        // When surface depth mode is on, sort by true surface distance
+                        // so that far (blue) points are painted first and near (red)
+                        // points sit on top — consistent with the colour mapping.
+                        float d = _showSurfaceDepth
+                            ? glm::length(pt.originalPos - pt.position)
+                            : std::abs(glm::dot(pt.position - hitO, hitN));
                         bool sel = std::find(selIds.begin(), selIds.end(), pt.originalIndex) != selIds.end();
                         GEntry e{&pt, d, isGeo, sel};
                         if (sel) selEntries.push_back(e);
@@ -766,14 +798,14 @@ public:
 
                     if (glm::length(pg.dU) < 1e-8f || glm::length(pg.dV) < 1e-8f) {
                         if (ctr.x>=canvasX0&&ctr.x<=canvasX1&&ctr.y>=canvasY0&&ctr.y<=canvasY1)
-                            dl->AddCircleFilled(ctr, e.isSelected?5.f:2.5f, outlineCol, 8);
+                            dl->AddCircleFilled(ctr, e.isSelected?5.f:2.5f, outlineCol);
                         return true;
                     }
                     glm::vec3 t1 = glm::normalize(pg.dU);
                     glm::vec3 t2r = pg.dV - glm::dot(pg.dV, t1) * t1;
                     if (glm::length(t2r) < 1e-8f) {
                         if (ctr.x>=canvasX0&&ctr.x<=canvasX1&&ctr.y>=canvasY0&&ctr.y<=canvasY1)
-                            dl->AddCircleFilled(ctr, e.isSelected?5.f:2.5f, outlineCol, 8);
+                            dl->AddCircleFilled(ctr, e.isSelected?5.f:2.5f, outlineCol);
                         return true;
                     }
                     glm::vec3 t2 = glm::normalize(t2r);
@@ -807,8 +839,8 @@ public:
                     glm::vec2 uvA=toUV2(axA),uvB=toUV2(axB);
 
                     float sc = dim * _viewScale;
-                    float pxAx=uvA.x*sc, pxAy=-uvA.y*sc;
-                    float pxBx=uvB.x*sc, pxBy=-uvB.y*sc;
+                    float pxAx=-uvA.y*sc, pxAy=-uvA.x*sc;
+                    float pxBx=-uvB.y*sc, pxBy=-uvB.x*sc;
                     float mp=pxAx*pxAx+pxAy*pxAy;
                     float mq=pxAx*pxBx+pxAy*pxBy;
                     float mr=pxBx*pxBx+pxBy*pxBy;
@@ -847,17 +879,38 @@ public:
                     dl->AddPolyline(pts,N_SEGS,outlineCol,true,1.0f);
                 };
 
-                for (int ei=0;ei<(int)nonSelEntries.size();ei++){
-                    const GEntry& e=nonSelEntries[ei];
-                    float t=1.f-(e.absDist-nsDistMin)/nsRange;
-                    ImU32 fC=e.isGeo?IM_COL32(255,120,120,150):IM_COL32(90,200,255,150);
-                    ImU32 oC=e.isGeo?IM_COL32(255,120,120,255):IM_COL32(90,200,255,255);
-                    drawEllipse(e, fC, oC, false);
-                }
+                if (_showSurfaceDepth) {
+                    for (int ei=0;ei<(int)nonSelEntries.size();ei++){
+                        const GEntry& e=nonSelEntries[ei];
+                        // Distance from surface, shrunk by blend factor (0=original, 1=on surface).
+                        float d = glm::length(e.pg->originalPos - e.pg->position) * (1.0f - _surfaceBlend);
+                        float t = glm::clamp(powf(d / _surfDepthMax, 0.3f), 0.f, 1.f);
+                        int r = (int)(255.f * (1.f - t));
+                        int b = (int)(255.f * t);
+                        ImU32 fC = IM_COL32(r, 0, b, 150);
+                        ImU32 oC = IM_COL32(r, 0, b, 255);
+                        drawEllipse(e, fC, oC, false);
+                    }
 
-                for (int ei=0;ei<(int)selEntries.size();ei++){
-                    const GEntry& e=selEntries[ei];
-                    drawEllipse(e, IM_COL32(255,255,0,150), IM_COL32(255,255,0,255));
+                    for (int ei=0;ei<(int)selEntries.size();ei++){
+                        const GEntry& e=selEntries[ei];
+                        drawEllipse(e, IM_COL32(255,255,0,150), IM_COL32(255,255,0,255));
+                    }
+                } else {
+                    // Draw small dots: Geo = Red, App = Blue
+                    for (const auto& e : nonSelEntries) {
+                        ImVec2 ctr = TransformUV(e.pg->uv);
+                        if (ctr.x >= canvasX0 && ctr.x <= canvasX1 && ctr.y >= canvasY0 && ctr.y <= canvasY1) {
+                            ImU32 col = e.isGeo ? IM_COL32(255, 0, 0, 255) : IM_COL32(0, 0, 255, 255);
+                            dl->AddCircleFilled(ctr, 3.0f, col);
+                        }
+                    }
+                    for (const auto& e : selEntries) {
+                        ImVec2 ctr = TransformUV(e.pg->uv);
+                        if (ctr.x >= canvasX0 && ctr.x <= canvasX1 && ctr.y >= canvasY0 && ctr.y <= canvasY1) {
+                            dl->AddCircleFilled(ctr, 3.0f, IM_COL32(255, 255, 0, 255));
+                        }
+                    }
                 }
             }
 
@@ -900,8 +953,8 @@ public:
                 for (const auto& uv : _suppressedUVs) {
                     if (uv.x < -1.0f || uv.x > 2.0f || uv.y < -1.0f || uv.y > 2.0f) continue;
                     ImVec2 pos = TransformUV(uv);
-                    dl->AddCircleFilled(pos, 5.0f, IM_COL32(0,180,0,200), 6);
-                    dl->AddCircleFilled(pos, 3.5f, IM_COL32(0,255,80,255), 6);
+                    dl->AddCircleFilled(pos, 5.0f, IM_COL32(0,180,0,200));
+                    dl->AddCircleFilled(pos, 3.5f, IM_COL32(0,255,80,255));
                 }
             }
 
@@ -1247,8 +1300,8 @@ private:
 
             pg.originalIndex = (int)ptIdx;
             pg.uv            = baryUV;
-            pg.position      = pt;
-            pg.originalPos   = pt;
+            pg.position      = pProj;   // surface-projected position
+            pg.originalPos   = pt;      // original Gaussian position (for surf depth distance)
 
             float du1 = uv1.x-uv0.x, dv1 = uv1.y-uv0.y, du2 = uv2.x-uv0.x, dv2 = uv2.y-uv0.y;
             float det = du1*dv2 - du2*dv1;
@@ -1403,8 +1456,8 @@ private:
                     ProjectedGaussian pg;
                     pg.originalIndex = (int)i;
                     pg.uv            = bestUV;
-                    pg.position      = pt;
-                    pg.originalPos   = pt;
+                    pg.position      = bestProjPos; // surface-projected position
+                    pg.originalPos   = pt;          // original Gaussian position (for surf depth distance)
 
                     const auto& t = _mesh->triangles()[bestTriGlobalID];
                     glm::vec3 v0 = toGlm(_mesh->vertices()[t[0]]), v1 = toGlm(_mesh->vertices()[t[1]]), v2 = toGlm(_mesh->vertices()[t[2]]);
@@ -1581,8 +1634,10 @@ private:
     bool   _cullBackFace  = true;
     bool   _showBackgroundTexture = true;
     
-    bool   _showAppPoints  = true;
-    bool   _showGeoPoints  = true;
+    bool   _showAppPoints    = true;
+    bool   _showGeoPoints    = true;
+    bool   _showSurfaceDepth = false;
+    float  _surfDepthMax     = 0.6f;
 
     std::vector<ProjectedGaussian> _projectedAppPoints;
     std::vector<ProjectedGaussian> _projectedGeoPoints;
@@ -1619,6 +1674,9 @@ private:
 
     std::vector<glm::vec2> _suppressedUVs;
     bool _showSuppressedPoints = true;
+
+    float _surfaceBlend      = 1.0f;
+    bool  _surfaceBlendDirty = false;
 };
 
 #endif

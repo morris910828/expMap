@@ -491,7 +491,7 @@ void sibr::GaussianView::suppressGaussiansInRegion(
         if (dx*dx + dy*dy + dz*dz > suppressRadius2) continue;
 
         if (hasSurfDist && surfaceDists[i] < suppressRadius) {
-            // Inside sphere, no UV: smooth falloff — dist=0 -> factor=1, dist=radius -> factor~0.05
+            // Inside sphere, no UV: smooth falloff  dist=0 -> factor=1, dist=radius -> factor~0.05
             float t = surfaceDists[i] / suppressRadius;
             float factor = std::exp(-3.0f * t * t);
             modOpc[i] *= factor;
@@ -507,6 +507,23 @@ void sibr::GaussianView::restoreOpacities() {
     if ((int)_cpuOpacityCache.size() != count) return;
     cudaMemcpy(opacity_cuda, _cpuOpacityCache.data(), sizeof(float) * count, cudaMemcpyHostToDevice);
     _cpuOpacityCache.clear();
+
+    if (!_cpuPosCache.empty()) {
+        cudaMemcpy(pos_cuda, _cpuPosCache.data(),
+                   sizeof(float) * count * 3, cudaMemcpyHostToDevice);
+        _cpuPosCache.clear();
+        _cpuPos.clear();
+    }
+    if (!_cpuRotCache.empty()) {
+        cudaMemcpy(rot_cuda, _cpuRotCache.data(),
+                   sizeof(float) * count * 4, cudaMemcpyHostToDevice);
+        _cpuRotCache.clear();
+    }
+    if (!_cpuScaleCache.empty()) {
+        cudaMemcpy(scale_cuda, _cpuScaleCache.data(),
+                   sizeof(float) * count * 3, cudaMemcpyHostToDevice);
+        _cpuScaleCache.clear();
+    }
 }
 
 void sibr::GaussianView::updateGeometry(
@@ -523,13 +540,14 @@ void sibr::GaussianView::updateGeometry(
 }
 
 // =============================================================================
-// setUVsAndTexture
+// setUVsAndTexture  (with surfacePositions parameter)
 // =============================================================================
 void sibr::GaussianView::setUVsAndTexture(
 	const std::vector<sibr::Vector2f>& uvs,
 	const std::vector<sibr::Vector3f>& dUs,
 	const std::vector<sibr::Vector3f>& dVs,
 	const std::vector<float>&          surfaceDists,
+	const std::vector<sibr::Vector3f>& surfacePositions,  // NEW
 	sibr::Texture2DRGBA::Ptr texPtr)
 {
 	if ((int)uvs.size() != count || (int)dUs.size() != count ||
@@ -575,6 +593,145 @@ void sibr::GaussianView::setUVsAndTexture(
 		surfaceDists.data(),
 		sizeof(float) * count,
 		cudaMemcpyHostToDevice));
+
+	//  Snap UV-Gaussians onto mesh surface in pos_cuda
+	// Snapshot original values on first call
+	if (_cpuPosCache.empty()) {
+		_cpuPosCache.resize(count);
+		cudaMemcpy(_cpuPosCache.data(), pos_cuda,
+		           sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
+	}
+	if (_cpuRotCache.empty()) {
+		_cpuRotCache.resize(count * 4);
+		cudaMemcpy(_cpuRotCache.data(), rot_cuda,
+		           sizeof(float) * count * 4, cudaMemcpyDeviceToHost);
+	}
+	if (_cpuScaleCache.empty()) {
+		_cpuScaleCache.resize(count * 3);
+		cudaMemcpy(_cpuScaleCache.data(), scale_cuda,
+		           sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
+	}
+
+	if ((int)surfacePositions.size() == count) {
+		// Position: start from snapshot, snap UV Gaussians to mesh surface
+		std::vector<sibr::Vector3f> newPos(_cpuPosCache);
+		for (int i = 0; i < count; ++i) {
+			if (uvs[i].x() < 0.f) continue;
+			newPos[i] = surfacePositions[i];
+		}
+		cudaMemcpy(pos_cuda, newPos.data(),
+		           sizeof(float) * count * 3, cudaMemcpyHostToDevice);
+		_cpuPos.clear();
+
+		// Scale/Rotation: start from originals, flatten UV Gaussians onto surface plane
+		std::vector<float> newRot(_cpuRotCache);
+		std::vector<float> newScale(_cpuScaleCache);
+
+		for (int i = 0; i < count; ++i) {
+			if (uvs[i].x() < 0.f) continue;
+
+			// ── Step 1: surface tangent frame ─────────────────────────────────
+			float dUx=dUs[i].x(), dUy=dUs[i].y(), dUz=dUs[i].z();
+			float dVx=dVs[i].x(), dVy=dVs[i].y(), dVz=dVs[i].z();
+
+			float nx = dUy*dVz - dUz*dVy;   // cross(dU, dV) = surface normal
+			float ny = dUz*dVx - dUx*dVz;
+			float nz = dUx*dVy - dUy*dVx;
+			float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+			if (nlen < 1e-8f) continue;
+			nx /= nlen; ny /= nlen; nz /= nlen;
+
+			float t1len = std::sqrt(dUx*dUx + dUy*dUy + dUz*dUz);
+			if (t1len < 1e-8f) continue;
+			float t1x=dUx/t1len, t1y=dUy/t1len, t1z=dUz/t1len;  // normalize(dU)
+
+			float t2x = ny*t1z - nz*t1y;  // cross(n, t1) — already unit
+			float t2y = nz*t1x - nx*t1z;
+			float t2z = nx*t1y - ny*t1x;
+
+			// ── Step 2: recover original world-space covariance eigenvectors ─
+			// 3DGS quaternion convention: [w=rot.x, x=rot.y, y=rot.z, z=rot.w]
+			// The local-to-world rotation R_std has columns = local axes in world.
+			// Columns differ from computeCov3D's R (which stores R_std^T):
+			//   col0 (local X in world): (1-2(qy²+qz²),  2(qx*qy+qr*qz),  2(qx*qz-qr*qy))
+			//   col1 (local Y in world): (2(qx*qy-qr*qz), 1-2(qx²+qz²),   2(qy*qz+qr*qx))
+			//   col2 (local Z in world): (2(qx*qz+qr*qy), 2(qy*qz-qr*qx), 1-2(qx²+qy²))
+			float qr_=_cpuRotCache[4*i], qx_=_cpuRotCache[4*i+1],
+			      qy_=_cpuRotCache[4*i+2], qz_=_cpuRotCache[4*i+3];
+
+			float c0x=1.f-2.f*(qy_*qy_+qz_*qz_), c0y=2.f*(qx_*qy_+qr_*qz_), c0z=2.f*(qx_*qz_-qr_*qy_);
+			float c1x=2.f*(qx_*qy_-qr_*qz_), c1y=1.f-2.f*(qx_*qx_+qz_*qz_), c1z=2.f*(qy_*qz_+qr_*qx_);
+			float c2x=2.f*(qx_*qz_+qr_*qy_), c2y=2.f*(qy_*qz_-qr_*qx_), c2z=1.f-2.f*(qx_*qx_+qy_*qy_);
+
+			float sx=_cpuScaleCache[3*i], sy=_cpuScaleCache[3*i+1], sz=_cpuScaleCache[3*i+2];
+			float sx2=sx*sx, sy2=sy*sy, sz2=sz*sz;
+
+			// ── Step 3: project covariance Σ = Σ_k sk² (col_k⊗col_k) onto (t1,t2)
+			// Σ_2D[a][b] = Σ_k sk² (col_k·ta)(col_k·tb)
+			float d0t1=c0x*t1x+c0y*t1y+c0z*t1z, d1t1=c1x*t1x+c1y*t1y+c1z*t1z, d2t1=c2x*t1x+c2y*t1y+c2z*t1z;
+			float d0t2=c0x*t2x+c0y*t2y+c0z*t2z, d1t2=c1x*t2x+c1y*t2y+c1z*t2z, d2t2=c2x*t2x+c2y*t2y+c2z*t2z;
+
+			float A = sx2*d0t1*d0t1 + sy2*d1t1*d1t1 + sz2*d2t1*d2t1;  // Σ_2D[0][0]
+			float B = sx2*d0t1*d0t2 + sy2*d1t1*d1t2 + sz2*d2t1*d2t2;  // Σ_2D[0][1]
+			float C = sx2*d0t2*d0t2 + sy2*d1t2*d1t2 + sz2*d2t2*d2t2;  // Σ_2D[1][1]
+
+			// ── Step 4: 2×2 eigendecomposition of [A B; B C] ─────────────────
+			float mid  = 0.5f*(A + C);
+			float disc = std::sqrt(std::max(0.f, 0.25f*(A-C)*(A-C) + B*B));
+			float lam1 = mid + disc;  // larger eigenvalue  → larger in-plane scale
+			float lam2 = mid - disc;
+
+			float sc1 = std::sqrt(std::max(1e-12f, lam1));
+			float sc2 = std::sqrt(std::max(1e-12f, lam2));
+
+			// Cap to the local triangle 3D extent to prevent runaway large Gaussians
+			float triSize = std::max(t1len, std::sqrt(dVx*dVx+dVy*dVy+dVz*dVz));
+			sc1 = std::min(sc1, triSize * 3.f);
+			sc2 = std::min(sc2, triSize * 3.f);
+
+			// Eigenvector of lam1 in (t1,t2) plane: angle θ = atan2(2B, A-C)/2
+			float theta = 0.5f * std::atan2(2.f*B, A - C);
+			float cosT = std::cos(theta), sinT = std::sin(theta);
+
+			// World-space eigenvectors on the tangent plane
+			float e1x=cosT*t1x+sinT*t2x, e1y=cosT*t1y+sinT*t2y, e1z=cosT*t1z+sinT*t2z;
+			float e2x=-sinT*t1x+cosT*t2x, e2y=-sinT*t1y+cosT*t2y, e2z=-sinT*t1z+cosT*t2z;
+
+			// ── Step 5: build rotation [e1 | e2 | n] → quaternion (Shepperd) ─
+			// col0=e1, col1=e2, col2=n  (Rij = R[col=i][row=j] in glm col-major)
+			float R00=e1x, R01=e1y, R02=e1z;
+			float R10=e2x, R11=e2y, R12=e2z;
+			float R20=nx,  R21=ny,  R22=nz;
+			float tr = R00 + R11 + R22;
+			float qr, qx, qy, qz;
+			if (tr > 0.f) {
+				float s = 2.f * std::sqrt(tr + 1.f);
+				qr=0.25f*s; qx=(R12-R21)/s; qy=(R20-R02)/s; qz=(R01-R10)/s;
+			} else if (R00 > R11 && R00 > R22) {
+				float s = 2.f * std::sqrt(1.f+R00-R11-R22);
+				qr=(R12-R21)/s; qx=0.25f*s; qy=(R01+R10)/s; qz=(R20+R02)/s;
+			} else if (R11 > R22) {
+				float s = 2.f * std::sqrt(1.f+R11-R00-R22);
+				qr=(R20-R02)/s; qx=(R01+R10)/s; qy=0.25f*s; qz=(R21+R12)/s;
+			} else {
+				float s = 2.f * std::sqrt(1.f+R22-R00-R11);
+				qr=(R01-R10)/s; qx=(R20+R02)/s; qy=(R21+R12)/s; qz=0.25f*s;
+			}
+			float qlen = std::sqrt(qr*qr+qx*qx+qy*qy+qz*qz);
+			if (qlen > 1e-8f) { qr/=qlen; qx/=qlen; qy/=qlen; qz/=qlen; }
+
+			newRot[4*i+0]=qr; newRot[4*i+1]=qx; newRot[4*i+2]=qy; newRot[4*i+3]=qz;
+
+			// In-plane scales = projected eigenvalues; normal scale = 1% of smaller axis
+			newScale[3*i+0] = sc1;
+			newScale[3*i+1] = sc2;
+			newScale[3*i+2] = std::min(sc1, sc2) * 0.01f;
+		}
+
+		cudaMemcpy(rot_cuda,   newRot.data(),   sizeof(float) * count * 4, cudaMemcpyHostToDevice);
+		cudaMemcpy(scale_cuda, newScale.data(), sizeof(float) * count * 3, cudaMemcpyHostToDevice);
+	}
+	//
 
 	if (_current_tex != texPtr) {
 		_current_tex = texPtr;

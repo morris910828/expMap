@@ -109,10 +109,20 @@ public:
             bool prevShowTex = _showTexture;
             ImGui::Checkbox("Show Texture", &_showTexture);
             if (_showTexture != prevShowTex && !_lastAllUVs.empty()) {
+                _gaussianView->restoreOpacities();
                 _gaussianView->setUVsAndTexture(
                     _lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists,
+                    _lastAllSurfPos,
                     _showTexture ? _texPtr : nullptr
                 );
+                if (_showTexture && _lastExpRadius > 0.f) {
+                    _gaussianView->suppressGaussiansInRegion(
+                        _lastAllUVs,
+                        _lastHitPos,
+                        _lastExpRadius,
+                        _lastAllSurfDists
+                    );
+                }
             }
         }
         ImGui::Separator();
@@ -124,13 +134,14 @@ public:
             std::vector<sibr::Vector3f> empty_dUs(_gaussianView->getCount(), sibr::Vector3f(0.f, 0.f, 0.f));
             std::vector<sibr::Vector3f> empty_dVs(_gaussianView->getCount(), sibr::Vector3f(0.f, 0.f, 0.f));
             std::vector<float>          empty_sd(_gaussianView->getCount(), 1e9f);
-            _gaussianView->setUVsAndTexture(empty_uvs, empty_dUs, empty_dVs, empty_sd, nullptr);
+            std::vector<sibr::Vector3f> empty_sp(_gaussianView->getCount(), sibr::Vector3f(-1.f,-1.f,-1.f));
+            _gaussianView->setUVsAndTexture(empty_uvs, empty_dUs, empty_dVs, empty_sd, empty_sp, nullptr);
         }
         ImGui::End();
         _expMapSolver.RenderUI();
         if (_expMapSolver.ConsumeTextureDirty()) {
             _texPtr = _expMapSolver.GetTextureLoader().getTexture();
-            if (!_lastAllUVs.empty()) _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, _texPtr);
+            if (!_lastAllUVs.empty()) _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, _lastAllSurfPos, _texPtr);
         }
     }
 
@@ -184,12 +195,7 @@ void main() { fragColor = uColor; }
 
         const auto& geoPoints = _expMapSolver.GetProjectedGeoPoints();
         const auto& appPoints = _expMapSolver.GetProjectedAppPoints();
-        const auto& selGeo    = _expMapSolver.GetSelectedGeoIndices();
-        const auto& selApp    = _expMapSolver.GetSelectedAppIndices();
-        if (selGeo.empty() && selApp.empty()) return;
-
-        std::set<int> geoSet(selGeo.begin(), selGeo.end());
-        std::set<int> appSet(selApp.begin(), selApp.end());
+        if (geoPoints.empty() && appPoints.empty()) return;
 
         static constexpr float kPi = 3.14159265358979323846f;
         static constexpr int   SEGS = 32;
@@ -205,6 +211,11 @@ void main() { fragColor = uColor; }
         // The 3D covariance is projected onto the mesh tangent plane (dU/dV),
         // giving the actual footprint shape, size and orientation on the surface.
         // ---------------------------------------------------------------
+        const float outlineBlend = _expMapSolver.GetSurfaceBlend();
+        auto blendedCenter = [&](const ProjectedGaussian& pg) -> glm::vec3 {
+            return pg.originalPos + outlineBlend * (pg.position - pg.originalPos);
+        };
+
         auto makeRing = [&](const ProjectedGaussian& pg) -> std::vector<glm::vec3> {
             // Quaternion layout: rotation.x=w, .y=x, .z=y, .w=z
             const float qw = pg.rotation.x, qx = pg.rotation.y;
@@ -221,7 +232,8 @@ void main() { fragColor = uColor; }
             const float s1 = std::exp(pg.scale.y);
             const float s2 = std::exp(pg.scale.z);
 
-            // Build orthonormal tangent basis (t1, t2) from mesh dU/dV vectors
+            // Build orthonormal tangent basis (t1, t2) from mesh dU/dV vectors.
+            // If dU is degenerate, fall back to drawing using the two largest 3D axes.
             glm::vec3 t1 = pg.dU;
             const float lenU = glm::length(t1);
             if (lenU < 1e-7f) {
@@ -231,10 +243,11 @@ void main() { fragColor = uColor; }
                 if (sArr[idx[0]] < sArr[idx[2]]) std::swap(idx[0], idx[2]);
                 if (sArr[idx[1]] < sArr[idx[2]]) std::swap(idx[1], idx[2]);
                 std::vector<glm::vec3> ring(SEGS);
+                const glm::vec3 ctr0 = blendedCenter(pg);
                 for (int i = 0; i < SEGS; ++i) {
                     const float phi = 2.f * kPi * i / SEGS;
-                    ring[i] = pg.position + sArr[idx[0]]*std::cos(phi)*R[idx[0]]
-                                          + sArr[idx[1]]*std::sin(phi)*R[idx[1]];
+                    ring[i] = ctr0 + sArr[idx[0]]*std::cos(phi)*R[idx[0]]
+                                   + sArr[idx[1]]*std::sin(phi)*R[idx[1]];
                 }
                 return ring;
             }
@@ -249,6 +262,8 @@ void main() { fragColor = uColor; }
                 t2 /= lenV;
             }
 
+            // Project the 3D covariance Σ = R diag(s²) R^T onto the mesh tangent plane.
+            // This gives the ellipse footprint that lies flat on the triangle surface.
             const glm::mat3 Rt = glm::transpose(R);
             auto SigmaV = [&](const glm::vec3& v) -> glm::vec3 {
                 glm::vec3 u = Rt * v;
@@ -263,6 +278,7 @@ void main() { fragColor = uColor; }
             const float disc = std::sqrt(std::max(0.f, 0.25f*(a2d-c2d)*(a2d-c2d) + b2d*b2d));
             const float lam1 = std::max(0.f, 0.5f*(a2d+c2d) + disc);
             const float lam2 = std::max(0.f, 0.5f*(a2d+c2d) - disc);
+
             const float semiA = std::sqrt(lam1);
             const float semiB = std::sqrt(lam2);
 
@@ -278,9 +294,10 @@ void main() { fragColor = uColor; }
             const glm::vec3 axisB = semiB * (ev2.x * t1 + ev2.y * t2);
 
             std::vector<glm::vec3> ring(SEGS);
+            const glm::vec3 ctr1 = blendedCenter(pg);
             for (int i = 0; i < SEGS; ++i) {
                 const float phi = 2.f * kPi * i / SEGS;
-                ring[i] = pg.position + std::cos(phi)*axisA + std::sin(phi)*axisB;
+                ring[i] = ctr1 + std::cos(phi)*axisA + std::sin(phi)*axisB;
             }
             return ring;
         };
@@ -321,16 +338,14 @@ void main() { fragColor = uColor; }
             float depth;  // squared distance from camera (for sorting)
         };
         std::vector<DrawItem> items;
-        items.reserve(geoSet.size() + appSet.size());
+        items.reserve(geoPoints.size() + appPoints.size());
 
         for (const auto& pg : geoPoints) {
-            if (!geoSet.count(pg.originalIndex)) continue;
-            float depth = glm::dot(pg.position - camPos, camFwd);
+            float depth = glm::dot(blendedCenter(pg) - camPos, camFwd);
             items.push_back({&pg, true, depth});
         }
         for (const auto& pg : appPoints) {
-            if (!appSet.count(pg.originalIndex)) continue;
-            float depth = glm::dot(pg.position - camPos, camFwd);
+            float depth = glm::dot(blendedCenter(pg) - camPos, camFwd);
             items.push_back({&pg, false, depth});
         }
 
@@ -369,19 +384,19 @@ void main() { fragColor = uColor; }
         int drawnGeo = 0, drawnApp = 0;
         for (const auto& item : items) {
             if (item.isGeo) {
-                drawOne(makeRing(*item.pg), item.pg->position, colorLoc, 1.f, 0.2f, 0.2f);
+                drawOne(makeRing(*item.pg), blendedCenter(*item.pg), colorLoc, 1.f, 0.2f, 0.2f);
                 ++drawnGeo;
             } else {
-                drawOne(makeRing(*item.pg), item.pg->position, colorLoc, 0.2f, 0.5f, 1.f);
+                drawOne(makeRing(*item.pg), blendedCenter(*item.pg), colorLoc, 0.2f, 0.5f, 1.f);
                 ++drawnApp;
             }
         }
 
-        // Log once per selection change
-        static size_t lastSelTotal = 0;
-        size_t curSelTotal = selGeo.size() + selApp.size();
-        if (curSelTotal != lastSelTotal) {
-            lastSelTotal = curSelTotal;
+        // Log once when count changes
+        static size_t lastDrawTotal = 0;
+        size_t curDrawTotal = (size_t)(drawnGeo + drawnApp);
+        if (curDrawTotal != lastDrawTotal) {
+            lastDrawTotal = curDrawTotal;
             std::cout << "[GaussianOutline] drew geo=" << drawnGeo
                       << " app=" << drawnApp << "\n";
         }
@@ -459,6 +474,7 @@ void main() { fragColor = uColor; }
         std::vector<sibr::Vector3f> all_dUs(nGauss, sibr::Vector3f(0.f, 0.f, 0.f));
         std::vector<sibr::Vector3f> all_dVs(nGauss, sibr::Vector3f(0.f, 0.f, 0.f));
         std::vector<float>          all_surfDists(nGauss, 1e9f);
+        std::vector<sibr::Vector3f> all_surfPos(nGauss, sibr::Vector3f(-1.f, -1.f, -1.f));
         _texGaussians.clear();
 
         // Assign UV to ALL Gaussians within the sphere, regardless of surface distance.
@@ -515,6 +531,7 @@ void main() { fragColor = uColor; }
             all_dUs[k]      = { bDU.x, bDU.y, bDU.z };
             all_dVs[k]      = { bDV.x, bDV.y, bDV.z };
             all_surfDists[k]= std::sqrt(best);
+            all_surfPos[k]  = { bSurfPos.x, bSurfPos.y, bSurfPos.z };
 
             ProjectedGaussian pg;
             // position = projected onto mesh surface, removes normal offset from Gaussian to mesh
@@ -531,10 +548,20 @@ void main() { fragColor = uColor; }
 
         _expMapSolver.ClearSuppressedUVs();
         _lastAllUVs = all_uvs; _lastAllDUs = all_dUs; _lastAllDVs = all_dVs;
-        _lastAllSurfDists = all_surfDists;
+        _lastAllSurfDists = all_surfDists; _lastAllSurfPos = all_surfPos;
         _expMapSolver.SetMainGaussiansForNextSave(_texGaussians);
         _gaussianView->restoreOpacities();
-        _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, all_surfDists, _texPtr);
+        _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, all_surfDists, all_surfPos, _texPtr);
+        // record hit position for toggle reuse
+        _lastHitPos    = sibr::Vector3f(hitPos.x(), hitPos.y(), hitPos.z());
+        _lastExpRadius = _expMapRadius;
+        // suppress non-UV gaussians inside texture region to prevent occlusion
+        _gaussianView->suppressGaussiansInRegion(
+            all_uvs,
+            _lastHitPos,
+            _expMapRadius,
+            all_surfDists
+        );
     }
 
     GaussianView::Ptr               _gaussianView;
@@ -556,7 +583,10 @@ void main() { fragColor = uColor; }
     sibr::Texture2DRGBA::Ptr        _texPtr;
     std::vector<sibr::Vector2f>     _lastAllUVs;
     std::vector<sibr::Vector3f>     _lastAllDUs, _lastAllDVs;
+    std::vector<sibr::Vector3f>     _lastAllSurfPos;
     std::vector<float>              _lastAllSurfDists;
+    sibr::Vector3f                  _lastHitPos   = sibr::Vector3f(0,0,0);
+    float                           _lastExpRadius = 0.5f;
 };
 
 // =============================================================================

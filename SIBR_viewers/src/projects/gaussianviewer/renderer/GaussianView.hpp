@@ -65,12 +65,13 @@ namespace sibr {
 			std::vector<float>& outScale,
 			std::vector<float>& outOpacity);
 
-		// 新版：上傳 per-Gaussian UV + dU + dV + surfaceDist + optional texture
+		// Upload per-Gaussian UV + dU + dV + surfaceDist + surfacePositions + optional texture
 		void setUVsAndTexture(
 			const std::vector<sibr::Vector2f>& uvs,
 			const std::vector<sibr::Vector3f>& dUs,
 			const std::vector<sibr::Vector3f>& dVs,
 			const std::vector<float>&          surfaceDists,
+			const std::vector<sibr::Vector3f>& surfacePositions,  // NEW: projected point on mesh surface
 			sibr::Texture2DRGBA::Ptr texPtr);
 
 		void suppressGaussiansInRegion(
@@ -85,6 +86,7 @@ namespace sibr {
 			const std::vector<sibr::Vector3f>& positions,
 			const std::vector<sibr::Vector4f>& rotations,
 			const std::vector<sibr::Vector3f>& scales);
+
 
 		const std::shared_ptr<sibr::BasicIBRScene>& getScene() const { return _scene; }
 
@@ -125,6 +127,9 @@ namespace sibr {
 
 		std::vector<sibr::Vector3f> _cpuPos;
 		std::vector<float> _cpuOpacityCache;
+		std::vector<sibr::Vector3f> _cpuPosCache;  // original position snapshot
+		std::vector<float> _cpuRotCache;            // original rotation snapshot [w,x,y,z] * count
+		std::vector<float> _cpuScaleCache;          // original scale snapshot [sx,sy,sz] * count
 
 		GLuint imageBuffer;
 		cudaGraphicsResource_t imageBufferCuda;

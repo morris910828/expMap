@@ -1285,10 +1285,23 @@ private:
                 vec3 hitPos  = uCamPos + t_hit * rayDir;
                 vec3 offset  = hitPos - vCenter;
 
-                float len2U  = dot(v_dU, v_dU);
-                float len2V  = dot(v_dV, v_dV);
-                float deltaU = (len2U > 1e-12) ? dot(offset, v_dU) / len2U : 0.0;
-                float deltaV = (len2V > 1e-12) ? dot(offset, v_dV) / len2V : 0.0;
+                // Solve the 2x2 Gram system to get correct UV offsets even when
+                // dU and dV are not orthogonal (e.g. skewed UV parameterization).
+                // offset = deltaU * dU + deltaV * dV  →  Cramer's rule:
+                float dUU = dot(v_dU, v_dU);
+                float dVV = dot(v_dV, v_dV);
+                float dUV = dot(v_dU, v_dV);
+                float D   = dUU * dVV - dUV * dUV;
+                float deltaU, deltaV;
+                if (D > 1e-12) {
+                    float bU = dot(offset, v_dU);
+                    float bV = dot(offset, v_dV);
+                    deltaU = (bU * dVV - bV * dUV) / D;
+                    deltaV = (bV * dUU - bU * dUV) / D;
+                } else {
+                    deltaU = 0.0;
+                    deltaV = 0.0;
+                }
 
                 // Clamp UV extrapolation to the assigned triangle's UV extent.
                 // Prevents tangent-frame discontinuities at UV seams from
@@ -1298,13 +1311,13 @@ private:
                 deltaV = clamp(deltaV, -maxDelta, maxDelta);
 
                 vec2 exactUV = vUV_center + vec2(deltaU, deltaV);
-                
+
                 vec2 uv_dx = dFdx(exactUV);
                 vec2 uv_dy = dFdy(exactUV);
-                
+
                 if (exactUV.x < 0.0 || exactUV.x > 1.0 || exactUV.y < 0.0 || exactUV.y > 1.0) discard;
 
-                vec4 c = texture(uTexture, exactUV);
+                vec4 c = textureGrad(uTexture, exactUV, uv_dx, uv_dy);
                 if (c.a < 0.01) discard;
 
                 FragColor = vec4(c.rgb, c.a * alpha * uAlpha);
