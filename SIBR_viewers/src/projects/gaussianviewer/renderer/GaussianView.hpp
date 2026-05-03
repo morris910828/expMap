@@ -123,6 +123,9 @@ namespace sibr {
 		cudaArray_t tex_array = nullptr;
 		sibr::Texture2DRGBA::Ptr _current_tex;
 
+		sibr::Vector3f _uvSurfacePos = sibr::Vector3f(0.f, 0.f, 0.f);
+		bool _hasUVSurface = false;
+
 		std::vector<int> _plyToSorted;
 
 		std::vector<sibr::Vector3f> _cpuPos;

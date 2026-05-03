@@ -128,6 +128,13 @@ public:
     }
     void ResetSurfaceBlend() { _surfaceBlend = 1.0f; _surfaceBlendDirty = false; }
 
+    float GetSurfDistThreshold() const { return _surfDistThreshold; }
+    bool ConsumeSurfDistThresholdDirty() {
+        bool d = _surfDistThresholdDirty;
+        _surfDistThresholdDirty = false;
+        return d;
+    }
+
     const ProjectionStats& GetProjectionStats() const { return _projectionStats; }
 
     void SetMainGaussiansForNextSave(const std::vector<ProjectedGaussian>& g) {
@@ -207,6 +214,10 @@ public:
         if (_liveSSBO) { glDeleteBuffers(1, &_liveSSBO); _liveSSBO = 0; }
         _liveDirty = true;
         _suppressedUVs.clear();
+
+        _surfDistThreshold      = 1e9f;
+        _computedMaxSurfDist    = 1.0f;
+        _surfDistThresholdDirty = false;
     }
     
     void OnRaycastHit(const sibr::Vector3f& hitPos, float radius, int hitTriID) {
@@ -602,6 +613,16 @@ public:
                 if (_surfaceBlend != prev) _surfaceBlendDirty = true;
             }
 
+            {
+                float sliderMax = (_computedMaxSurfDist > 1e-6f) ? _computedMaxSurfDist : 1.0f;
+                _surfDistThreshold = std::min(_surfDistThreshold, sliderMax);
+                float prev = _surfDistThreshold;
+                ImGui::PushItemWidth(-1.f);
+                ImGui::SliderFloat("Dist Cutoff##sdc", &_surfDistThreshold, 0.0f, sliderMax, "Dist Cutoff %.4f");
+                ImGui::PopItemWidth();
+                if (_surfDistThreshold != prev) _surfDistThresholdDirty = true;
+            }
+
             ImVec2 p = ImGui::GetCursorScreenPos();
             ImVec2 sz = ImGui::GetContentRegionAvail();
             if(sz.x < 50) sz.x = 50; 
@@ -760,6 +781,8 @@ public:
                     if (op < minOpacity) return false;
                     glm::vec3 sExp = glm::exp(pt.scale);
                     if (std::max({sExp.x, sExp.y, sExp.z}) > maxScale3DExp) return false;
+                    float surfDist = glm::length(pt.originalPos - pt.position);
+                    if (surfDist > _surfDistThreshold) return false;
                     return true;
                 };
 
@@ -1312,7 +1335,7 @@ private:
             {
                 glm::vec2 uvMin = glm::min(uv0, glm::min(uv1, uv2));
                 glm::vec2 uvMax = glm::max(uv0, glm::max(uv1, uv2));
-                pg.uvMaxDelta = glm::length(uvMax - uvMin) * 0.5f;
+                pg.uvMaxDelta = glm::length(uvMax - uvMin) * 2.0f; // Relaxed clamp to prevent cropping
             }
             if (ptIdx < props.size()) {
                 pg.opacity  = props[ptIdx].opacity;
@@ -1471,7 +1494,7 @@ private:
                     {
                         glm::vec2 uvMin = glm::min(uv0, glm::min(uv1, uv2));
                         glm::vec2 uvMax = glm::max(uv0, glm::max(uv1, uv2));
-                        pg.uvMaxDelta = glm::length(uvMax - uvMin) * 0.5f;
+                        pg.uvMaxDelta = glm::length(uvMax - uvMin) * 2.0f; // Relaxed clamp to prevent cropping
                     }
                     if (i < props.size()) {
                         pg.opacity   = props[i].opacity;
@@ -1498,6 +1521,15 @@ private:
         process(_geoCloudData, {}, _geoGaussianProps, _projectedGeoPoints, "GEO");
         process(_appCloudData, _appCloudFids, _appGaussianProps, _projectedAppPoints, "APP");
         _liveDirty = true;
+
+        // Compute max surface distance for the dist-cutoff slider range
+        float maxD = 0.f;
+        for (const auto& pg : _projectedGeoPoints)
+            maxD = std::max(maxD, glm::length(pg.originalPos - pg.position));
+        for (const auto& pg : _projectedAppPoints)
+            maxD = std::max(maxD, glm::length(pg.originalPos - pg.position));
+        _computedMaxSurfDist = (maxD > 1e-6f) ? maxD * 1.1f : 1.0f;
+        _surfDistThreshold = _computedMaxSurfDist;  // Default: show all
     }
     
     void ComputeExtraNodeCosts() {
@@ -1677,6 +1709,10 @@ private:
 
     float _surfaceBlend      = 1.0f;
     bool  _surfaceBlendDirty = false;
+
+    float _surfDistThreshold      = 1e9f;
+    float _computedMaxSurfDist    = 1.0f;
+    bool  _surfDistThresholdDirty = false;
 };
 
 #endif

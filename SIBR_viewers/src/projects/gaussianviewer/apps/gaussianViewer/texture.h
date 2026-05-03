@@ -1193,7 +1193,8 @@ private:
 
                 vec3 N_mesh = cross(a_dU, a_dV);
                 float lenN  = length(N_mesh);
-                vNormal     = (lenN > 1e-8) ? (N_mesh / lenN) : vec3(0.0, 1.0, 0.0);
+                vec3 n      = (lenN > 1e-8) ? (N_mesh / lenN) : vec3(0.0, 1.0, 0.0);
+                vNormal     = n;
                 vOpacity    = aOpacity;
 
                 vec4 posV = uView * vec4(aPos, 1.0);
@@ -1204,13 +1205,17 @@ private:
                 vec3  sc = exp(aScale);
                 if (sc.x > 0.05 || sc.y > 0.05) { gl_Position = vec4(0,0,2,1); return; }
                 
-                float qw=aRot.x, qx=aRot.y, qy=aRot.z, qz=aRot.w;
-                mat3 R = mat3(
-                    vec3(1.0-2.0*(qy*qy+qz*qz), 2.0*(qx*qy+qw*qz), 2.0*(qx*qz-qw*qy)),
-                    vec3(2.0*(qx*qy-qw*qz), 1.0-2.0*(qx*qx+qz*qz), 2.0*(qy*qz+qw*qx)),
-                    vec3(2.0*(qx*qz+qw*qy), 2.0*(qy*qz-qw*qx), 1.0-2.0*(qx*qx+qy*qy))
-                );
-                mat3 S    = mat3(sc.x,0,0, 0,sc.y,0, 0,0,sc.z);
+                // Force rotation to be surface-aligned:
+                // Col 0 = tangent X (normalized dU)
+                // Col 2 = normal
+                // Col 1 = tangent Y (n x tX)
+                vec3 tX = normalize(a_dU);
+                vec3 tY = normalize(cross(n, tX));
+                mat3 R  = mat3(tX, tY, n);
+
+                // Force scale Z to be extremely small to ensure flatness
+                float flatZ = min(sc.x, sc.y) * 0.001; 
+                mat3 S    = mat3(sc.x,0,0, 0,sc.y,0, 0,0,flatZ);
                 mat3 M_cov = R * S;
                 mat3 Sig  = M_cov * transpose(M_cov);
 
@@ -1306,7 +1311,7 @@ private:
                 // Clamp UV extrapolation to the assigned triangle's UV extent.
                 // Prevents tangent-frame discontinuities at UV seams from
                 // mapping pixels to the wrong texture region.
-                float maxDelta = max(vUVMaxDelta, 0.005);
+                float maxDelta = max(vUVMaxDelta, 0.05); // Increased floor from 0.005 to 0.05
                 deltaU = clamp(deltaU, -maxDelta, maxDelta);
                 deltaV = clamp(deltaV, -maxDelta, maxDelta);
 
@@ -1316,6 +1321,12 @@ private:
                 vec2 uv_dy = dFdy(exactUV);
 
                 if (exactUV.x < 0.0 || exactUV.x > 1.0 || exactUV.y < 0.0 || exactUV.y > 1.0) discard;
+
+                // Calculate proper fragment depth from the plane intersection point
+                vec4 p_clip = uProj * uView * vec4(hitPos, 1.0);
+                gl_FragDepth = (p_clip.z / p_clip.w) * 0.5 + 0.5;
+                // Add a tiny offset to ensure it stays in front of the mesh
+                gl_FragDepth -= 0.00001;
 
                 vec4 c = textureGrad(uTexture, exactUV, uv_dx, uv_dy);
                 if (c.a < 0.01) discard;

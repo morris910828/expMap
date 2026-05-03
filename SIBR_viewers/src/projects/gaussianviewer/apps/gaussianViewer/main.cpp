@@ -340,11 +340,14 @@ void main() { fragColor = uColor; }
         std::vector<DrawItem> items;
         items.reserve(geoPoints.size() + appPoints.size());
 
+        const float surfDistThreshold = _expMapSolver.GetSurfDistThreshold();
         for (const auto& pg : geoPoints) {
+            if (glm::length(pg.originalPos - pg.position) > surfDistThreshold) continue;
             float depth = glm::dot(blendedCenter(pg) - camPos, camFwd);
             items.push_back({&pg, true, depth});
         }
         for (const auto& pg : appPoints) {
+            if (glm::length(pg.originalPos - pg.position) > surfDistThreshold) continue;
             float depth = glm::dot(blendedCenter(pg) - camPos, camFwd);
             items.push_back({&pg, false, depth});
         }

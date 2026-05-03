@@ -339,6 +339,21 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camer
 		float* boxmin = _cropping   ? (float*)&_boxmin : nullptr;
 		float* boxmax = _cropping   ? (float*)&_boxmax : nullptr;
 
+		// Compute a single unified view-space depth for all UV Gaussians.
+		// By forcing every UV Gaussian to the same depth during the radix sort,
+		// we eliminate the parallax effect that makes the texture appear to protrude
+		// when viewed from the side.
+		float uvFixedDepth = 0.f;
+		if (_hasUVSurface) {
+			// Transform world-space centroid into the same view space used by the CUDA rasterizer
+			// (row 1 and 2 negated above, so view-space z is positive for objects in front).
+			sibr::Vector4f p(_uvSurfacePos.x(), _uvSurfacePos.y(), _uvSurfacePos.z(), 1.f);
+			sibr::Vector4f pv = view_mat * p;
+			// Only use the depth if the surface is in front of the camera (z > 0.2 matches frustum cull threshold)
+			if (pv.z() > 0.2f)
+				uvFixedDepth = pv.z();
+		}
+
 		CudaRasterizer::Rasterizer::forward(
 			geomBufferFunc, binningBufferFunc, imgBufferFunc,
 			count, _sh_degree, 16,
@@ -349,7 +364,8 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camer
 			tan_fovx, tan_fovy,
 			false, image_cuda, _antialiasing,
 			nullptr, rects, boxmin, boxmax,
-			uvs_cuda, dU_cuda, dV_cuda, surfaceDist_cuda, tex_cuda
+			uvs_cuda, dU_cuda, dV_cuda, surfaceDist_cuda, tex_cuda,
+			uvFixedDepth
 		);
 
 		if (!_interop_failed) {
@@ -479,28 +495,47 @@ void sibr::GaussianView::suppressGaussiansInRegion(
     const bool hasSurfDist = ((int)surfaceDists.size() == count);
     std::vector<float> modOpc(_cpuOpacityCache);
 
+    // Cache original scale values for restoration by restoreOpacities().
+    // (setUVsAndTexture no longer modifies scale, so we cache it here on first call.)
+    if (_cpuScaleCache.empty()) {
+        _cpuScaleCache.resize(count * 3);
+        cudaMemcpy(_cpuScaleCache.data(), scale_cuda, sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
+    }
+    // Always start from the cached originals so re-calls don't accumulate suppression.
+    std::vector<float> modScale(_cpuScaleCache);
+
     const float suppressRadius2 = suppressRadius * suppressRadius;
 
     for (int i = 0; i < count; ++i) {
-        if (uvs[i].x() >= 0.f) continue; // has UV -> keep original opacity
+        if (uvs[i].x() >= 0.f) continue; // has UV -> keep original opacity and scale
 
-        // Only suppress Gaussians physically inside the expmap sphere.
-        // Gaussians outside the region belong to the rest of the model and must be untouched.
         const sibr::Vector3f& p = _cpuPos[i];
         float dx = p.x() - center.x(), dy = p.y() - center.y(), dz = p.z() - center.z();
         if (dx*dx + dy*dy + dz*dz > suppressRadius2) continue;
 
+        float factor;
         if (hasSurfDist && surfaceDists[i] < suppressRadius) {
-            // Inside sphere, no UV: smooth falloff  dist=0 -> factor=1, dist=radius -> factor~0.05
+            // dist=0 (on surface) -> factor=0 (fully suppressed)
+            // dist=suppressRadius -> factor≈0.95 (mostly untouched)
             float t = surfaceDists[i] / suppressRadius;
-            float factor = std::exp(-3.0f * t * t);
+            factor = 1.0f - std::exp(-3.0f * t * t);
             modOpc[i] *= factor;
         } else {
-            // Inside sphere but no surface distance recorded -> fully transparent
+            factor = 0.f;
             modOpc[i] = 0.f;
+        }
+
+        // For heavily suppressed Gaussians: also zero scale so cov3D→0.
+        // The preprocessCUDA opacity early-exit (opacities < 1/255 → return) will
+        // then remove these entirely from the tile list, preventing any T consumption.
+        if (factor < 0.1f) {
+            modScale[3*i+0] = 1e-6f;
+            modScale[3*i+1] = 1e-6f;
+            modScale[3*i+2] = 1e-6f;
         }
     }
     cudaMemcpy(opacity_cuda, modOpc.data(), sizeof(float) * count, cudaMemcpyHostToDevice);
+    cudaMemcpy(scale_cuda,   modScale.data(), sizeof(float) * count * 3, cudaMemcpyHostToDevice);
 }
 
 void sibr::GaussianView::restoreOpacities() {
@@ -540,23 +575,25 @@ void sibr::GaussianView::updateGeometry(
 }
 
 // =============================================================================
-// setUVsAndTexture  (with surfacePositions parameter)
+// setUVsAndTexture
+// Uploads UV/tangent data and texture to GPU. Gaussian position, scale, and
+// rotation are intentionally left unchanged — each Gaussian keeps its original
+// geometry. Texture UV is computed in renderCUDA via ray-tangent-plane
+// intersection using the per-Gaussian dU/dV vectors.
 // =============================================================================
 void sibr::GaussianView::setUVsAndTexture(
 	const std::vector<sibr::Vector2f>& uvs,
 	const std::vector<sibr::Vector3f>& dUs,
 	const std::vector<sibr::Vector3f>& dVs,
 	const std::vector<float>&          surfaceDists,
-	const std::vector<sibr::Vector3f>& surfacePositions,  // NEW
+	const std::vector<sibr::Vector3f>& surfacePositions,
 	sibr::Texture2DRGBA::Ptr texPtr)
 {
 	if ((int)uvs.size() != count || (int)dUs.size() != count ||
 	    (int)dVs.size() != count || (int)surfaceDists.size() != count) {
 		SIBR_ERR << "[GaussianView::setUVsAndTexture] size mismatch: "
-		         << "uvs=" << uvs.size()
-		         << " dUs=" << dUs.size()
-		         << " dVs=" << dVs.size()
-		         << " surfaceDists=" << surfaceDists.size()
+		         << "uvs=" << uvs.size() << " dUs=" << dUs.size()
+		         << " dVs=" << dVs.size() << " surfaceDists=" << surfaceDists.size()
 		         << " count=" << count;
 		return;
 	}
@@ -570,180 +607,44 @@ void sibr::GaussianView::setUVsAndTexture(
 	if (!surfaceDist_cuda)
 		CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&surfaceDist_cuda, sizeof(float) * count));
 
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
-		uvs_cuda,
-		uvs.data(),
-		sizeof(float) * count * 2,
-		cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(uvs_cuda,         uvs.data(),          sizeof(float) * count * 2, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(dU_cuda,          dUs.data(),          sizeof(float) * count * 3, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(dV_cuda,          dVs.data(),          sizeof(float) * count * 3, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(surfaceDist_cuda, surfaceDists.data(), sizeof(float) * count,     cudaMemcpyHostToDevice));
 
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
-		dU_cuda,
-		dUs.data(),
-		sizeof(float) * count * 3,
-		cudaMemcpyHostToDevice));
-
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
-		dV_cuda,
-		dVs.data(),
-		sizeof(float) * count * 3,
-		cudaMemcpyHostToDevice));
-
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
-		surfaceDist_cuda,
-		surfaceDists.data(),
-		sizeof(float) * count,
-		cudaMemcpyHostToDevice));
-
-	//  Snap UV-Gaussians onto mesh surface in pos_cuda
-	// Snapshot original values on first call
-	if (_cpuPosCache.empty()) {
-		_cpuPosCache.resize(count);
-		cudaMemcpy(_cpuPosCache.data(), pos_cuda,
-		           sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
-	}
-	if (_cpuRotCache.empty()) {
-		_cpuRotCache.resize(count * 4);
-		cudaMemcpy(_cpuRotCache.data(), rot_cuda,
-		           sizeof(float) * count * 4, cudaMemcpyDeviceToHost);
-	}
-	if (_cpuScaleCache.empty()) {
-		_cpuScaleCache.resize(count * 3);
-		cudaMemcpy(_cpuScaleCache.data(), scale_cuda,
-		           sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
-	}
-
+	// Snap UV Gaussians onto the mesh surface.
+	// The ray-plane intersection in renderCUDA uses means3D (= pos_cuda) as the plane
+	// origin. If the Gaussian floats above the surface by surfaceDist, the tangent plane
+	// drifts away from the mesh and causes severe UV stretching when viewed from the side.
+	// Moving the center to the projected surface point fixes this at its root.
 	if ((int)surfacePositions.size() == count) {
-		// Position: start from snapshot, snap UV Gaussians to mesh surface
-		std::vector<sibr::Vector3f> newPos(_cpuPosCache);
-		for (int i = 0; i < count; ++i) {
-			if (uvs[i].x() < 0.f) continue;
-			newPos[i] = surfacePositions[i];
-		}
-		cudaMemcpy(pos_cuda, newPos.data(),
-		           sizeof(float) * count * 3, cudaMemcpyHostToDevice);
-		_cpuPos.clear();
-
-		// Scale/Rotation: start from originals, flatten UV Gaussians onto surface plane
-		std::vector<float> newRot(_cpuRotCache);
-		std::vector<float> newScale(_cpuScaleCache);
-
-		for (int i = 0; i < count; ++i) {
-			if (uvs[i].x() < 0.f) continue;
-
-			// ── Step 1: surface tangent frame ─────────────────────────────────
-			float dUx=dUs[i].x(), dUy=dUs[i].y(), dUz=dUs[i].z();
-			float dVx=dVs[i].x(), dVy=dVs[i].y(), dVz=dVs[i].z();
-
-			float nx = dUy*dVz - dUz*dVy;   // cross(dU, dV) = surface normal
-			float ny = dUz*dVx - dUx*dVz;
-			float nz = dUx*dVy - dUy*dVx;
-			float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
-			if (nlen < 1e-8f) continue;
-			nx /= nlen; ny /= nlen; nz /= nlen;
-
-			float t1len = std::sqrt(dUx*dUx + dUy*dUy + dUz*dUz);
-			if (t1len < 1e-8f) continue;
-			float t1x=dUx/t1len, t1y=dUy/t1len, t1z=dUz/t1len;  // normalize(dU)
-
-			float t2x = ny*t1z - nz*t1y;  // cross(n, t1) — already unit
-			float t2y = nz*t1x - nx*t1z;
-			float t2z = nx*t1y - ny*t1x;
-
-			// ── Step 2: recover original world-space covariance eigenvectors ─
-			// 3DGS quaternion convention: [w=rot.x, x=rot.y, y=rot.z, z=rot.w]
-			// The local-to-world rotation R_std has columns = local axes in world.
-			// Columns differ from computeCov3D's R (which stores R_std^T):
-			//   col0 (local X in world): (1-2(qy²+qz²),  2(qx*qy+qr*qz),  2(qx*qz-qr*qy))
-			//   col1 (local Y in world): (2(qx*qy-qr*qz), 1-2(qx²+qz²),   2(qy*qz+qr*qx))
-			//   col2 (local Z in world): (2(qx*qz+qr*qy), 2(qy*qz-qr*qx), 1-2(qx²+qy²))
-			float qr_=_cpuRotCache[4*i], qx_=_cpuRotCache[4*i+1],
-			      qy_=_cpuRotCache[4*i+2], qz_=_cpuRotCache[4*i+3];
-
-			float c0x=1.f-2.f*(qy_*qy_+qz_*qz_), c0y=2.f*(qx_*qy_+qr_*qz_), c0z=2.f*(qx_*qz_-qr_*qy_);
-			float c1x=2.f*(qx_*qy_-qr_*qz_), c1y=1.f-2.f*(qx_*qx_+qz_*qz_), c1z=2.f*(qy_*qz_+qr_*qx_);
-			float c2x=2.f*(qx_*qz_+qr_*qy_), c2y=2.f*(qy_*qz_-qr_*qx_), c2z=1.f-2.f*(qx_*qx_+qy_*qy_);
-
-			float sx=_cpuScaleCache[3*i], sy=_cpuScaleCache[3*i+1], sz=_cpuScaleCache[3*i+2];
-			float sx2=sx*sx, sy2=sy*sy, sz2=sz*sz;
-
-			// ── Step 3: project covariance Σ = Σ_k sk² (col_k⊗col_k) onto (t1,t2)
-			// Σ_2D[a][b] = Σ_k sk² (col_k·ta)(col_k·tb)
-			float d0t1=c0x*t1x+c0y*t1y+c0z*t1z, d1t1=c1x*t1x+c1y*t1y+c1z*t1z, d2t1=c2x*t1x+c2y*t1y+c2z*t1z;
-			float d0t2=c0x*t2x+c0y*t2y+c0z*t2z, d1t2=c1x*t2x+c1y*t2y+c1z*t2z, d2t2=c2x*t2x+c2y*t2y+c2z*t2z;
-
-			float A = sx2*d0t1*d0t1 + sy2*d1t1*d1t1 + sz2*d2t1*d2t1;  // Σ_2D[0][0]
-			float B = sx2*d0t1*d0t2 + sy2*d1t1*d1t2 + sz2*d2t1*d2t2;  // Σ_2D[0][1]
-			float C = sx2*d0t2*d0t2 + sy2*d1t2*d1t2 + sz2*d2t2*d2t2;  // Σ_2D[1][1]
-
-			// ── Step 4: 2×2 eigendecomposition of [A B; B C] ─────────────────
-			float mid  = 0.5f*(A + C);
-			float disc = std::sqrt(std::max(0.f, 0.25f*(A-C)*(A-C) + B*B));
-			float lam1 = mid + disc;  // larger eigenvalue  → larger in-plane scale
-			float lam2 = mid - disc;
-
-			float sc1 = std::sqrt(std::max(1e-12f, lam1));
-			float sc2 = std::sqrt(std::max(1e-12f, lam2));
-
-			// Cap to the local triangle 3D extent to prevent runaway large Gaussians
-			float triSize = std::max(t1len, std::sqrt(dVx*dVx+dVy*dVy+dVz*dVz));
-			sc1 = std::min(sc1, triSize * 3.f);
-			sc2 = std::min(sc2, triSize * 3.f);
-
-			// Eigenvector of lam1 in (t1,t2) plane: angle θ = atan2(2B, A-C)/2
-			float theta = 0.5f * std::atan2(2.f*B, A - C);
-			float cosT = std::cos(theta), sinT = std::sin(theta);
-
-			// World-space eigenvectors on the tangent plane
-			float e1x=cosT*t1x+sinT*t2x, e1y=cosT*t1y+sinT*t2y, e1z=cosT*t1z+sinT*t2z;
-			float e2x=-sinT*t1x+cosT*t2x, e2y=-sinT*t1y+cosT*t2y, e2z=-sinT*t1z+cosT*t2z;
-
-			// ── Step 5: build rotation [e1 | e2 | n] → quaternion (Shepperd) ─
-			// col0=e1, col1=e2, col2=n  (Rij = R[col=i][row=j] in glm col-major)
-			float R00=e1x, R01=e1y, R02=e1z;
-			float R10=e2x, R11=e2y, R12=e2z;
-			float R20=nx,  R21=ny,  R22=nz;
-			float tr = R00 + R11 + R22;
-			float qr, qx, qy, qz;
-			if (tr > 0.f) {
-				float s = 2.f * std::sqrt(tr + 1.f);
-				qr=0.25f*s; qx=(R12-R21)/s; qy=(R20-R02)/s; qz=(R01-R10)/s;
-			} else if (R00 > R11 && R00 > R22) {
-				float s = 2.f * std::sqrt(1.f+R00-R11-R22);
-				qr=(R12-R21)/s; qx=0.25f*s; qy=(R01+R10)/s; qz=(R20+R02)/s;
-			} else if (R11 > R22) {
-				float s = 2.f * std::sqrt(1.f+R11-R00-R22);
-				qr=(R20-R02)/s; qx=(R01+R10)/s; qy=0.25f*s; qz=(R21+R12)/s;
-			} else {
-				float s = 2.f * std::sqrt(1.f+R22-R00-R11);
-				qr=(R01-R10)/s; qx=(R20+R02)/s; qy=(R21+R12)/s; qz=0.25f*s;
-			}
-			float qlen = std::sqrt(qr*qr+qx*qx+qy*qy+qz*qz);
-			if (qlen > 1e-8f) { qr/=qlen; qx/=qlen; qy/=qlen; qz/=qlen; }
-
-			newRot[4*i+0]=qr; newRot[4*i+1]=qx; newRot[4*i+2]=qy; newRot[4*i+3]=qz;
-
-			// In-plane scales = projected eigenvalues; normal scale = 1% of smaller axis
-			newScale[3*i+0] = sc1;
-			newScale[3*i+1] = sc2;
-			newScale[3*i+2] = std::min(sc1, sc2) * 0.01f;
+		// Cache original positions for restoreOpacities().
+		if (_cpuPosCache.empty()) {
+			_cpuPosCache.resize(count);
+			cudaMemcpy(_cpuPosCache.data(), pos_cuda,
+			           sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
 		}
 
-		cudaMemcpy(rot_cuda,   newRot.data(),   sizeof(float) * count * 4, cudaMemcpyHostToDevice);
-		cudaMemcpy(scale_cuda, newScale.data(), sizeof(float) * count * 3, cudaMemcpyHostToDevice);
+		std::vector<float> snappedPos(count * 3);
+		// Start from current GPU positions so non-UV Gaussians are untouched.
+		cudaMemcpy(snappedPos.data(), pos_cuda, sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
+		for (int i = 0; i < count; ++i) {
+			if (uvs[i].x() < 0.f) continue;
+			snappedPos[3*i+0] = surfacePositions[i].x();
+			snappedPos[3*i+1] = surfacePositions[i].y();
+			snappedPos[3*i+2] = surfacePositions[i].z();
+		}
+		cudaMemcpy(pos_cuda, snappedPos.data(), sizeof(float) * count * 3, cudaMemcpyHostToDevice);
+		_cpuPos.clear(); // invalidate cached CPU positions
 	}
-	//
+
+	_hasUVSurface = false; // uvFixedDepth path disabled; depth bias in preprocessCUDA handles ordering
 
 	if (_current_tex != texPtr) {
 		_current_tex = texPtr;
 
-		if (tex_cuda) {
-			cudaDestroyTextureObject(tex_cuda);
-			tex_cuda = 0;
-		}
-		if (tex_array) {
-			cudaFreeArray(tex_array);
-			tex_array = nullptr;
-		}
+		if (tex_cuda) { cudaDestroyTextureObject(tex_cuda); tex_cuda = 0; }
+		if (tex_array) { cudaFreeArray(tex_array); tex_array = nullptr; }
 
 		if (texPtr && texPtr->handle() != 0) {
 			int w = texPtr->w();
@@ -761,11 +662,8 @@ void sibr::GaussianView::setUVsAndTexture(
 			cudaChannelFormatDesc cd = cudaCreateChannelDesc(32,32,32,32, cudaChannelFormatKindFloat);
 			CUDA_SAFE_CALL_ALWAYS(cudaMallocArray(&tex_array, &cd, w, h));
 			CUDA_SAFE_CALL_ALWAYS(cudaMemcpy2DToArray(
-				tex_array, 0, 0,
-				fp.data(),
-				w * 4 * sizeof(float),
-				w * 4 * sizeof(float),
-				h,
+				tex_array, 0, 0, fp.data(),
+				w * 4 * sizeof(float), w * 4 * sizeof(float), h,
 				cudaMemcpyHostToDevice));
 
 			cudaResourceDesc resDesc{};
@@ -773,84 +671,22 @@ void sibr::GaussianView::setUVsAndTexture(
 			resDesc.res.array.array = tex_array;
 
 			cudaTextureDesc texDesc{};
-			// Border mode: UV outside [0,1] returns transparent (0,0,0,0) instead of clamping
-			// This avoids edge artifacts without needing manual alpha cutoff.
-			texDesc.addressMode[0]   = cudaAddressModeBorder;
-			texDesc.addressMode[1]   = cudaAddressModeBorder;
-			texDesc.borderColor[0]   = 0.f;   // R
-			texDesc.borderColor[1]   = 0.f;   // G
-			texDesc.borderColor[2]   = 0.f;   // B
-			texDesc.borderColor[3]   = 0.f;   // A = 0 -> fully transparent outside boundary
-			texDesc.filterMode       = cudaFilterModeLinear;
-			texDesc.readMode         = cudaReadModeElementType;
-			texDesc.normalizedCoords = 1;
-			texDesc.maxAnisotropy    = 16;
-			texDesc.mipmapFilterMode = cudaFilterModePoint; // lock to mip level 0
+			texDesc.addressMode[0]      = cudaAddressModeBorder;
+			texDesc.addressMode[1]      = cudaAddressModeBorder;
+			texDesc.borderColor[0]      = 0.f;
+			texDesc.borderColor[1]      = 0.f;
+			texDesc.borderColor[2]      = 0.f;
+			texDesc.borderColor[3]      = 0.f;
+			texDesc.filterMode          = cudaFilterModeLinear;
+			texDesc.readMode            = cudaReadModeElementType;
+			texDesc.normalizedCoords    = 1;
+			texDesc.maxAnisotropy       = 16;
+			texDesc.mipmapFilterMode    = cudaFilterModePoint;
 			texDesc.maxMipmapLevelClamp = 0;
 
 			CUDA_SAFE_CALL_ALWAYS(cudaCreateTextureObject(&tex_cuda, &resDesc, &texDesc, NULL));
 		}
 	}
-
-	// ==========================================================================
-	// [DEBUG] UV coverage check: mark Gaussians without UV assignment as pure green
-	// Output color = SH_C0 * sh[0] + 0.5; SH_C0 = 0.28209479177387814
-	// Pure green (R=0, G=1, B=0): sh_R=-1.7725, sh_G=1.7725, sh_B=-1.7725
-	// Note: this permanently modifies shs_cuda until next setUVsAndTexture call.
-	// Set DEBUG_MARK_NO_UV to 0 after confirming UV coverage.
-	// ==========================================================================
-#define DEBUG_MARK_NO_UV 0
-#if DEBUG_MARK_NO_UV
-	{
-		// degree 3 -> 16 coefficients x 3 channels = 48 floats per Gaussian
-		const int SH_TOTAL = 16 * 3;
-
-		std::vector<float> shs_host((size_t)count * SH_TOTAL);
-		CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
-			shs_host.data(),
-			shs_cuda,
-			sizeof(float) * count * SH_TOTAL,
-			cudaMemcpyDeviceToHost));
-
-		const float SH_C0 = 0.28209479177387814f;
-		const float sh_R  = (0.0f - 0.5f) / SH_C0;   // -> R=0
-		const float sh_G  = (1.0f - 0.5f) / SH_C0;   // -> G=1
-		const float sh_B  = (0.0f - 0.5f) / SH_C0;   // -> B=0
-
-		int no_uv_count = 0;
-		for (int i = 0; i < count; i++)
-		{
-			const float u = uvs[i].x();
-			const float v = uvs[i].y();
-
-			if (u < -0.5f || v < -0.5f)
-			{
-				// Overwrite DC component (layout: shs[0]=R, shs[1]=G, shs[2]=B)
-				shs_host[i * SH_TOTAL + 0] = sh_R;
-				shs_host[i * SH_TOTAL + 1] = sh_G;
-				shs_host[i * SH_TOTAL + 2] = sh_B;
-				// Zero out higher-order SH to prevent view-dependent color shift
-				for (int j = 3; j < SH_TOTAL; j++)
-					shs_host[i * SH_TOTAL + j] = 0.0f;
-				no_uv_count++;
-			}
-		}
-
-		SIBR_LOG << "[GaussianView] UV coverage: "
-		         << (count - no_uv_count) << " / " << count
-		         << " Gaussians have UV  ("
-		         << no_uv_count << " marked green, "
-		         << (100.f * (count - no_uv_count) / (float)count) << "% covered)"
-		         << std::endl;
-
-		// Upload back to GPU
-		CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(
-			shs_cuda,
-			shs_host.data(),
-			sizeof(float) * count * SH_TOTAL,
-			cudaMemcpyHostToDevice));
-	}
-#endif // DEBUG_MARK_NO_UV
 }
 
 sibr::GaussianView::~GaussianView()
