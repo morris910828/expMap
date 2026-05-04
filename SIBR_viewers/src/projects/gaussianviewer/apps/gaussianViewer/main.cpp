@@ -7,6 +7,7 @@
 #include <regex>
 #include <array>
 #include <cmath>
+#include <unordered_map>
 
 #include <core/graphics/Window.hpp>
 #include <core/view/MultiViewManager.hpp>
@@ -110,19 +111,12 @@ public:
             ImGui::Checkbox("Show Texture", &_showTexture);
             if (_showTexture != prevShowTex && !_lastAllUVs.empty()) {
                 _gaussianView->restoreOpacities();
+                auto blended = computeBlendedPos(_expMapSolver.GetSurfaceBlend());
                 _gaussianView->setUVsAndTexture(
                     _lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists,
-                    _lastAllSurfPos,
+                    blended,
                     _showTexture ? _texPtr : nullptr
                 );
-                if (_showTexture && _lastExpRadius > 0.f) {
-                    _gaussianView->suppressGaussiansInRegion(
-                        _lastAllUVs,
-                        _lastHitPos,
-                        _lastExpRadius,
-                        _lastAllSurfDists
-                    );
-                }
             }
         }
         ImGui::Separator();
@@ -130,6 +124,7 @@ public:
             _gaussianView->restoreOpacities();
             _texGaussians.clear();
             _expMapSolver.ClearRaycastState();
+            _lastAllOrigPos.clear();
             std::vector<sibr::Vector2f> empty_uvs(_gaussianView->getCount(), sibr::Vector2f(-1.f, -1.f));
             std::vector<sibr::Vector3f> empty_dUs(_gaussianView->getCount(), sibr::Vector3f(0.f, 0.f, 0.f));
             std::vector<sibr::Vector3f> empty_dVs(_gaussianView->getCount(), sibr::Vector3f(0.f, 0.f, 0.f));
@@ -139,13 +134,32 @@ public:
         }
         ImGui::End();
         _expMapSolver.RenderUI();
+        // Surface blend slider changed -> update GPU positions with new blend amount
+        if (_expMapSolver.ConsumeSurfaceBlendDirty() && !_lastAllUVs.empty() && !_lastAllOrigPos.empty()) {
+            auto blended = computeBlendedPos(_expMapSolver.GetSurfaceBlend());
+            _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, blended, _texPtr);
+        }
         if (_expMapSolver.ConsumeTextureDirty()) {
             _texPtr = _expMapSolver.GetTextureLoader().getTexture();
-            if (!_lastAllUVs.empty()) _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, _lastAllSurfPos, _texPtr);
+            if (!_lastAllUVs.empty()) {
+                auto blended = computeBlendedPos(_expMapSolver.GetSurfaceBlend());
+                _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, blended, _texPtr);
+            }
         }
     }
 
 private:
+    // Compute per-Gaussian surface position interpolated by blend (0=original, 1=surface).
+    std::vector<sibr::Vector3f> computeBlendedPos(float blend) const {
+        const int n = (int)_lastAllOrigPos.size();
+        std::vector<sibr::Vector3f> out(n, sibr::Vector3f(-1.f, -1.f, -1.f));
+        for (int i = 0; i < n; ++i) {
+            if (i < (int)_lastAllUVs.size() && _lastAllUVs[i].x() >= 0.f)
+                out[i] = _lastAllOrigPos[i] + blend * (_lastAllSurfPos[i] - _lastAllOrigPos[i]);
+        }
+        return out;
+    }
+
     // -------------------------------------------------------------------------
     // Gaussian outline rendering (3-D ellipses in the mesh tangent plane)
     // -------------------------------------------------------------------------
@@ -445,6 +459,10 @@ void main() { fragColor = uColor; }
         _texPtr = _expMapSolver.GetTextureLoader().getTexture();
         if (!_texPtr) return;
 
+        // Restore GPU positions to original before reading, so cpuPos is always
+        // the true pre-snap positions (needed for correct blend origin).
+        _gaussianView->restoreOpacities();
+
         const std::set<int>& activeSet = _expMapSolver.GetActiveTriIndices();
         const std::map<int, glm::vec2>& glmUVMap = _expMapSolver.GetDisplayUVs();
         const int nGauss = _gaussianView->getCount();
@@ -454,22 +472,38 @@ void main() { fragColor = uColor; }
 
         struct TriInfo { glm::vec3 v0, v1, v2, e1, e2, n, dU, dV; float d00, d01, d11; glm::vec2 uv0, uv1, uv2; bool valid; int vi0, vi1, vi2; };
         std::vector<TriInfo> triCache;
-        for (int triID : activeSet) {
-            TriInfo ti; ti.valid = false; const auto& tri = triangles[triID];
-            ti.vi0 = tri[0]; ti.vi1 = tri[1]; ti.vi2 = tri[2];
-            if (!glmUVMap.count(tri[0]) || !glmUVMap.count(tri[1]) || !glmUVMap.count(tri[2])) { triCache.push_back(ti); continue; }
-            ti.v0 = {verts[tri[0]].x(), verts[tri[0]].y(), verts[tri[0]].z()};
-            ti.v1 = {verts[tri[1]].x(), verts[tri[1]].y(), verts[tri[1]].z()};
-            ti.v2 = {verts[tri[2]].x(), verts[tri[2]].y(), verts[tri[2]].z()};
-            ti.e1 = ti.v1 - ti.v0; ti.e2 = ti.v2 - ti.v0;
-            glm::vec3 rn = glm::cross(ti.e1, ti.e2); float ln = glm::length(rn);
-            if (ln < 1e-9f) { triCache.push_back(ti); continue; }
-            ti.n = rn/ln; ti.d00 = glm::dot(ti.e1, ti.e1); ti.d01 = glm::dot(ti.e1, ti.e2); ti.d11 = glm::dot(ti.e2, ti.e2);
-            ti.uv0 = glmUVMap.at(tri[0]); ti.uv1 = glmUVMap.at(tri[1]); ti.uv2 = glmUVMap.at(tri[2]);
-            float du1 = ti.uv1.x - ti.uv0.x, dv1 = ti.uv1.y - ti.uv0.y, du2 = ti.uv2.x - ti.uv0.x, dv2 = ti.uv2.y - ti.uv0.y, det = du1*dv2 - du2*dv1;
-            if (std::abs(det) < 1e-9f) { triCache.push_back(ti); continue; }
-            ti.dU = (dv2*ti.e1 - dv1*ti.e2)/det; ti.dV = (-du2*ti.e1 + du1*ti.e2)/det; ti.valid = true; triCache.push_back(ti);
+        // Also build a global-triID → cache-index map for O(1) fid lookup
+        std::unordered_map<int,int> triIdxToCache;
+        triIdxToCache.reserve(activeSet.size());
+        {
+            int cIdx = 0;
+            for (int triID : activeSet) {
+                triIdxToCache[triID] = cIdx++;
+                TriInfo ti; ti.valid = false; const auto& tri = triangles[triID];
+                ti.vi0 = tri[0]; ti.vi1 = tri[1]; ti.vi2 = tri[2];
+                if (!glmUVMap.count(tri[0]) || !glmUVMap.count(tri[1]) || !glmUVMap.count(tri[2])) { triCache.push_back(ti); continue; }
+                ti.v0 = {verts[tri[0]].x(), verts[tri[0]].y(), verts[tri[0]].z()};
+                ti.v1 = {verts[tri[1]].x(), verts[tri[1]].y(), verts[tri[1]].z()};
+                ti.v2 = {verts[tri[2]].x(), verts[tri[2]].y(), verts[tri[2]].z()};
+                ti.e1 = ti.v1 - ti.v0; ti.e2 = ti.v2 - ti.v0;
+                glm::vec3 rn = glm::cross(ti.e1, ti.e2); float ln = glm::length(rn);
+                if (ln < 1e-9f) { triCache.push_back(ti); continue; }
+                ti.n = rn/ln; ti.d00 = glm::dot(ti.e1, ti.e1); ti.d01 = glm::dot(ti.e1, ti.e2); ti.d11 = glm::dot(ti.e2, ti.e2);
+                ti.uv0 = glmUVMap.at(tri[0]); ti.uv1 = glmUVMap.at(tri[1]); ti.uv2 = glmUVMap.at(tri[2]);
+                float du1 = ti.uv1.x - ti.uv0.x, dv1 = ti.uv1.y - ti.uv0.y, du2 = ti.uv2.x - ti.uv0.x, dv2 = ti.uv2.y - ti.uv0.y, det = du1*dv2 - du2*dv1;
+                if (std::abs(det) < 1e-9f) { triCache.push_back(ti); continue; }
+                ti.dU = (dv2*ti.e1 - dv1*ti.e2)/det; ti.dV = (-du2*ti.e1 + du1*ti.e2)/det; ti.valid = true; triCache.push_back(ti);
+            }
         }
+
+        // Determine geo/app split: point_cloud.ply = [geo (N_geo)] ++ [app (N_app)]
+        // App Gaussians have a pre-assigned face ID; use it directly instead of
+        // nearest-triangle search to avoid steeply-inclined triangles stealing them.
+        const int nGeo = _geoRenderer.isLoaded()
+                         ? (int)(_geoRenderer.getRawData().size() / 3) : nGauss;
+        const auto& appFids = _appRenderer.getFids();
+        const bool canUseFids = _appRenderer.isLoaded() &&
+                                (int)appFids.size() == (nGauss - nGeo);
 
         const float r2 = _expMapRadius * _expMapRadius;
         const glm::vec3 ctr(hitPos.x(), hitPos.y(), hitPos.z());
@@ -480,64 +514,90 @@ void main() { fragColor = uColor; }
         std::vector<sibr::Vector3f> all_surfPos(nGauss, sibr::Vector3f(-1.f, -1.f, -1.f));
         _texGaussians.clear();
 
-        // Assign UV to ALL Gaussians within the sphere, regardless of surface distance.
-        // Each Gaussian is projected onto the closest valid triangle to obtain its UV.
         for (int k = 0; k < nGauss; ++k) {
             glm::vec3 p(cpuPos[k].x(), cpuPos[k].y(), cpuPos[k].z());
             if (glm::dot(p - ctr, p - ctr) > r2) continue;
 
-            float best = 1e18f;
             glm::vec2 bUV(0.f, 0.f);
             glm::vec3 bDU(0.f), bDV(0.f);
-            glm::vec3 bSurfPos(0.f);  // projected point on mesh surface
+            glm::vec3 bSurfPos(0.f);
             float bUVMaxDelta = 0.0f;
+            float surfDist = 1e9f;
             bool found = false;
 
-            for (const auto& ti : triCache) {
-                if (!ti.valid) continue;
+            const int appIdx = k - nGeo;
+            const bool isAppWithFid = canUseFids && appIdx >= 0 && appIdx < (int)appFids.size();
 
-                float planeDist = glm::dot(p - ti.v0, ti.n);
-                glm::vec3 pv = (p - ti.n * planeDist) - ti.v0;
-                float den = ti.d00 * ti.d11 - ti.d01 * ti.d01;
-                if (std::abs(den) < 1e-9f) continue;
-
-                float d20 = glm::dot(pv, ti.e1);
-                float d21 = glm::dot(pv, ti.e2);
-                float bv = (ti.d11 * d20 - ti.d01 * d21) / den;
-                float bw = (ti.d00 * d21 - ti.d01 * d20) / den;
-                float bu = 1.f - bv - bw;
-
-                if (bu >= -0.001f && bv >= -0.001f && bw >= -0.001f) {
-                    float d2 = planeDist * planeDist;
-                    if (d2 < best) {
-                        best = d2;
-                        bUV = bu * ti.uv0 + bv * ti.uv1 + bw * ti.uv2;
-                        bSurfPos = bu * ti.v0 + bv * ti.v1 + bw * ti.v2;
-                        // Use per-triangle tangent directly to avoid cross-seam averaging errors.
-                        // Vertices on opposite sides of a UV seam share the same 3D position
-                        // but have different UVs; averaging dU/dV across the seam is incorrect.
-                        bDU = ti.dU;
-                        bDV = ti.dV;
-                        // UV bbox half-diagonal: limits how far the shader can extrapolate
-                        // from the Gaussian center UV, preventing seam-boundary artifacts.
-                        glm::vec2 uvMin = glm::min(glm::min(ti.uv0, ti.uv1), ti.uv2);
-                        glm::vec2 uvMax = glm::max(glm::max(ti.uv0, ti.uv1), ti.uv2);
-                        bUVMaxDelta = glm::length(uvMax - uvMin) * 0.5f;
-                        found = true;
+            // App Gaussian: try fid-based projection first to avoid inclined-triangle error.
+            if (isAppWithFid) {
+                int fid = appFids[appIdx];
+                auto it = triIdxToCache.find(fid);
+                if (it != triIdxToCache.end()) {
+                    const TriInfo& ti = triCache[it->second];
+                    if (ti.valid) {
+                        float planeDist = glm::dot(p - ti.v0, ti.n);
+                        glm::vec3 pv = (p - ti.n * planeDist) - ti.v0;
+                        float den = ti.d00 * ti.d11 - ti.d01 * ti.d01;
+                        if (std::abs(den) >= 1e-9f) {
+                            float d20 = glm::dot(pv, ti.e1);
+                            float d21 = glm::dot(pv, ti.e2);
+                            float bv = (ti.d11 * d20 - ti.d01 * d21) / den;
+                            float bw = (ti.d00 * d21 - ti.d01 * d20) / den;
+                            float bu = 1.f - bv - bw;
+                            bUV      = bu * ti.uv0 + bv * ti.uv1 + bw * ti.uv2;
+                            bSurfPos = bu * ti.v0   + bv * ti.v1   + bw * ti.v2;
+                            bDU = ti.dU; bDV = ti.dV;
+                            glm::vec2 uvMin = glm::min(glm::min(ti.uv0, ti.uv1), ti.uv2);
+                            glm::vec2 uvMax = glm::max(glm::max(ti.uv0, ti.uv1), ti.uv2);
+                            bUVMaxDelta = glm::length(uvMax - uvMin) * 0.5f;
+                            surfDist = std::abs(planeDist);
+                            found = true;
+                        }
                     }
                 }
             }
 
+            // Geo Gaussians, and app Gaussians whose bound triangle is not in the
+            // active set: fall back to nearest-triangle (preserves original behaviour).
+            if (!found) {
+                float best = 1e18f;
+                for (const auto& ti : triCache) {
+                    if (!ti.valid) continue;
+                    float planeDist = glm::dot(p - ti.v0, ti.n);
+                    glm::vec3 pv = (p - ti.n * planeDist) - ti.v0;
+                    float den = ti.d00 * ti.d11 - ti.d01 * ti.d01;
+                    if (std::abs(den) < 1e-9f) continue;
+                    float d20 = glm::dot(pv, ti.e1);
+                    float d21 = glm::dot(pv, ti.e2);
+                    float bv = (ti.d11 * d20 - ti.d01 * d21) / den;
+                    float bw = (ti.d00 * d21 - ti.d01 * d20) / den;
+                    float bu = 1.f - bv - bw;
+                    if (bu >= -0.001f && bv >= -0.001f && bw >= -0.001f) {
+                        float d2 = planeDist * planeDist;
+                        if (d2 < best) {
+                            best = d2;
+                            bUV      = bu * ti.uv0 + bv * ti.uv1 + bw * ti.uv2;
+                            bSurfPos = bu * ti.v0   + bv * ti.v1   + bw * ti.v2;
+                            bDU = ti.dU; bDV = ti.dV;
+                            glm::vec2 uvMin = glm::min(glm::min(ti.uv0, ti.uv1), ti.uv2);
+                            glm::vec2 uvMax = glm::max(glm::max(ti.uv0, ti.uv1), ti.uv2);
+                            bUVMaxDelta = glm::length(uvMax - uvMin) * 0.5f;
+                            found = true;
+                        }
+                    }
+                }
+                if (found) surfDist = std::sqrt(best);
+            }
+
             if (!found) continue;
 
-            all_uvs[k]      = { bUV.x, bUV.y };
-            all_dUs[k]      = { bDU.x, bDU.y, bDU.z };
-            all_dVs[k]      = { bDV.x, bDV.y, bDV.z };
-            all_surfDists[k]= std::sqrt(best);
-            all_surfPos[k]  = { bSurfPos.x, bSurfPos.y, bSurfPos.z };
+            all_uvs[k]       = { bUV.x, bUV.y };
+            all_dUs[k]       = { bDU.x, bDU.y, bDU.z };
+            all_dVs[k]       = { bDV.x, bDV.y, bDV.z };
+            all_surfDists[k] = surfDist;
+            all_surfPos[k]   = { bSurfPos.x, bSurfPos.y, bSurfPos.z };
 
             ProjectedGaussian pg;
-            // position = projected onto mesh surface, removes normal offset from Gaussian to mesh
             pg.originalIndex = k; pg.position = bSurfPos; pg.originalPos = p;
             pg.uv = bUV; pg.dU = bDU; pg.dV = bDV; pg.uvMaxDelta = bUVMaxDelta;
             float opc = std::max(1e-4f, std::min(1.f - 1e-4f, cpuOpacity[k]));
@@ -552,19 +612,24 @@ void main() { fragColor = uColor; }
         _expMapSolver.ClearSuppressedUVs();
         _lastAllUVs = all_uvs; _lastAllDUs = all_dUs; _lastAllDVs = all_dVs;
         _lastAllSurfDists = all_surfDists; _lastAllSurfPos = all_surfPos;
+        // Save original positions (cpuPos is already restored to pre-snap state above)
+        _lastAllOrigPos.resize(nGauss);
+        for (int i = 0; i < nGauss; ++i) _lastAllOrigPos[i] = cpuPos[i];
         _expMapSolver.SetMainGaussiansForNextSave(_texGaussians);
-        _gaussianView->restoreOpacities();
-        _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, all_surfDists, all_surfPos, _texPtr);
+        // Reset blend to 0: Gaussians start at their original positions
+        _expMapSolver.ResetSurfaceBlend();
+        // Upload UV data; snap target = original positions (blend=0, no movement yet)
+        _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, all_surfDists, _lastAllOrigPos, _texPtr);
         // record hit position for toggle reuse
         _lastHitPos    = sibr::Vector3f(hitPos.x(), hitPos.y(), hitPos.z());
         _lastExpRadius = _expMapRadius;
         // suppress non-UV gaussians inside texture region to prevent occlusion
-        _gaussianView->suppressGaussiansInRegion(
-            all_uvs,
-            _lastHitPos,
-            _expMapRadius,
-            all_surfDists
-        );
+        // _gaussianView->suppressGaussiansInRegion(
+        //     all_uvs,
+        //     _lastHitPos,
+        //     _expMapRadius,
+        //     all_surfDists
+        // );
     }
 
     GaussianView::Ptr               _gaussianView;
@@ -587,6 +652,7 @@ void main() { fragColor = uColor; }
     std::vector<sibr::Vector2f>     _lastAllUVs;
     std::vector<sibr::Vector3f>     _lastAllDUs, _lastAllDVs;
     std::vector<sibr::Vector3f>     _lastAllSurfPos;
+    std::vector<sibr::Vector3f>     _lastAllOrigPos;
     std::vector<float>              _lastAllSurfDists;
     sibr::Vector3f                  _lastHitPos   = sibr::Vector3f(0,0,0);
     float                           _lastExpRadius = 0.5f;

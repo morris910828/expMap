@@ -126,7 +126,7 @@ public:
         _surfaceBlendDirty = false;
         return d;
     }
-    void ResetSurfaceBlend() { _surfaceBlend = 1.0f; _surfaceBlendDirty = false; }
+    void ResetSurfaceBlend() { _surfaceBlend = 0.0f; _surfaceBlendDirty = true; }
 
     float GetSurfDistThreshold() const { return _surfDistThreshold; }
     bool ConsumeSurfDistThresholdDirty() {
@@ -596,14 +596,6 @@ public:
             ImGui::Checkbox("Show Geo", &_showGeoPoints);
             ImGui::SameLine();
             ImGui::Checkbox("Show Suppressed", &_showSuppressedPoints);
-            ImGui::SameLine();
-            ImGui::Checkbox("Surf Depth", &_showSurfaceDepth);
-            if (_showSurfaceDepth) {
-                ImGui::SameLine();
-                ImGui::PushItemWidth(100.f);
-                ImGui::SliderFloat("Max", &_surfDepthMax, 0.01f, 2.0f, "%.2f");
-                ImGui::PopItemWidth();
-            }
 
             {
                 float prev = _surfaceBlend;
@@ -790,12 +782,9 @@ public:
                                         const std::vector<int>& selIds, bool isGeo) {
                     for (const auto& pt : pts) {
                         if (!passFilter(pt)) continue;
-                        // When surface depth mode is on, sort by true surface distance
-                        // so that far (blue) points are painted first and near (red)
-                        // points sit on top — consistent with the colour mapping.
-                        float d = _showSurfaceDepth
-                            ? glm::length(pt.originalPos - pt.position)
-                            : std::abs(glm::dot(pt.position - hitO, hitN));
+                        // Sort by true surface distance: far (blue) points drawn first,
+                        // near (red) points drawn on top — consistent with colour mapping.
+                        float d = glm::length(pt.originalPos - pt.position);
                         bool sel = std::find(selIds.begin(), selIds.end(), pt.originalIndex) != selIds.end();
                         GEntry e{&pt, d, isGeo, sel};
                         if (sel) selEntries.push_back(e);
@@ -902,37 +891,24 @@ public:
                     dl->AddPolyline(pts,N_SEGS,outlineCol,true,1.0f);
                 };
 
-                if (_showSurfaceDepth) {
-                    for (int ei=0;ei<(int)nonSelEntries.size();ei++){
-                        const GEntry& e=nonSelEntries[ei];
-                        // Distance from surface, shrunk by blend factor (0=original, 1=on surface).
+                {
+                    // Auto depth max: deepest point in the selected region = full blue.
+                    float autoDepthMax = 1e-6f;
+                    for (const auto& e : nonSelEntries)
+                        autoDepthMax = std::max(autoDepthMax, glm::length(e.pg->originalPos - e.pg->position));
+                    for (const auto& e : selEntries)
+                        autoDepthMax = std::max(autoDepthMax, glm::length(e.pg->originalPos - e.pg->position));
+
+                    for (int ei = 0; ei < (int)nonSelEntries.size(); ei++) {
+                        const GEntry& e = nonSelEntries[ei];
                         float d = glm::length(e.pg->originalPos - e.pg->position) * (1.0f - _surfaceBlend);
-                        float t = glm::clamp(powf(d / _surfDepthMax, 0.3f), 0.f, 1.f);
+                        float t = glm::clamp(powf(d / autoDepthMax, 0.3f), 0.f, 1.f);
                         int r = (int)(255.f * (1.f - t));
                         int b = (int)(255.f * t);
-                        ImU32 fC = IM_COL32(r, 0, b, 150);
-                        ImU32 oC = IM_COL32(r, 0, b, 255);
-                        drawEllipse(e, fC, oC, false);
+                        drawEllipse(e, IM_COL32(r, 0, b, 150), IM_COL32(r, 0, b, 255), false);
                     }
-
-                    for (int ei=0;ei<(int)selEntries.size();ei++){
-                        const GEntry& e=selEntries[ei];
-                        drawEllipse(e, IM_COL32(255,255,0,150), IM_COL32(255,255,0,255));
-                    }
-                } else {
-                    // Draw small dots: Geo = Red, App = Blue
-                    for (const auto& e : nonSelEntries) {
-                        ImVec2 ctr = TransformUV(e.pg->uv);
-                        if (ctr.x >= canvasX0 && ctr.x <= canvasX1 && ctr.y >= canvasY0 && ctr.y <= canvasY1) {
-                            ImU32 col = e.isGeo ? IM_COL32(255, 0, 0, 255) : IM_COL32(0, 0, 255, 255);
-                            dl->AddCircleFilled(ctr, 3.0f, col);
-                        }
-                    }
-                    for (const auto& e : selEntries) {
-                        ImVec2 ctr = TransformUV(e.pg->uv);
-                        if (ctr.x >= canvasX0 && ctr.x <= canvasX1 && ctr.y >= canvasY0 && ctr.y <= canvasY1) {
-                            dl->AddCircleFilled(ctr, 3.0f, IM_COL32(255, 255, 0, 255));
-                        }
+                    for (int ei = 0; ei < (int)selEntries.size(); ei++) {
+                        drawEllipse(selEntries[ei], IM_COL32(255, 255, 0, 150), IM_COL32(255, 255, 0, 255));
                     }
                 }
             }
@@ -1668,8 +1644,6 @@ private:
     
     bool   _showAppPoints    = true;
     bool   _showGeoPoints    = true;
-    bool   _showSurfaceDepth = false;
-    float  _surfDepthMax     = 0.6f;
 
     std::vector<ProjectedGaussian> _projectedAppPoints;
     std::vector<ProjectedGaussian> _projectedGeoPoints;
