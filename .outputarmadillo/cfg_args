@@ -1,0 +1,1 @@
+Namespace(data_device='cuda', depths='', eval=True, images='images', model_path='.outputarmadillo', resolution=-1, sh_degree=3, source_path='/mnt/d/SGGaussians/SGGaussians/.dataarmadillo', train_test_exp=False, white_background=True)
