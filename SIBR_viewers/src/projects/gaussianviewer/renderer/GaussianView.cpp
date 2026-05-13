@@ -612,31 +612,24 @@ void sibr::GaussianView::setUVsAndTexture(
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(dV_cuda,          dVs.data(),          sizeof(float) * count * 3, cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(surfaceDist_cuda, surfaceDists.data(), sizeof(float) * count,     cudaMemcpyHostToDevice));
 
-	// Snap UV Gaussians onto the mesh surface.
-	// The ray-plane intersection in renderCUDA uses means3D (= pos_cuda) as the plane
-	// origin. If the Gaussian floats above the surface by surfaceDist, the tangent plane
-	// drifts away from the mesh and causes severe UV stretching when viewed from the side.
-	// Moving the center to the projected surface point fixes this at its root.
-	if ((int)surfacePositions.size() == count) {
-		// Cache original positions for restoreOpacities().
-		if (_cpuPosCache.empty()) {
-			_cpuPosCache.resize(count);
-			cudaMemcpy(_cpuPosCache.data(), pos_cuda,
-			           sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
-		}
-
-		std::vector<float> snappedPos(count * 3);
-		// Start from current GPU positions so non-UV Gaussians are untouched.
-		cudaMemcpy(snappedPos.data(), pos_cuda, sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
-		for (int i = 0; i < count; ++i) {
-			if (uvs[i].x() < 0.f) continue;
-			snappedPos[3*i+0] = surfacePositions[i].x();
-			snappedPos[3*i+1] = surfacePositions[i].y();
-			snappedPos[3*i+2] = surfacePositions[i].z();
-		}
-		cudaMemcpy(pos_cuda, snappedPos.data(), sizeof(float) * count * 3, cudaMemcpyHostToDevice);
-		_cpuPos.clear(); // invalidate cached CPU positions
-	}
+	// [DISABLED] Snap UV Gaussians onto the mesh surface.
+	// if ((int)surfacePositions.size() == count) {
+	// 	if (_cpuPosCache.empty()) {
+	// 		_cpuPosCache.resize(count);
+	// 		cudaMemcpy(_cpuPosCache.data(), pos_cuda,
+	// 		           sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
+	// 	}
+	// 	std::vector<float> snappedPos(count * 3);
+	// 	cudaMemcpy(snappedPos.data(), pos_cuda, sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
+	// 	for (int i = 0; i < count; ++i) {
+	// 		if (uvs[i].x() < 0.f) continue;
+	// 		snappedPos[3*i+0] = surfacePositions[i].x();
+	// 		snappedPos[3*i+1] = surfacePositions[i].y();
+	// 		snappedPos[3*i+2] = surfacePositions[i].z();
+	// 	}
+	// 	cudaMemcpy(pos_cuda, snappedPos.data(), sizeof(float) * count * 3, cudaMemcpyHostToDevice);
+	// 	_cpuPos.clear();
+	// }
 
 	_hasUVSurface = false; // uvFixedDepth path disabled; depth bias in preprocessCUDA handles ordering
 
