@@ -128,6 +128,7 @@ public:
     }
     void ResetSurfaceBlend() { _surfaceBlend = 0.0f; _surfaceBlendDirty = true; }
 
+    float GetSurfDistMin()       const { return _surfDistMin; }
     float GetSurfDistThreshold() const { return _surfDistThreshold; }
     bool ConsumeSurfDistThresholdDirty() {
         bool d = _surfDistThresholdDirty;
@@ -215,6 +216,7 @@ public:
         _liveDirty = true;
         _suppressedUVs.clear();
 
+        _surfDistMin            = 0.f;
         _surfDistThreshold      = 1e9f;
         _computedMaxSurfDist    = 1.0f;
         _surfDistThresholdDirty = false;
@@ -596,23 +598,79 @@ public:
             ImGui::Checkbox("Show Geo", &_showGeoPoints);
             ImGui::SameLine();
             ImGui::Checkbox("Show Suppressed", &_showSuppressedPoints);
+            // Legend: transparency encodes surface distance
+            ImGui::TextColored(ImVec4(1.f,0.3f,0.3f,1.f), "Red: all pts");
+            ImGui::SameLine(0,12);
+            ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1.f), "Transparent=near mesh");
+            ImGui::SameLine(0,12);
+            ImGui::TextColored(ImVec4(1.f,0.3f,0.3f,1.f), "Opaque=far from mesh");
 
             {
-                float prev = _surfaceBlend;
-                ImGui::PushItemWidth(-1.f);
-                ImGui::SliderFloat("Surface Blend##sb", &_surfaceBlend, 0.0f, 1.0f, "Surface Blend %.2f");
-                ImGui::PopItemWidth();
-                if (_surfaceBlend != prev) _surfaceBlendDirty = true;
-            }
-
-            {
+                // Two-thumb range slider for surface distance filter
                 float sliderMax = (_computedMaxSurfDist > 1e-6f) ? _computedMaxSurfDist : 1.0f;
-                _surfDistThreshold = std::min(_surfDistThreshold, sliderMax);
-                float prev = _surfDistThreshold;
-                ImGui::PushItemWidth(-1.f);
-                ImGui::SliderFloat("Dist Cutoff##sdc", &_surfDistThreshold, 0.0f, sliderMax, "Dist Cutoff %.4f");
-                ImGui::PopItemWidth();
-                if (_surfDistThreshold != prev) _surfDistThresholdDirty = true;
+                _surfDistMin       = glm::clamp(_surfDistMin,       0.f, sliderMax);
+                _surfDistThreshold = glm::clamp(_surfDistThreshold, 0.f, sliderMax);
+
+                // --- Range slider widget ---
+                const float TH = 5.f, TR = 7.f, WH = TR * 2.f + 6.f;
+                ImVec2 pos = ImGui::GetCursorScreenPos();
+                float  w   = ImGui::GetContentRegionAvail().x;
+                if (w < 40.f) w = 40.f;
+                float tx0 = pos.x + TR + 4.f;
+                float tx1 = pos.x + w  - TR - 4.f;
+                float tw  = tx1 - tx0;
+                float ty  = pos.y + WH * 0.5f;
+
+                auto v2x = [&](float v) { return tx0 + (v / sliderMax) * tw; };
+                auto x2v = [&](float x) { return glm::clamp((x - tx0) / tw, 0.f, 1.f) * sliderMax; };
+
+                float lx = v2x(_surfDistMin);
+                float hx = v2x(_surfDistThreshold);
+
+                ImGui::InvisibleButton("##distrange", ImVec2(w, WH));
+                bool active = ImGui::IsItemActive();
+                static int  dragging  = 0;
+                static bool prevActive = false;
+                bool justActivated = active && !prevActive;
+                prevActive = active;
+                if (justActivated) {
+                    float mx = ImGui::GetIO().MousePos.x;
+                    dragging = (std::abs(mx - lx) <= std::abs(mx - hx)) ? 1 : 2;
+                }
+                if (!active) dragging = 0;
+
+                bool changed = false;
+                if (active && dragging) {
+                    float val = x2v(ImGui::GetIO().MousePos.x);
+                    if (dragging == 1) { _surfDistMin       = std::min(val, _surfDistThreshold); changed = true; }
+                    else               { _surfDistThreshold = std::max(val, _surfDistMin);       changed = true; }
+                    lx = v2x(_surfDistMin);
+                    hx = v2x(_surfDistThreshold);
+                }
+                if (changed) _surfDistThresholdDirty = true;
+
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                // Track background
+                dl->AddRectFilled(ImVec2(tx0, ty - TH*.5f), ImVec2(tx1, ty + TH*.5f),
+                                  IM_COL32(70,70,70,255), TH);
+                // Active range fill
+                dl->AddRectFilled(ImVec2(lx, ty - TH*.5f), ImVec2(hx, ty + TH*.5f),
+                                  IM_COL32(60,140,220,255), TH);
+                // Lo thumb
+                ImU32 lcol = (dragging==1) ? IM_COL32(255,255,255,255) : IM_COL32(210,210,210,255);
+                dl->AddCircleFilled(ImVec2(lx, ty), TR, lcol);
+                dl->AddCircle(ImVec2(lx, ty), TR, IM_COL32(50,50,50,200), 16, 1.5f);
+                // Hi thumb
+                ImU32 hcol = (dragging==2) ? IM_COL32(255,255,255,255) : IM_COL32(210,210,210,255);
+                dl->AddCircleFilled(ImVec2(hx, ty), TR, hcol);
+                dl->AddCircle(ImVec2(hx, ty), TR, IM_COL32(50,50,50,200), 16, 1.5f);
+                // Value label centred below track
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Dist [%.4f .. %.4f]", _surfDistMin, _surfDistThreshold);
+                ImVec2 tsz = ImGui::CalcTextSize(buf);
+                dl->AddText(ImVec2(pos.x + (w - tsz.x) * .5f, pos.y + WH + 2.f),
+                            IM_COL32(200,200,200,255), buf);
+                ImGui::Dummy(ImVec2(w, 14.f));  // reserve space for label
             }
 
             ImVec2 p = ImGui::GetCursorScreenPos();
@@ -774,7 +832,7 @@ public:
                     glm::vec3 sExp = glm::exp(pt.scale);
                     if (std::max({sExp.x, sExp.y, sExp.z}) > maxScale3DExp) return false;
                     float surfDist = glm::length(pt.originalPos - pt.position);
-                    if (surfDist > _surfDistThreshold) return false;
+                    if (surfDist < _surfDistMin || surfDist > _surfDistThreshold) return false;
                     return true;
                 };
 
@@ -782,8 +840,8 @@ public:
                                         const std::vector<int>& selIds, bool isGeo) {
                     for (const auto& pt : pts) {
                         if (!passFilter(pt)) continue;
-                        // Sort by true surface distance: far (blue) points drawn first,
-                        // near (red) points drawn on top — consistent with colour mapping.
+                        // Sort by true surface distance: far points drawn first,
+                        // near points drawn on top — consistent with colour mapping.
                         float d = glm::length(pt.originalPos - pt.position);
                         bool sel = std::find(selIds.begin(), selIds.end(), pt.originalIndex) != selIds.end();
                         GEntry e{&pt, d, isGeo, sel};
@@ -901,11 +959,15 @@ public:
 
                     for (int ei = 0; ei < (int)nonSelEntries.size(); ei++) {
                         const GEntry& e = nonSelEntries[ei];
-                        float d = glm::length(e.pg->originalPos - e.pg->position) * (1.0f - _surfaceBlend);
-                        float t = glm::clamp(powf(d / autoDepthMax, 0.3f), 0.f, 1.f);
-                        int r = (int)(255.f * (1.f - t));
-                        int b = (int)(255.f * t);
-                        drawEllipse(e, IM_COL32(r, 0, b, 150), IM_COL32(r, 0, b, 255), false);
+                        float d = glm::length(e.pg->originalPos - e.pg->position);
+                        // Linear: close to mesh = transparent, far = opaque
+                        float t = glm::clamp(d / autoDepthMax, 0.f, 1.f);
+                        int fill_a    = (int)(80.f + t * 170.f);  // 80 (near) -> 250 (far)
+                        int outline_a = (int)(80.f + t * 175.f);  // 80 (near) -> 255 (far)
+                        // Uniform red; alpha encodes surface distance
+                        ImU32 fillCol    = IM_COL32(220, 30, 30, fill_a);
+                        ImU32 outlineCol = IM_COL32(255, 60, 60, outline_a);
+                        drawEllipse(e, fillCol, outlineCol, false);
                     }
                     for (int ei = 0; ei < (int)selEntries.size(); ei++) {
                         drawEllipse(selEntries[ei], IM_COL32(255, 255, 0, 150), IM_COL32(255, 255, 0, 255));
@@ -1505,6 +1567,7 @@ private:
         for (const auto& pg : _projectedAppPoints)
             maxD = std::max(maxD, glm::length(pg.originalPos - pg.position));
         _computedMaxSurfDist = (maxD > 1e-6f) ? maxD * 1.1f : 1.0f;
+        _surfDistMin       = 0.f;
         _surfDistThreshold = _computedMaxSurfDist;  // Default: show all
     }
     
@@ -1684,6 +1747,7 @@ private:
     float _surfaceBlend      = 1.0f;
     bool  _surfaceBlendDirty = false;
 
+    float _surfDistMin            = 0.f;
     float _surfDistThreshold      = 1e9f;
     float _computedMaxSurfDist    = 1.0f;
     bool  _surfDistThresholdDirty = false;
