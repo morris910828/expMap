@@ -111,9 +111,10 @@ public:
             ImGui::Checkbox("Show Texture", &_showTexture);
             if (_showTexture != prevShowTex && !_lastAllUVs.empty()) {
                 _gaussianView->restoreOpacities();
+                auto blended = computeBlendedPos(_expMapSolver.GetSurfaceBlend());
                 _gaussianView->setUVsAndTexture(
                     _lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists,
-                    _lastAllOrigPos,
+                    blended,
                     _showTexture ? _texPtr : nullptr
                 );
             }
@@ -133,10 +134,16 @@ public:
         }
         ImGui::End();
         _expMapSolver.RenderUI();
+        // Surface blend slider changed -> update GPU positions with new blend amount
+        if (_expMapSolver.ConsumeSurfaceBlendDirty() && !_lastAllUVs.empty() && !_lastAllOrigPos.empty()) {
+            auto blended = computeBlendedPos(_expMapSolver.GetSurfaceBlend());
+            _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, blended, _texPtr);
+        }
         if (_expMapSolver.ConsumeTextureDirty()) {
             _texPtr = _expMapSolver.GetTextureLoader().getTexture();
             if (!_lastAllUVs.empty()) {
-                _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, _lastAllOrigPos, _texPtr);
+                auto blended = computeBlendedPos(_expMapSolver.GetSurfaceBlend());
+                _gaussianView->setUVsAndTexture(_lastAllUVs, _lastAllDUs, _lastAllDVs, _lastAllSurfDists, blended, _texPtr);
             }
         }
     }
@@ -218,6 +225,11 @@ void main() { fragColor = uColor; }
         // The 3D covariance is projected onto the mesh tangent plane (dU/dV),
         // giving the actual footprint shape, size and orientation on the surface.
         // ---------------------------------------------------------------
+        const float outlineBlend = _expMapSolver.GetSurfaceBlend();
+        auto blendedCenter = [&](const ProjectedGaussian& pg) -> glm::vec3 {
+            return pg.originalPos + outlineBlend * (pg.position - pg.originalPos);
+        };
+
         auto makeRing = [&](const ProjectedGaussian& pg) -> std::vector<glm::vec3> {
             // Quaternion layout: rotation.x=w, .y=x, .z=y, .w=z
             const float qw = pg.rotation.x, qx = pg.rotation.y;
@@ -245,7 +257,7 @@ void main() { fragColor = uColor; }
                 if (sArr[idx[0]] < sArr[idx[2]]) std::swap(idx[0], idx[2]);
                 if (sArr[idx[1]] < sArr[idx[2]]) std::swap(idx[1], idx[2]);
                 std::vector<glm::vec3> ring(SEGS);
-                const glm::vec3 ctr0 = pg.originalPos;
+                const glm::vec3 ctr0 = blendedCenter(pg);
                 for (int i = 0; i < SEGS; ++i) {
                     const float phi = 2.f * kPi * i / SEGS;
                     ring[i] = ctr0 + sArr[idx[0]]*std::cos(phi)*R[idx[0]]
@@ -296,7 +308,7 @@ void main() { fragColor = uColor; }
             const glm::vec3 axisB = semiB * (ev2.x * t1 + ev2.y * t2);
 
             std::vector<glm::vec3> ring(SEGS);
-            const glm::vec3 ctr1 = pg.originalPos;
+            const glm::vec3 ctr1 = blendedCenter(pg);
             for (int i = 0; i < SEGS; ++i) {
                 const float phi = 2.f * kPi * i / SEGS;
                 ring[i] = ctr1 + std::cos(phi)*axisA + std::sin(phi)*axisB;
@@ -342,18 +354,15 @@ void main() { fragColor = uColor; }
         std::vector<DrawItem> items;
         items.reserve(geoPoints.size() + appPoints.size());
 
-        const float surfDistMin = _expMapSolver.GetSurfDistMin();
-        const float surfDistMax = _expMapSolver.GetSurfDistThreshold();
+        const float surfDistThreshold = _expMapSolver.GetSurfDistThreshold();
         for (const auto& pg : geoPoints) {
-            float d = glm::length(pg.originalPos - pg.position);
-            if (d < surfDistMin || d > surfDistMax) continue;
-            float depth = glm::dot(pg.originalPos - camPos, camFwd);
+            if (glm::length(pg.originalPos - pg.position) > surfDistThreshold) continue;
+            float depth = glm::dot(blendedCenter(pg) - camPos, camFwd);
             items.push_back({&pg, true, depth});
         }
         for (const auto& pg : appPoints) {
-            float d = glm::length(pg.originalPos - pg.position);
-            if (d < surfDistMin || d > surfDistMax) continue;
-            float depth = glm::dot(pg.originalPos - camPos, camFwd);
+            if (glm::length(pg.originalPos - pg.position) > surfDistThreshold) continue;
+            float depth = glm::dot(blendedCenter(pg) - camPos, camFwd);
             items.push_back({&pg, false, depth});
         }
 
@@ -392,10 +401,10 @@ void main() { fragColor = uColor; }
         int drawnGeo = 0, drawnApp = 0;
         for (const auto& item : items) {
             if (item.isGeo) {
-                drawOne(makeRing(*item.pg), item.pg->originalPos, colorLoc, 1.f, 0.2f, 0.2f);
+                drawOne(makeRing(*item.pg), blendedCenter(*item.pg), colorLoc, 1.f, 0.2f, 0.2f);
                 ++drawnGeo;
             } else {
-                drawOne(makeRing(*item.pg), item.pg->originalPos, colorLoc, 0.2f, 0.5f, 1.f);
+                drawOne(makeRing(*item.pg), blendedCenter(*item.pg), colorLoc, 0.2f, 0.5f, 1.f);
                 ++drawnApp;
             }
         }

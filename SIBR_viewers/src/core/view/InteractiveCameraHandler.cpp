@@ -26,7 +26,7 @@
 namespace sibr {
 
 	InteractiveCameraHandler::InteractiveCameraHandler(const bool supportRecording) : _trackball(true) {
-		_currentMode = TRACKBALL;
+		_currentMode = FPS;
 		_shouldSmooth = IBRVIEW_USESMOOTHCAM;
 		_startCam = 0;
 		_interpFactor = 0;

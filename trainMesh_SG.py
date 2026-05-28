@@ -327,14 +327,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             torch.cuda.empty_cache()
             print(f"Stage 3 init: pruned {prune_mask.sum().item()} low-opacity app Gaussians")
     # Stage 3
-    # Opacity regularisation constants — penalise app Gaussians that fall below
-    # OPACITY_FLOOR.  Keeps occluded faces from collapsing to fully transparent.
-    _OPACITY_FLOOR      = 0.5    # sigmoid threshold; tune up if holes persist
-    _LAMBDA_OPAC_REG    = 0.1    # weight; tune down if over-opaque artefacts appear
-    _OPACITY_HARD_FLOOR = -2.944 # logit(0.05): hard clamp — app opacity never falls below 5%
-    _SCALE_FLOOR_RATIO  = 0.5    # min in-plane scale as fraction of face longest edge
-    _LAMBDA_SCALE_FLOOR = 0.1    # weight for soft floor loss
-
     progress_bar = tqdm(range(third_iter, opt.iterations), desc="Stage 3 Training progress")
     third_iter += 1
     for iteration in range(third_iter, opt.iterations + 1):
@@ -391,28 +383,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         app_vr = gaussians.get_app_vertex_radius
         if app_vr is not None:
             mrloss = mesh_vertex_restrict_loss(gaussians.get_app_scaling, app_vr, weight=1.0)
-            # Scale floor: reference face longest edge so the floor scales with face size.
-            # Use min(s_x, s_y) so both in-plane axes stay above floor (prevents needles).
-            app_face_longest = gaussians.get_app_face_longest_edge
-            app_s_inplane = gaussians.get_app_scaling[:, :2].min(dim=1).values
-            scale_floor_loss = _LAMBDA_SCALE_FLOOR * torch.clamp(
-                app_face_longest * _SCALE_FLOOR_RATIO - app_s_inplane, min=0.0
-            ).mean()
         else:
             vert1, ver2, vert3 = gaussians.get_vertex
             mrloss = mesh_restrict_loss(gaussians.get_app_scaling, vert1, ver2, vert3, weight=1.0)
-            scale_floor_loss = 0.0
 
-        # Opacity regularisation: hinge loss on app Gaussian opacity
-        if gaussians._added_opacity is not None and gaussians._added_opacity.shape[0] > 0:
-            app_opac = torch.sigmoid(gaussians._added_opacity)
-            opacity_reg = _LAMBDA_OPAC_REG * torch.mean(
-                torch.clamp(_OPACITY_FLOOR - app_opac, min=0.0)
-            )
-        else:
-            opacity_reg = 0.0
-
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + dis_loss + aniso_loss + mrloss + scale_floor_loss + opacity_reg
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + dis_loss + aniso_loss + mrloss
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -459,11 +434,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune_sg3(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-
-                # reset_opacity intentionally removed from Stage 3:
-                # mrloss + dis_loss already constrain geometry; periodic resets
-                # prevent occluded-face Gaussians from recovering opacity.
-
+                
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -479,22 +452,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # A soft loss is insufficient — appearance loss always wins and tilts the Gaussians.
                 gaussians.snap_rotations_to_normals()
 
-                # Hard floor: prevent app Gaussian opacity from collapsing to transparent.
-                if gaussians._added_opacity is not None:
-                    gaussians._added_opacity.data.clamp_(min=_OPACITY_HARD_FLOOR)
-
-                # Hard floor: prevent app Gaussian in-plane scales from collapsing too small.
-                # Soft loss alone is insufficient — image loss always wins and shrinks Gaussians.
-                gaussians.clamp_app_scale_floor(ratio=_SCALE_FLOOR_RATIO)
-
-                # Fill faces whose opacity-weighted coverage is below threshold.
-                if iteration % 200 == 0:
-                    n_filled = gaussians.fill_uncovered_faces(
-                        coverage_threshold=0.5, max_new=500
-                    )
-                    if n_filled > 0:
-                        print(f"\n[ITER {iteration}] Filled {n_filled} uncovered faces")
-                        torch.cuda.empty_cache()
+                #gaussians._opacity.clamp_(max=0.25)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

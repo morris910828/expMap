@@ -41,65 +41,6 @@ print(f"  貼近表面 (|d|<0.01): {(np.abs(signed_dist)<0.01).sum()}")
 print(f"  表面上方 (d>0.01)  : {(signed_dist>0.01).sum()}")
 print(f"  表面下方 (d<-0.01) : {(signed_dist<-0.01).sum()}")
 
-# ── 覆蓋率分析 ─────────────────────────────────────────────────────────────────
-num_faces   = len(mesh.faces)
-num_gauss   = len(pts)
-abs_dist    = np.abs(signed_dist)
-
-# 每個面被「表面附近 Gaussian」指向幾次（用最近面 ID 統計）
-THRESHOLDS  = [0.01, 0.05, 0.10]
-
-print()
-print("━" * 55)
-print("  Mesh 覆蓋率分析")
-print("━" * 55)
-print(f"  網格總面數      : {num_faces:>10,}")
-print(f"  Gaussian 總數   : {num_gauss:>10,}")
-
-for thr in THRESHOLDS:
-    mask_near   = abs_dist <= thr
-    faces_near  = tri_ids[mask_near]                        # 距離 ≤ thr 的 Gaussian 的所在面
-    covered     = np.unique(faces_near)
-    n_covered   = len(covered)
-    n_uncovered = num_faces - n_covered
-    pct         = n_covered / num_faces * 100
-    print()
-    print(f"  ┌─ 閾值 |d| ≤ {thr:.2f}")
-    print(f"  │  覆蓋面數      : {n_covered:>8,} / {num_faces:,}  ({pct:.1f}%)")
-    print(f"  │  未覆蓋面數    : {n_uncovered:>8,}              ({100-pct:.1f}%)")
-    print(f"  └─ 有效 Gaussian : {mask_near.sum():>8,}")
-
-# 使用最小閾值計算每面 Gaussian 分布
-thr_main    = THRESHOLDS[0]
-mask_main   = abs_dist <= thr_main
-counts_per_face = np.bincount(tri_ids[mask_main], minlength=num_faces)
-
-print()
-print(f"  每面 Gaussian 數分布  (閾值 |d| ≤ {thr_main})")
-brackets = [(0, 0), (1, 1), (2, 2), (3, 5), (6, 10), (11, None)]
-for lo, hi in brackets:
-    if hi is None:
-        mask_b = counts_per_face >= lo
-        label  = f"≥{lo:>2} 個"
-    elif lo == hi:
-        mask_b = counts_per_face == lo
-        label  = f"  {lo:>2} 個"
-    else:
-        mask_b = (counts_per_face >= lo) & (counts_per_face <= hi)
-        label  = f"{lo:>2}~{hi} 個"
-    n_b = mask_b.sum()
-    bar_len = int(n_b / num_faces * 30)
-    bar = "█" * bar_len
-    print(f"    {label} : {n_b:>8,}  ({n_b/num_faces*100:5.1f}%)  {bar}")
-
-mean_cov = counts_per_face.mean()
-median_cov = np.median(counts_per_face)
-print()
-print(f"  平均每面 Gaussian 數   : {mean_cov:.2f}")
-print(f"  中位數每面 Gaussian 數 : {median_cov:.1f}")
-print("━" * 55)
-print()
-
 # ── 畫圖 ──────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 fig.suptitle(f"Gaussian Distribution vs Mesh Surface  (N={len(pts)})", fontsize=14)
