@@ -273,6 +273,36 @@ class StructuralGaussianModel:
         r2 = self.vertex_radius[v_idx[:, 2]]
         return torch.stack([r0, r1, r2], dim=1).max(dim=1).values
 
+    @property
+    def get_app_face_longest_edge(self):
+        """Per-app-Gaussian longest edge of its bound face."""
+        if self.fid is None or self._added_scaling is None:
+            return None
+        face_ids = self.fid[:, 0]
+        v_idx = self.face_idx[face_ids]
+        v0 = self.vertices[v_idx[:, 0]]
+        v1 = self.vertices[v_idx[:, 1]]
+        v2 = self.vertices[v_idx[:, 2]]
+        e01 = (v1 - v0).norm(dim=1)
+        e02 = (v2 - v0).norm(dim=1)
+        e12 = (v2 - v1).norm(dim=1)
+        return torch.stack([e01, e02, e12], dim=1).max(dim=1).values  # (N_app,)
+
+    def clamp_app_scale_floor(self, ratio=0.5):
+        """Hard-clamp both in-plane app Gaussian scales to >= ratio × face longest edge."""
+        if self.fid is None or self._added_scaling is None:
+            return
+        with torch.no_grad():
+            face_longest = self.get_app_face_longest_edge
+            s_min = (face_longest * ratio).clamp(min=1e-4)
+            for dim in [0, 1]:
+                cur_s = self.scaling_activation(self._added_scaling[:, dim])
+                too_small = cur_s < s_min
+                if too_small.any():
+                    self._added_scaling.data[too_small, dim] += torch.log(
+                        s_min[too_small] / cur_s[too_small].clamp(min=1e-8)
+                    )
+
     def get_deform_covariance(self):
         return strip_symmetric(self.gaussian_deform_cov)
 
@@ -604,6 +634,20 @@ class StructuralGaussianModel:
         ).detach()
         self.fid = face_idx.unsqueeze(1).long()
 
+        # Boundary face mask: faces adjacent to a sharp edge (angle > 20°) are
+        # exempt from snap_rotations_to_normals so their Gaussians can freely
+        # orient to cover the visible seam between differently-angled faces.
+        _BOUNDARY_THRESH = np.radians(20.0)
+        adj_faces  = mesh.face_adjacency          # (E, 2)
+        adj_angles = mesh.face_adjacency_angles   # (E,)  radians
+        sharp      = adj_angles > _BOUNDARY_THRESH
+        bnd_indices = np.unique(adj_faces[sharp].ravel())
+        bnd_mask = np.zeros(len(mesh.faces), dtype=bool)
+        bnd_mask[bnd_indices] = True
+        self._boundary_face_mask = torch.from_numpy(bnd_mask).to(device)
+        print(f"  Boundary faces (>{np.degrees(_BOUNDARY_THRESH):.0f}°): "
+              f"{bnd_mask.sum()} / {len(mesh.faces)}")
+
         # Align each app Gaussian's local z-axis with its face normal so that
         # the splat lies flat on the mesh surface (critical for sharp texture projection).
         face_normals_assigned = self.normals[face_idx]           # (N_app, 3)
@@ -611,17 +655,56 @@ class StructuralGaussianModel:
         with torch.no_grad():
             self._added_rotation.data.copy_(aligned_quats)
 
+        # After rotation aligns local-z to face normal, dims 0 and 1 are in-plane.
+        # Clamp up any Gaussians whose in-plane scale is too small to cover their face.
+        # (Stage 2 learning can leave some Gaussians very small; mrloss has no lower bound.)
+        with torch.no_grad():
+            v_idx = self.face_idx[face_idx]                              # (N_app, 3)
+            r0 = self.vertex_radius[v_idx[:, 0]]
+            r1 = self.vertex_radius[v_idx[:, 1]]
+            r2 = self.vertex_radius[v_idx[:, 2]]
+            face_r = torch.stack([r0, r1, r2], dim=1).max(dim=1).values  # (N_app,)
+            s_floor = face_r * 0.5
+            # Use min(s_x, s_y) so both axes are checked independently.
+            s0 = self.scaling_activation(self._added_scaling[:, 0])
+            s1 = self.scaling_activation(self._added_scaling[:, 1])
+            # Scale up dim 0 if too small
+            too_small_0 = s0 < s_floor
+            if too_small_0.any():
+                self._added_scaling.data[too_small_0, 0] += torch.log(
+                    s_floor[too_small_0] / s0[too_small_0].clamp(min=1e-8)
+                )
+            # Scale up dim 1 if too small
+            too_small_1 = s1 < s_floor
+            if too_small_1.any():
+                self._added_scaling.data[too_small_1, 1] += torch.log(
+                    s_floor[too_small_1] / s1[too_small_1].clamp(min=1e-8)
+                )
+            n_fixed = (too_small_0 | too_small_1).sum().item()
+            if n_fixed > 0:
+                print(f"  Stage 3 init: rescaled {n_fixed} undersized app Gaussians "
+                      f"(in-plane scale < 50% of face vertex_radius)")
+
     def snap_rotations_to_normals(self):
         """
-        Hard-reset every app Gaussian's rotation so its local z-axis equals the face normal.
-        Call this after every optimizer step in Stage 3 to enforce a strict flatness constraint.
-        Without this, the appearance loss tilts Gaussians for better rendering coverage,
-        producing blurry textures when the Gaussian is not parallel to the mesh surface.
+        Hard-reset app Gaussian rotations so each z-axis equals its face normal.
+        Boundary faces (adjacent to a sharp edge) are exempt: their Gaussians are
+        free to rotate and find an orientation that covers the visible seam.
         """
         if self.fid is None or self._added_rotation is None:
             return
-        aligned_quats = _normals_to_quaternions(self.normals[self.fid[:, 0]])
-        self._added_rotation.data.copy_(aligned_quats)
+
+        face_ids = self.fid[:, 0]  # (N_app,)
+
+        bnd = getattr(self, '_boundary_face_mask', None)
+        if bnd is not None:
+            snap_mask = ~bnd[face_ids]           # snap only non-boundary Gaussians
+        else:
+            snap_mask = torch.ones(face_ids.shape[0], dtype=torch.bool, device=face_ids.device)
+
+        if snap_mask.any():
+            aligned_quats = _normals_to_quaternions(self.normals[face_ids[snap_mask]])
+            self._added_rotation.data[snap_mask] = aligned_quats
 
     def save_geo_ply(self, path):
         mkdir_p(os.path.dirname(path))
@@ -1086,17 +1169,6 @@ class StructuralGaussianModel:
         selected_vertex_mask = selected_pts_mask[:self.vertices.shape[0]]
         selected_added_mask = selected_pts_mask[self.vertices.shape[0]:]
 
-        num_vertices = selected_vertex_mask.shape[0]
-        vertex_face_count = torch.bincount(self.face_idx.flatten(), minlength=num_vertices)
-
-        # 取出 mask == True 的頂點的面數
-        masked_face_counts = vertex_face_count[selected_vertex_mask].unsqueeze(1) 
-
-        with torch.no_grad():
-            self._scaling[selected_vertex_mask] = self.scaling_inverse_activation(
-                self.get_geo_scaling[selected_vertex_mask] / (masked_face_counts * 0.8)
-            )
-
         # Split from geometry gaussians
         selected_fid = self.split_neighbor_gaussians(selected_vertex_mask)
         selected_faces = self.face_idx[selected_fid]
@@ -1105,12 +1177,27 @@ class StructuralGaussianModel:
         new_distance = torch.full((selected_fid.shape[0], 1), _DIST_INIT_LOGIT, dtype=torch.float, device="cuda")
         new_fid = selected_fid.unsqueeze(1).long().cuda()
 
-        selected_vertex = selected_faces[:, 0]
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_vertex])
+        # Init scale from face vertex_radius instead of inherited geo scale.
+        # Geo scale shrinks across densification rounds; inheriting it causes
+        # new app Gaussians to also be microscopic and produce holes.
+        r0 = self.vertex_radius[selected_faces[:, 0]]
+        r1 = self.vertex_radius[selected_faces[:, 1]]
+        r2 = self.vertex_radius[selected_faces[:, 2]]
+        face_r = torch.stack([r0, r1, r2], dim=1).max(dim=1).values
+        s_xy = (face_r * 0.5).clamp(min=1e-4)
+        new_scaling = self.scaling_inverse_activation(
+            torch.stack([s_xy, s_xy, torch.full_like(s_xy, 1e-4)], dim=1)
+        )
         new_rotation = _normals_to_quaternions(self.normals[selected_fid])
+        selected_vertex = selected_faces[:, 0]
         new_features_dc = self._features_dc[selected_vertex]
         new_features_rest = self._features_rest[selected_vertex]
-        new_opacity = self._opacity[selected_vertex]
+        # Do not inherit geo Gaussian opacity — geo opacities are reset to ~0.01 by
+        # Stage 2 reset_opacity calls, which would leave new app Gaussians invisible.
+        # Initialize at 0.5 (logit = 0.0) so they contribute to the render immediately.
+        new_opacity = torch.zeros(
+            (selected_fid.shape[0], 1), dtype=torch.float, device="cuda"
+        )  # sigmoid(0.0) = 0.5
 
         vertex_num = selected_vertex.shape[0]
             
@@ -1119,7 +1206,9 @@ class StructuralGaussianModel:
         new_added_bc = torch.ones_like(bc) / 3
         distance = self._distance[selected_added_mask].unsqueeze(1).repeat(1, N, 1).view(-1, 1)
         new_added_distance = torch.full_like(distance, _DIST_INIT_LOGIT)
-        new_added_scaling = self.scaling_inverse_activation(self.get_app_scaling[selected_added_mask].repeat(N,1) / (0.8*N))
+        new_added_scaling = self.scaling_inverse_activation(
+            (self.get_app_scaling[selected_added_mask].repeat(N, 1) / (0.8 * N)).clamp(min=1e-4)
+        )
         # Use face-aligned rotations so split children also lie flat on the mesh.
         parent_face_ids = self.fid[selected_added_mask, 0]
         new_added_rotation = _normals_to_quaternions(self.normals[parent_face_ids]).repeat(N, 1)
@@ -1158,6 +1247,100 @@ class StructuralGaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+
+    def fill_uncovered_faces(self, coverage_threshold=0.5, max_new=500):
+        """
+        Add one app Gaussian at the centroid of each face whose opacity-weighted
+        in-plane coverage falls below coverage_threshold.
+
+        coverage(face) = Σ_i  opacity_i × min(s_xi × s_yi / face_area, 1.0)
+
+        At most max_new faces are filled per call; priority goes to the faces
+        with the lowest coverage first.
+
+        Returns the number of new Gaussians added.
+        """
+        if self.fid is None or self._added_opacity is None:
+            return 0
+
+        device = self._added_opacity.device
+        n_faces = self.face_idx.shape[0]
+        face_ids = self.fid[:, 0]  # (N_app,)
+
+        with torch.no_grad():
+            # ── face areas ────────────────────────────────────────────────────
+            v0 = self.vertices[self.face_idx[:, 0]]
+            v1 = self.vertices[self.face_idx[:, 1]]
+            v2 = self.vertices[self.face_idx[:, 2]]
+            face_area = 0.5 * torch.cross(v1 - v0, v2 - v0, dim=1).norm(dim=1)  # (n_faces,)
+
+            # ── per-Gaussian contribution ──────────────────────────────────────
+            app_opac = torch.sigmoid(self._added_opacity).squeeze(1)          # (N_app,)
+            app_s    = self.get_app_scaling                                    # (N_app, 3)
+            inplane  = app_s[:, 0] * app_s[:, 1]                              # (N_app,)
+            contrib  = app_opac * (inplane / face_area[face_ids].clamp(min=1e-8)).clamp(max=1.0)
+
+            # ── aggregate to faces ─────────────────────────────────────────────
+            face_coverage = torch.zeros(n_faces, device=device)
+            face_coverage.scatter_add_(0, face_ids, contrib)
+
+            # ── select faces to fill ───────────────────────────────────────────
+            needs_fill   = face_coverage < coverage_threshold
+            fill_face_ids = torch.nonzero(needs_fill, as_tuple=True)[0]  # (M,)
+
+            if fill_face_ids.shape[0] == 0:
+                return 0
+
+            # Prioritise lowest-coverage faces
+            if fill_face_ids.shape[0] > max_new:
+                scores   = face_coverage[fill_face_ids]
+                _, order = torch.sort(scores)
+                fill_face_ids = fill_face_ids[order[:max_new]]
+
+            n_new = fill_face_ids.shape[0]
+
+            # ── build new Gaussian parameters ──────────────────────────────────
+            fill_faces   = self.face_idx[fill_face_ids]                        # (n_new, 3)
+
+            new_bc       = torch.full((n_new, 3), 1/3, dtype=torch.float, device=device)
+            new_distance = torch.full((n_new, 1), -6.9078, dtype=torch.float, device=device)
+            new_fid      = fill_face_ids.unsqueeze(1).long()
+
+            # Scale from triangle geometry: elliptical splat aligned to longest edge
+            v0f = self.vertices[fill_faces[:, 0]]   # (n_new, 3)
+            v1f = self.vertices[fill_faces[:, 1]]
+            v2f = self.vertices[fill_faces[:, 2]]
+            e01 = (v1f - v0f).norm(dim=1)
+            e02 = (v2f - v0f).norm(dim=1)
+            e12 = (v2f - v1f).norm(dim=1)
+            longest_edge = torch.stack([e01, e02, e12], dim=1).max(dim=1).values  # (n_new,)
+            fill_area    = face_area[fill_face_ids]  # (n_new,)
+            s_major = (longest_edge * 0.5).clamp(min=1e-4)
+            s_minor = (fill_area / longest_edge.clamp(min=1e-8)).clamp(min=1e-4)
+            new_scaling = self.scaling_inverse_activation(
+                torch.stack([s_major, s_minor, torch.full_like(s_major, 1e-4)], dim=1)
+            )
+
+            new_rotation = _normals_to_quaternions(self.normals[fill_face_ids])
+
+            # Colour from first vertex of the face (geo Gaussian)
+            first_vertex    = fill_faces[:, 0]
+            new_features_dc   = self._features_dc[first_vertex].clone()
+            new_features_rest = self._features_rest[first_vertex].clone()
+
+            # Opacity: sigmoid(0.0) = 0.5
+            new_opacity = torch.zeros((n_new, 1), dtype=torch.float, device=device)
+
+        # ── register with optimizer ────────────────────────────────────────────
+        self.fid = torch.cat((self.fid, new_fid), dim=0)
+        self.densification_postfix_sg3(
+            new_bc, new_distance,
+            new_features_dc, new_features_rest,
+            new_opacity, new_scaling, new_rotation
+        )
+
+        return n_new
 
     def weight_control_optimizer(self, geo_grad_scale=0.1):
         ''' Control Geometry Gaussian Gradient '''
