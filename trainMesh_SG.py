@@ -294,9 +294,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    gaussians.reset_opacity()  # Stage 2: reset both geo and app Gaussians
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -317,15 +317,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.find_closet_faces()
     gaussians.training_s3_setup(opt)
 
-    # Prune low-opacity app Gaussians carried over from Stage 2
-    with torch.no_grad():
-        n_geo = gaussians.vertices.shape[0]
-        app_opacity = gaussians.get_opacity[n_geo:]
-        prune_mask = (app_opacity < 0.005).squeeze()
-        if prune_mask.any():
-            gaussians.prune_points(prune_mask)
-            torch.cuda.empty_cache()
-            print(f"Stage 3 init: pruned {prune_mask.sum().item()} low-opacity app Gaussians")
+    n_respawned = gaussians.respawn_low_opacity_app_gaussians(threshold=0.1)
+    torch.cuda.empty_cache()
+    print(f"Stage 3 init: respawned {n_respawned} low-opacity app Gaussians")
+
+    _bg_color = [1., 1., 1.] if dataset.white_background else [0., 0., 0.]
+    n_bg_respawned = gaussians.respawn_background_color_app_gaussians(_bg_color, threshold=0.15)
+    torch.cuda.empty_cache()
+    print(f"Stage 3 init: respawned {n_bg_respawned} background-colored app Gaussians")
+
     # Stage 3
     progress_bar = tqdm(range(third_iter, opt.iterations), desc="Stage 3 Training progress")
     third_iter += 1
@@ -416,6 +416,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
+            # Diagnose loss components every 1000 iters — shows which term dominates
+            if iteration % 1000 == 0:
+                n_app = gaussians._added_opacity.shape[0] if gaussians._added_opacity is not None else 0
+                print(f"\n[ITER {iteration}] appearance={Ll1.item():.5f}  dis={dis_loss.item():.5f}"
+                      f"  mr={mrloss.item():.5f}  aniso={aniso_loss.item():.5f}"
+                      f"  n_app={n_app}")
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -434,9 +440,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune_sg3(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    gaussians.respawn_background_color_app_gaussians(_bg_color, threshold=0.15)
+                # Stage 3: no reset_opacity — app Gaussians are mesh-constrained, resetting
+                # collapses their opacity to 0.01 and is the primary cause of transparency artifacts.
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -448,9 +454,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-                # Hard constraint: force every app Gaussian z-axis to align with its face normal.
-                # A soft loss is insufficient — appearance loss always wins and tilts the Gaussians.
-                gaussians.snap_rotations_to_normals()
+                # snap_rotations_to_normals() removed: forcing z to face normal creates
+                # flat discs that are edge-on (invisible) from oblique viewing angles.
+                # Loss converges (0.00357) but rendering has holes from non-training views.
+                # Let rotation optimise freely from the face-normal starting point set by
+                # find_closet_faces(); Gaussians will self-orient toward cameras.
+                gaussians.clamp_app_scaling_minimum(min_frac=0.1)
 
                 #gaussians._opacity.clamp_(max=0.25)
 
