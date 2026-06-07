@@ -3,7 +3,6 @@ import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
-import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
@@ -142,7 +141,7 @@ class StructuralGaussianModel:
         denom,
         opt_dict, 
         self.spatial_lr_scale) = model_args
-        self.training_setup(training_args)
+        self.training_s1_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
@@ -563,8 +562,6 @@ class StructuralGaussianModel:
         offset_vec = xyz - p_on_surface
         t = (n * offset_vec).sum(dim=1)
 
-        recon = bary[:,0:1]*v0 + bary[:,1:2]*v1 + bary[:,2:3]*v2 + t.unsqueeze(1)*n  # (N,3)
-
         return bary, t
 
     def find_closet_faces(self):
@@ -593,11 +590,11 @@ class StructuralGaussianModel:
         )
 
         self._bc = bary.float().detach()
-        # dis_loss = clamp(sigmoid(_distance) - distance_threshold, 0)^2
-        # With actual t values (0.3-0.8), sigmoid(logit(t)) = t >> distance_threshold (0.01),
-        # making dis_loss ~0.1-0.6 which overwhelms the appearance loss (~0.05).
-        # Keep the near-surface init so dis_loss stays ~0 and appearance loss dominates.
-        _DIST_INIT_LOGIT = -6.9078  # sigmoid ≈ 0.001, well below distance_threshold
+        # Initialize all app Gaussians very close to the surface.
+        # sigmoid(-6.9078) ≈ 0.001, so offset = 0.001 * face_normal ≈ on surface.
+        # Stage 2 distances (|t|) can be large (0.3-0.8); using them would leave Gaussians
+        # floating far above the mesh. Starting from near-zero lets dis_loss keep them close.
+        _DIST_INIT_LOGIT = -6.9078  # logit(0.001)
         self._distance = torch.full(
             (bary.shape[0], 1), _DIST_INIT_LOGIT,
             dtype=torch.float, device=device
@@ -1024,9 +1021,6 @@ class StructuralGaussianModel:
         new_features_dc = features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = opacities[selected_pts_mask].repeat(N,1)
-        # floor at logit(0.1): reset_opacity drives parents to 0.01 (logit≈-4.6),
-        # and near-zero opacity → near-zero gradient → new Gaussians stay stuck
-        new_opacity = torch.clamp(new_opacity, min=-2.1972)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
@@ -1074,17 +1068,6 @@ class StructuralGaussianModel:
         if prune_mask.any():
             self.prune_points(prune_mask)
 
-        # Respawn app Gaussians that are genuinely too small to cover any surface.
-        # Only check xy (tangential) axes — z is intentionally tiny for flat splats.
-        app_vr = self.get_app_vertex_radius
-        if app_vr is not None and self._added_scaling is not None and self._added_scaling.shape[0] > 0:
-            app_xy_max = self.get_app_scaling[:, :2].max(dim=1).values  # (n_app,)
-            too_small  = app_xy_max < 0.01 * app_vr                     # < 1% of face radius
-            if too_small.dim() == 0:
-                too_small = too_small.unsqueeze(0)
-            if too_small.any():
-                self._respawn_app_by_mask(too_small)
-
         torch.cuda.empty_cache()
 
     def densify_and_split_sg3(self, grads, grad_threshold, scene_extent, N=2):
@@ -1124,8 +1107,7 @@ class StructuralGaussianModel:
         new_rotation = _normals_to_quaternions(self.normals[selected_fid])
         new_features_dc = self._features_dc[selected_vertex]
         new_features_rest = self._features_rest[selected_vertex]
-        _APP_OPACITY_INIT = -2.1972  # logit(0.1); don't inherit parent which may be reset to 0.01
-        new_opacity = torch.full((selected_fid.shape[0], 1), _APP_OPACITY_INIT, dtype=torch.float, device="cuda")
+        new_opacity = self._opacity[selected_vertex]
 
         vertex_num = selected_vertex.shape[0]
             
@@ -1140,7 +1122,7 @@ class StructuralGaussianModel:
         new_added_rotation = _normals_to_quaternions(self.normals[parent_face_ids]).repeat(N, 1)
         new_added_features_dc = self._added_features_dc[selected_added_mask].repeat(N,1,1)
         new_added_features_rest = self._added_features_rest[selected_added_mask].repeat(N,1,1)
-        new_added_opacity = torch.full((selected_added_mask.sum() * N, 1), _APP_OPACITY_INIT, dtype=torch.float, device="cuda")
+        new_added_opacity = self._added_opacity[selected_added_mask].repeat(N,1)
         new_added_fid = self.fid[selected_added_mask].repeat(N,1)
 
         self.fid = torch.cat((self.fid, new_fid), dim=0)
@@ -1173,123 +1155,6 @@ class StructuralGaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-
-    def _respawn_app_by_mask(self, mask):
-        """
-        Delete app Gaussians where mask==True and spawn fresh replacements at
-        the same face IDs.  Fresh Gaussians are flat (xy from face radius, z≈0),
-        gray (DC=0), and start at opacity 0.5 (logit=0.0).
-        Returns the number of Gaussians respawned.
-        Only call this in Stage 3 (requires _bc / fid to be set).
-        """
-        if not mask.any():
-            return 0
-
-        respawn_fids = self.fid[mask, 0].clone()
-        n_respawn    = respawn_fids.shape[0]
-
-        self.prune_points(mask)
-
-        device = self._xyz.device
-
-        new_bc       = torch.ones(n_respawn, 3, device=device) / 3
-        new_distance = torch.full((n_respawn, 1), -6.9078, device=device)  # logit(0.001)
-        new_fid      = respawn_fids.unsqueeze(1).long()
-        new_rotation = _normals_to_quaternions(self.normals[respawn_fids])
-
-        # Isotropic init from face vertex radius — no forced flat z.
-        # snap_rotations_to_normals is disabled; rotation is free to optimise,
-        # so pinning z=-10 (invisible from edge) is no longer correct.
-        v_idx       = self.face_idx[respawn_fids]
-        r0          = self.vertex_radius[v_idx[:, 0]]
-        r1          = self.vertex_radius[v_idx[:, 1]]
-        r2          = self.vertex_radius[v_idx[:, 2]]
-        face_radius = torch.stack([r0, r1, r2], dim=1).max(dim=1).values
-        log_r       = self.scaling_inverse_activation(face_radius.clamp(min=1e-6))
-        new_scaling = log_r.unsqueeze(1).repeat(1, 3)  # isotropic: [log_r, log_r, log_r]
-
-        new_features_dc   = torch.zeros(n_respawn, 1, 3, device=device)
-        n_rest            = (self.max_sh_degree + 1) ** 2 - 1
-        new_features_rest = torch.zeros(n_respawn, n_rest, 3, device=device)
-        new_opacity       = torch.zeros(n_respawn, 1, device=device)  # logit(0.5) = 0.0
-
-        self.fid = torch.cat((self.fid, new_fid), dim=0)
-        self.densification_postfix_sg3(
-            new_bc, new_distance, new_features_dc, new_features_rest,
-            new_opacity, new_scaling, new_rotation
-        )
-
-        return n_respawn
-
-    def respawn_background_color_app_gaussians(self, bg_color, threshold=0.15):
-        """
-        Respawn app Gaussians whose DC color approximates the background.
-        These are visually transparent: they blend into the background rather
-        than contributing meaningful appearance.
-
-        With white background (-w flag), Gaussians that were stuck near-transparent
-        during Stage 2 learn white DC (to minimize loss) instead of recovering.
-        They appear see-through even at high opacity.
-
-        bg_color: list or tensor [r, g, b] in [0, 1]
-        threshold: max per-channel deviation from bg_color to consider degenerate
-        """
-        if self._added_features_dc is None or self.fid is None:
-            return 0
-
-        C0 = 0.28209479177387814
-        device = self._xyz.device
-        bg = torch.tensor(bg_color, device=device, dtype=torch.float32)  # (3,)
-
-        # DC shape: (N_app, 1, 3) → (N_app, 3)
-        dc = self._added_features_dc.detach().squeeze(1)     # (N_app, 3)
-        approx_color = (C0 * dc + 0.5).clamp(0.0, 1.0)      # (N_app, 3)
-
-        # Gaussian looks like background if ALL channels within threshold
-        diff = (approx_color - bg).abs()                     # (N_app, 3)
-        bg_mask = diff.max(dim=1).values < threshold          # (N_app,)
-        if bg_mask.dim() == 0:
-            bg_mask = bg_mask.unsqueeze(0)
-
-        return self._respawn_app_by_mask(bg_mask)
-
-    def respawn_low_opacity_app_gaussians(self, threshold=0.1):
-        """
-        Respawn app Gaussians whose opacity < threshold.
-        Used at Stage 3 init to recover from Stage 2's opacity-collapse.
-        """
-        if self._added_opacity is None or self.fid is None:
-            return 0
-
-        app_opacity = self.opacity_activation(self._added_opacity.detach())  # (N_app, 1)
-        low_mask = (app_opacity < threshold).squeeze()
-        if low_mask.dim() == 0:
-            low_mask = low_mask.unsqueeze(0)
-
-        return self._respawn_app_by_mask(low_mask)
-
-    def clamp_app_scaling_minimum(self, min_frac=0.1):
-        """
-        Hard-clamp app Gaussian xy scaling so it never falls below
-        min_frac * face_vertex_radius.
-
-        densify_and_split_sg3 divides app scaling by 1.6 on every split, so
-        after N splits the size is 0.625^N of the original — exponential decay.
-        mrloss only penalises being *too large*, not too small, so nothing
-        prevents this collapse.  This clamp (called after every optimizer step)
-        is the hard floor.
-        z-axis is excluded: it is intentionally pinned near zero for flat splats.
-        """
-        if self._added_scaling is None or self.fid is None:
-            return
-        app_vr = self.get_app_vertex_radius  # (n_app,) linear scale
-        if app_vr is None or app_vr.shape[0] == 0:
-            return
-        min_log = torch.log(min_frac * app_vr.clamp(min=1e-8))  # (n_app,) log space
-        min_log_xy = min_log.unsqueeze(1).expand(-1, 2)          # (n_app, 2)
-        self._added_scaling.data[:, :2] = torch.max(
-            self._added_scaling.data[:, :2], min_log_xy
-        )
 
     def weight_control_optimizer(self, geo_grad_scale=0.1):
         ''' Control Geometry Gaussian Gradient '''

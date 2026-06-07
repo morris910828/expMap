@@ -1,96 +1,32 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from plyfile import PlyData
-import trimesh
 
-PLY_PATH  = r"D:\SGGaussians\SGGaussians\output\armadillo\point_cloud\iteration_30000\point_cloud.ply"
-MESH_PATH = r"D:\SGGaussians\SGGaussians\data\armadillo\mesh.obj"
+PLY_PATH = r"D:\SGGaussians\SGGaussians\output\armadillo\point_cloud\iteration_30000\point_cloud.ply"
 
-# ── 讀取 Gaussian 點 ──────────────────────────────────────────────────────────
 print("讀取 Gaussian PLY...")
 plydata = PlyData.read(PLY_PATH)
 v = plydata['vertex']
-pts = np.stack([v['x'], v['y'], v['z']], axis=1).astype(np.float64)
 
-s0 = np.exp(np.array(v['scale_0'], dtype=np.float64))
-s1 = np.exp(np.array(v['scale_1'], dtype=np.float64))
-s2 = np.exp(np.array(v['scale_2'], dtype=np.float64))
-size = (s0 * s1 * s2) ** (1.0 / 3.0)   # 等效半徑
+raw_opacity = np.array(v['opacity'], dtype=np.float64)
+opacity = 1.0 / (1.0 + np.exp(-raw_opacity))  # sigmoid
 
-print(f"  {len(pts)} 個 Gaussian 點")
+# scale 欄位在 PLY 裡是 log 空間，exp 後才是真實 scale 值
+s2_log = np.array(v['scale_2'], dtype=np.float64)   # log-space z-axis
+s2     = np.exp(s2_log)                             # actual z-scale
 
-# ── 讀取 Mesh，計算有號距離 ───────────────────────────────────────────────────
-print("讀取 Mesh...")
-mesh = trimesh.load(MESH_PATH, force='mesh')
-print(f"  頂點數: {len(mesh.vertices)}  三角形數: {len(mesh.faces)}")
+n_total      = len(opacity)
+n_zero       = int((opacity == 0.0).sum())
+n_near_zero  = int((opacity < 0.01).sum())
+n_below_half = int((opacity < 0.5).sum())
 
-print("計算到 Mesh 表面的距離（有號距離）...")
-# closest_point 回傳最近表面點；用法線判斷正負
-closest, raw_dist, tri_ids = trimesh.proximity.closest_point(mesh, pts)
+print(f"  總 Gaussian 數          : {n_total}")
+print(f"  opacity == 0 (exact)    : {n_zero}")
+print(f"  opacity < 0.01          : {n_near_zero}  ({100*n_near_zero/n_total:.2f}%)")
+print(f"  opacity < 0.5           : {n_below_half}  ({100*n_below_half/n_total:.2f}%)")
 
-# 有號距離：點在法線方向外側為正（表面上方），內側為負（模型內部/下方）
-face_normals = mesh.face_normals[tri_ids]              # (N, 3)
-diff = pts - closest                                   # 指向點的向量
-sign = np.sign(np.einsum('ij,ij->i', diff, face_normals))
-sign[sign == 0] = 1.0
-signed_dist = sign * raw_dist
-
-print(f"  有號距離 min={signed_dist.min():.4f}  max={signed_dist.max():.4f}")
-print(f"  貼近表面 (|d|<0.01): {(np.abs(signed_dist)<0.01).sum()}")
-print(f"  表面上方 (d>0.01)  : {(signed_dist>0.01).sum()}")
-print(f"  表面下方 (d<-0.01) : {(signed_dist<-0.01).sum()}")
-
-# ── 畫圖 ──────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-fig.suptitle(f"Gaussian Distribution vs Mesh Surface  (N={len(pts)})", fontsize=14)
-
-# clip 至 1~99 percentile 讓圖更清楚
-dx_lo, dx_hi = np.percentile(signed_dist, 0.5), np.percentile(signed_dist, 99.5)
-sy_lo, sy_hi = np.percentile(size, 0.5), np.percentile(size, 99.5)
-
-mask = (signed_dist >= dx_lo) & (signed_dist <= dx_hi) & (size <= sy_hi)
-d_plot = signed_dist[mask]
-s_plot = size[mask]
-
-# ── 左圖：2D 密度 hexbin（完整分布）────────────────────────────────────────
-ax = axes[0]
-hb = ax.hexbin(d_plot, s_plot, gridsize=80, cmap='YlOrRd',
-               mincnt=1, bins='log')
-plt.colorbar(hb, ax=ax, label='log10(count)')
-ax.axvline(0, color='cyan', linewidth=1.5, linestyle='--', label='Mesh surface (d=0)')
-ax.axvline(-0.01, color='deepskyblue', linewidth=1, linestyle=':')
-ax.axvline( 0.01, color='deepskyblue', linewidth=1, linestyle=':')
-ax.set_xlabel("Signed distance to mesh  (+ = outside,  - = inside)")
-ax.set_ylabel("Gaussian size  (geometric-mean of scale axes)")
-ax.set_title("Full distribution (log-density)")
-ax.legend(fontsize=9)
-
-# ── 右圖：三區域著色散佈 ─────────────────────────────────────────────────────
-ax2 = axes[1]
-thresh = 0.02  # 貼近表面的門檻
-
-on   = np.abs(d_plot) <= thresh
-above = d_plot >  thresh
-below = d_plot < -thresh
-
-ax2.scatter(d_plot[on],    s_plot[on],    s=1, alpha=0.3, c='limegreen',  label=f'On surface (|d|<={thresh}): {on.sum()}')
-ax2.scatter(d_plot[above], s_plot[above], s=1, alpha=0.3, c='tomato',     label=f'Outside (d>{thresh}): {above.sum()}')
-ax2.scatter(d_plot[below], s_plot[below], s=1, alpha=0.3, c='dodgerblue', label=f'Inside (d<-{thresh}): {below.sum()}')
-
-ax2.axvline(0,      color='white',      linewidth=1.5, linestyle='--')
-ax2.axvline( thresh, color='salmon',    linewidth=1,   linestyle=':')
-ax2.axvline(-thresh, color='steelblue', linewidth=1,   linestyle=':')
-ax2.set_facecolor('#1a1a2e')
-ax2.set_xlabel("Signed distance to mesh  (+ = outside,  - = inside)")
-ax2.set_ylabel("Gaussian size  (geometric-mean of scale axes)")
-ax2.set_title("3-zone colored scatter")
-leg = ax2.legend(fontsize=8, markerscale=5)
-for lh in leg.legend_handles:
-    lh.set_alpha(1)
-
-plt.tight_layout()
-out = PLY_PATH.replace("point_cloud.ply", "surface_dist_vs_size.png")
-plt.savefig(out, dpi=150, bbox_inches='tight')
-print(f"\n圖片儲存至: {out}")
-plt.show()
+print()
+print("── Z-axis scale (scale_2, log space) ──")
+print(f"  log-space  min={s2_log.min():.4f}  max={s2_log.max():.4f}  mean={s2_log.mean():.4f}  median={np.median(s2_log):.4f}")
+print(f"  actual     min={s2.min():.6f}  max={s2.max():.6f}  mean={s2.mean():.6f}  median={np.median(s2):.6f}")
+print(f"  log <= -10 (flat, from fill_empty_faces) : {int((s2_log <= -10.0).sum())}  ({100*(s2_log <= -10.0).mean():.1f}%)")
+print(f"  log > -4   (non-flat, thick Gaussians)   : {int((s2_log > -4.0).sum())}  ({100*(s2_log > -4.0).mean():.1f}%)")

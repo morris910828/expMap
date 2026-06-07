@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, mesh_restrict_loss, mesh_vertex_restrict_loss
+from utils.loss_utils import l1_loss, ssim, mesh_vertex_restrict_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel, StructuralGaussianModel
@@ -294,9 +294,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-
+                
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()  # Stage 2: reset both geo and app Gaussians
+                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -314,18 +314,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")   
 
-    gaussians.find_closet_faces()
     gaussians.training_s3_setup(opt)
-
-    n_respawned = gaussians.respawn_low_opacity_app_gaussians(threshold=0.1)
-    torch.cuda.empty_cache()
-    print(f"Stage 3 init: respawned {n_respawned} low-opacity app Gaussians")
-
-    _bg_color = [1., 1., 1.] if dataset.white_background else [0., 0., 0.]
-    n_bg_respawned = gaussians.respawn_background_color_app_gaussians(_bg_color, threshold=0.15)
-    torch.cuda.empty_cache()
-    print(f"Stage 3 init: respawned {n_bg_respawned} background-colored app Gaussians")
-
     # Stage 3
     progress_bar = tqdm(range(third_iter, opt.iterations), desc="Stage 3 Training progress")
     third_iter += 1
@@ -368,24 +357,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
-        # Stage 3: aniso_loss only on geo Gaussians — app Gaussians are intentionally flat
-        # (densify_and_split_sg3 sets new_scaling[:, 2] = -10.0 by design)
-        geo_scaling = gaussians.get_geo_scaling
-        max_vals, _ = torch.max(geo_scaling, dim=1)
-        min_vals, _ = torch.min(geo_scaling, dim=1)
-        ratio = max_vals / (min_vals + 1e-8)
+        max_vals, _ = torch.max(gaussians.get_scaling, dim=1)
+        min_vals, _ = torch.min(gaussians.get_scaling, dim=1) 
+        ratio = max_vals / (min_vals + 1e-8)  
 
         r = 4.0
+        #aniso_loss = torch.mean(torch.max(ratio, torch.tensor(r, device=gaussians.get_scaling.device)) - r)
         aniso_loss = torch.mean(torch.clamp(ratio - r, min=0))
 
+        #dis_loss = torch.mean(gaussians.get_distance ** 2)
         dis_loss = torch.mean(torch.clamp(gaussians.get_distance - opt.distance_threshold, min=0) ** 2)
 
-        app_vr = gaussians.get_app_vertex_radius
-        if app_vr is not None:
-            mrloss = mesh_vertex_restrict_loss(gaussians.get_app_scaling, app_vr, weight=1.0)
-        else:
-            vert1, ver2, vert3 = gaussians.get_vertex
-            mrloss = mesh_restrict_loss(gaussians.get_app_scaling, vert1, ver2, vert3, weight=1.0)
+        app_vertex_r = gaussians.get_app_vertex_radius
+        mrloss = mesh_vertex_restrict_loss(gaussians.get_app_scaling, app_vertex_r, weight=1.0)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + dis_loss + aniso_loss + mrloss
 
@@ -416,12 +400,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
-            # Diagnose loss components every 1000 iters — shows which term dominates
-            if iteration % 1000 == 0:
-                n_app = gaussians._added_opacity.shape[0] if gaussians._added_opacity is not None else 0
-                print(f"\n[ITER {iteration}] appearance={Ll1.item():.5f}  dis={dis_loss.item():.5f}"
-                      f"  mr={mrloss.item():.5f}  aniso={aniso_loss.item():.5f}"
-                      f"  n_app={n_app}")
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -440,9 +418,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune_sg3(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                    gaussians.respawn_background_color_app_gaussians(_bg_color, threshold=0.15)
-                # Stage 3: no reset_opacity — app Gaussians are mesh-constrained, resetting
-                # collapses their opacity to 0.01 and is the primary cause of transparency artifacts.
+                
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -454,18 +432,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-                # snap_rotations_to_normals() removed: forcing z to face normal creates
-                # flat discs that are edge-on (invisible) from oblique viewing angles.
-                # Loss converges (0.00357) but rendering has holes from non-training views.
-                # Let rotation optimise freely from the face-normal starting point set by
-                # find_closet_faces(); Gaussians will self-orient toward cameras.
-                gaussians.clamp_app_scaling_minimum(min_frac=0.1)
-
                 #gaussians._opacity.clamp_(max=0.25)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")   
 
 
 def prepare_output_and_logger(args):    

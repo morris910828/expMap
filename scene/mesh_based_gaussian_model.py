@@ -62,8 +62,6 @@ class MeshBasedGaussianModel:
         self._distance = None
         self.fid= None
 
-        self.gaussian_deform_cov = None
-
         self.alpha_distance = 4
         # Mesh Info
         self.mesh_path = mesh_path
@@ -176,8 +174,7 @@ class MeshBasedGaussianModel:
             radius = self.r[self.fid[:, 0]]
 
             pos = bc[:, 0:1] * v0 + bc[:, 1:2] * v1 + bc[:, 2:3] * v2
-            # Force added Gaussians to be perfectly on the mesh surface
-            offset = 0 # self.alpha_distance*radius*(self.distance_activation(self._distance)-0.5)* n
+            offset = self.alpha_distance*radius*(self.distance_activation(self._distance)-0.5)* n
 
             added_xyz = pos + offset
 
@@ -196,8 +193,7 @@ class MeshBasedGaussianModel:
         radius = self.r[self.fid[:, 0]]
 
         pos = bc[:, 0:1] * v0 + bc[:, 1:2] * v1 + bc[:, 2:3] * v2
-        # Force added Gaussians to be perfectly on the mesh surface
-        offset = 0 # self.alpha_distance*radius*(self.distance_activation(self._distance)-0.5)* n
+        offset = self.alpha_distance*radius*(self.distance_activation(self._distance)-0.5)* n
 
         added_xyz = pos + offset
 
@@ -220,9 +216,6 @@ class MeshBasedGaussianModel:
             return self.opacity_activation(torch.cat((self._opacity, self._added_opacity), dim=0))
         return self.opacity_activation(self._opacity)
         
-    def get_deform_covariance(self):
-        return strip_symmetric(self.gaussian_deform_cov)
-
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self.get_rotation)
     
@@ -768,7 +761,6 @@ class MeshBasedGaussianModel:
 
         selected_vertex = selected_faces[:, 0]
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_vertex])
-        new_scaling[:, 2] = -10.0 # Flatten thickness
         new_rotation = self._rotation[selected_vertex]
         new_features_dc = self._features_dc[selected_vertex]
         new_features_rest = self._features_rest[selected_vertex]
@@ -847,7 +839,6 @@ class MeshBasedGaussianModel:
         distance = self._distance[selected_added_mask].unsqueeze(1).repeat(1, N, 1).view(-1, 1)
         new_added_distance = torch.zeros_like(distance)
         new_added_scaling = self.scaling_inverse_activation(self.get_app_scaling[selected_added_mask].repeat(N,1) / (0.8*N))
-        new_added_scaling[:, 2] = -10.0 # Flatten thickness
         new_added_rotation = self._added_rotation[selected_added_mask].repeat(N,1)
         new_added_features_dc = self._added_features_dc[selected_added_mask].repeat(N,1,1)
         new_added_features_rest = self._added_features_rest[selected_added_mask].repeat(N,1,1)
@@ -885,4 +876,3 @@ class MeshBasedGaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-a")

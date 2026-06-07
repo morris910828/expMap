@@ -132,6 +132,7 @@ def safe_state(silent):
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
 
+
 def compute_vertex_radii_approx(V, F):
     """
     V: (N,3) vertices (tensor, float32, cuda ok)

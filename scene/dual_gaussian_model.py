@@ -120,7 +120,7 @@ class DualGaussianModel:
     
     @property
     def get_distance(self):
-        return self.distance_activation(self._distance)
+        return self._distance
 
     @property
     def get_fid(self):
@@ -169,12 +169,12 @@ class DualGaussianModel:
             n = self.normals[self.fid[:, 0]]
 
             pro_pos = bc[:, 0:1] * v0 + bc[:, 1:2] * v1 + bc[:, 2:3] * v2
-            offset = self.distance_activation(self._distance) * n
+            offset = self._distance * n
             added_xyz = pro_pos + offset
 
             pos = torch.cat((self._xyz, added_xyz), dim=0)
         return pos
-
+    
     @property
     def get_add_xyz(self):
 
@@ -188,7 +188,7 @@ class DualGaussianModel:
             n = self.normals[self.fid[:, 0]]
 
             pro_pos = bc[:, 0:1] * v0 + bc[:, 1:2] * v1 + bc[:, 2:3] * v2
-            offset = self.distance_activation(self._distance) * n
+            offset = self._distance * n
             added_xyz = pro_pos + offset
 
             return added_xyz
@@ -227,17 +227,6 @@ class DualGaussianModel:
     @property
     def get_vertex_radius(self):
         return self.vertex_radius
-
-    @property
-    def get_app_vertex_radius(self):
-        """Per-app-Gaussian radius: max 1-ring vertex radius of its bound face."""
-        if self.vertex_radius.shape[0] == 0 or self.fid is None:
-            return None
-        v_idx = self.face_idx[self.fid[:, 0]]
-        r0 = self.vertex_radius[v_idx[:, 0]]
-        r1 = self.vertex_radius[v_idx[:, 1]]
-        r2 = self.vertex_radius[v_idx[:, 2]]
-        return torch.stack([r0, r1, r2], dim=1).max(dim=1).values
     
     def get_deform_covariance(self):
         return strip_symmetric(self.gaussian_deform_cov)
@@ -537,14 +526,7 @@ class DualGaussianModel:
         )
 
         self._bc = bary.float()
-        # Initialize all app Gaussians very close to the surface.
-        # sigmoid(-6.9078) ≈ 0.001; Stage 2 distances can be large so using logit(|t|)
-        # would leave Gaussians floating far above the mesh.
-        _DIST_INIT_LOGIT = -6.9078  # logit(0.001)
-        self._distance = torch.full(
-            (bary.shape[0], 1), _DIST_INIT_LOGIT,
-            dtype=torch.float, device=bary.device
-        )
+        self._distance = t.unsqueeze(1).float()
         self.fid = face_idx.unsqueeze(1).long()
 
     def save_geo_ply(self, path):
@@ -1007,9 +989,7 @@ class DualGaussianModel:
         selected_fid = self.split_neighbor_gaussians(selected_vertex_mask)
         selected_faces = self.face_idx[selected_fid]
         new_bc = torch.ones_like(selected_faces).float().cuda() / 3
-        # Initialize distance in logit space: sigmoid(-6.9078) ≈ 0.001, very close to surface
-        _DIST_INIT_LOGIT = -6.9078
-        new_distance = torch.full((selected_fid.shape[0], 1), _DIST_INIT_LOGIT, dtype=torch.float, device="cuda")
+        new_distance = torch.zeros_like(selected_fid.unsqueeze(1)).float().cuda()
         new_fid = selected_fid.unsqueeze(1).long().cuda()
 
         selected_vertex = selected_faces[:, 0]
@@ -1020,12 +1000,12 @@ class DualGaussianModel:
         new_opacity = self._opacity[selected_vertex]
 
         vertex_num = selected_vertex.shape[0]
-
+            
         # Split from appearance gaussians
         bc = self._bc[selected_added_mask].unsqueeze(1).repeat(1, N, 1).view(-1, 3)
         new_added_bc = torch.ones_like(bc) / 3
         distance = self._distance[selected_added_mask].unsqueeze(1).repeat(1, N, 1).view(-1, 1)
-        new_added_distance = torch.full_like(distance, _DIST_INIT_LOGIT)
+        new_added_distance = torch.zeros_like(distance)
         new_added_scaling = self.scaling_inverse_activation(self.get_app_scaling[selected_added_mask].repeat(N,1) / (0.8*N))
         new_added_rotation = self._added_rotation[selected_added_mask].repeat(N,1)
         new_added_features_dc = self._added_features_dc[selected_added_mask].repeat(N,1,1)
