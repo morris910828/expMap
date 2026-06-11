@@ -99,8 +99,9 @@ class StructuralGaussianModel:
         self.gaussian_deform_cov = None
 
         self.mesh_path = mesh_path
-        self.normals = torch.empty(0) # (F, 3)
-        self.vertices = torch.empty(0) # (F, 3)
+        self.normals = torch.empty(0) # (F, 3) per-face normals
+        self.vertex_normals = torch.empty(0) # (V, 3) per-vertex smooth normals
+        self.vertices = torch.empty(0) # (V, 3)
         self.face_idx = torch.empty(0) # (F, 3)
         self.vertex_radius = torch.empty(0)
 
@@ -128,6 +129,29 @@ class StructuralGaussianModel:
             self.spatial_lr_scale,
         )
     
+    def _compute_vertex_normals(self, face_normals):
+        """Average face normals at each vertex to get smooth vertex normals."""
+        vn = torch.zeros_like(self.vertices)
+        for i in range(3):
+            vn.index_add_(0, self.face_idx[:, i], face_normals)
+        vn = vn / (torch.norm(vn, dim=1, keepdim=True) + 1e-9)
+        return vn
+
+    def _interp_normal(self, bc, v_idx):
+        """Barycentric-interpolate vertex normals and re-normalize."""
+        n = (bc[:, 0:1] * self.vertex_normals[v_idx[:, 0]]
+           + bc[:, 1:2] * self.vertex_normals[v_idx[:, 1]]
+           + bc[:, 2:3] * self.vertex_normals[v_idx[:, 2]])
+        return n / (torch.norm(n, dim=1, keepdim=True) + 1e-9)
+
+    def _smooth_face_normal(self, face_ids):
+        """Smooth normal at face centroid = average of 3 vertex normals."""
+        v_idx = self.face_idx[face_ids]
+        n = (self.vertex_normals[v_idx[:, 0]]
+           + self.vertex_normals[v_idx[:, 1]]
+           + self.vertex_normals[v_idx[:, 2]])
+        return n / (torch.norm(n, dim=1, keepdim=True) + 1e-9)
+
     def restore(self, model_args, training_args):
         (self.active_sh_degree, 
         self._xyz, 
@@ -184,7 +208,8 @@ class StructuralGaussianModel:
     @property
     def get_rotation(self):
         if self._added_rotation is not None:
-            return self.rotation_activation(torch.cat((self._rotation, self._added_rotation), dim=0))
+            app_rot = self.rotation_activation(self._added_rotation)
+            return torch.cat((self.rotation_activation(self._rotation), app_rot), dim=0)
         return self.rotation_activation(self._rotation)
         
     @property
@@ -193,13 +218,13 @@ class StructuralGaussianModel:
         if self._added_xyz is not None:
             pos = torch.cat((self._xyz, self._added_xyz), dim=0)
         if self._bc is not None:
-            bc = self.bc_activation(self._bc,dim=1)
+            bc = self.bc_activation(self._bc, dim=1)
 
             v_idx = self.face_idx[self.fid[:, 0]]
             v0 = self.vertices[v_idx[:, 0]]
             v1 = self.vertices[v_idx[:, 1]]
             v2 = self.vertices[v_idx[:, 2]]
-            n = self.normals[self.fid[:, 0]]
+            n = self._interp_normal(bc, v_idx)
 
             pro_pos = bc[:, 0:1] * v0 + bc[:, 1:2] * v1 + bc[:, 2:3] * v2
             offset = self.distance_activation(self._distance) * n
@@ -207,18 +232,17 @@ class StructuralGaussianModel:
 
             pos = torch.cat((self._xyz, added_xyz), dim=0)
         return pos
-    
+
     @property
     def get_add_xyz(self):
-
         if self._bc is not None:
-            bc = self.bc_activation(self._bc,dim=1)
+            bc = self.bc_activation(self._bc, dim=1)
 
             v_idx = self.face_idx[self.fid[:, 0]]
             v0 = self.vertices[v_idx[:, 0]]
             v1 = self.vertices[v_idx[:, 1]]
             v2 = self.vertices[v_idx[:, 2]]
-            n = self.normals[self.fid[:, 0]]
+            n = self._interp_normal(bc, v_idx)
 
             pro_pos = bc[:, 0:1] * v0 + bc[:, 1:2] * v1 + bc[:, 2:3] * v2
             offset = self.distance_activation(self._distance) * n
@@ -299,6 +323,7 @@ class StructuralGaussianModel:
         normals = normals / (torch.norm(normals, dim=1, keepdim=True) + 1e-9)
 
         self.normals = normals
+        self.vertex_normals = self._compute_vertex_normals(normals)
         self.vertex_radius = compute_vertex_radii_approx(self.vertices, self.face_idx)
 
         self.spatial_lr_scale = spatial_lr_scale
@@ -590,23 +615,19 @@ class StructuralGaussianModel:
         )
 
         self._bc = bary.float().detach()
-        # Initialize all app Gaussians very close to the surface.
-        # sigmoid(-6.9078) ≈ 0.001, so offset = 0.001 * face_normal ≈ on surface.
-        # Stage 2 distances (|t|) can be large (0.3-0.8); using them would leave Gaussians
-        # floating far above the mesh. Starting from near-zero lets dis_loss keep them close.
-        _DIST_INIT_LOGIT = -6.9078  # logit(0.001)
-        self._distance = torch.full(
-            (bary.shape[0], 1), _DIST_INIT_LOGIT,
-            dtype=torch.float, device=device
-        ).detach()
+        # Preserve actual Stage 2 distance (above-surface offset along face normal).
+        # t can be negative (below surface) or very large; clamp to [0.001, 0.05].
+        # This keeps seam-area Gaussians at their original hover height instead of
+        # snapping everything to the surface, which left fold gaps uncovered.
+        _DIST_CLAMP_MAX = 0.05
+        t_safe = t.abs().clamp(min=1e-3, max=_DIST_CLAMP_MAX).float()  # (N,)
+        distance_logit = torch.logit(t_safe).unsqueeze(1)               # (N, 1)
+        self._distance = distance_logit.detach()
         self.fid = face_idx.unsqueeze(1).long()
-
-        # Align each app Gaussian's local z-axis with its face normal so that
-        # the splat lies flat on the mesh surface (critical for sharp texture projection).
-        face_normals_assigned = self.normals[face_idx]           # (N_app, 3)
-        aligned_quats = _normals_to_quaternions(face_normals_assigned)
-        with torch.no_grad():
-            self._added_rotation.data.copy_(aligned_quats)
+        # Stage 2 rotations are intentionally preserved here.
+        # Resetting to face normals makes sideways-facing Gaussians edge-on (opacity≈0),
+        # leaving them with near-zero gradient and unable to recover (dead Gaussian).
+        # The Stage 3 optimizer can freely update _added_rotation from the Stage 2 baseline.
 
     def snap_rotations_to_normals(self):
         """
@@ -619,6 +640,65 @@ class StructuralGaussianModel:
             return
         aligned_quats = _normals_to_quaternions(self.normals[self.fid[:, 0]])
         self._added_rotation.data.copy_(aligned_quats)
+
+    def fill_empty_faces(self, min_app_scale_logit: float = -6.21):
+        """
+        For every mesh face that currently has zero appearance Gaussians, add exactly one
+        Gaussian at the face centroid.  Called once after find_closet_faces (before
+        training_s3_setup) so no face is ever entirely uncovered at Stage 3 start.
+
+        Uses direct tensor concatenation rather than densification_postfix_sg3 because the
+        Stage 3 optimizer does not exist yet; training_s3_setup will register the tensors.
+        Returns the number of Gaussians added.
+        """
+        if self._bc is None or self.fid is None:
+            return 0
+
+        device = self._xyz.device
+        n_faces = self.face_idx.shape[0]
+
+        # Mark which faces already have at least one app Gaussian
+        occupied = torch.zeros(n_faces, dtype=torch.bool, device=device)
+        occupied[self.fid[:, 0]] = True
+        empty_face_ids = torch.where(~occupied)[0]   # (n_empty,)
+
+        if empty_face_ids.shape[0] == 0:
+            return 0
+
+        n_new = empty_face_ids.shape[0]
+
+        # bc = centroid, distance = on-surface (sigmoid(-6.9078) ≈ 0.001)
+        new_bc       = torch.full((n_new, 3), 1.0 / 3.0, device=device)
+        new_distance = torch.full((n_new, 1), -6.9078,   device=device)
+        new_fid      = empty_face_ids.unsqueeze(1)
+
+        # Rotation aligned to smooth face normal; free to optimise in Stage 3
+        new_rotation = _normals_to_quaternions(self._smooth_face_normal(empty_face_ids))
+
+        # Inherit colour / opacity / scale from vertex 0 of each empty face
+        v0_idx = self.face_idx[empty_face_ids, 0]
+        new_features_dc   = self._features_dc[v0_idx].clone().detach()
+        new_features_rest = self._features_rest[v0_idx].clone().detach()
+        new_opacity       = self._opacity[v0_idx].clone().detach()
+        new_scaling       = self._scaling[v0_idx].clone().detach().clamp(min=min_app_scale_logit)
+
+        # Direct cat — training_s3_setup will wrap these in nn.Parameter
+        self.fid                 = torch.cat((self.fid,                 new_fid),           dim=0)
+        self._bc                 = torch.cat((self._bc,                 new_bc),             dim=0)
+        self._distance           = torch.cat((self._distance,           new_distance),       dim=0)
+        self._added_features_dc  = torch.cat((self._added_features_dc,  new_features_dc),    dim=0)
+        self._added_features_rest= torch.cat((self._added_features_rest,new_features_rest),  dim=0)
+        self._added_opacity      = torch.cat((self._added_opacity,       new_opacity),        dim=0)
+        self._added_scaling      = torch.cat((self._added_scaling,       new_scaling),        dim=0)
+        self._added_rotation     = torch.cat((self._added_rotation,      new_rotation),       dim=0)
+
+        # Reset gradient accumulators to the new total count
+        n_total = self._xyz.shape[0] + self._bc.shape[0]
+        self.xyz_gradient_accum = torch.zeros((n_total, 1), device=device)
+        self.denom              = torch.zeros((n_total, 1), device=device)
+        self.max_radii2D        = torch.zeros(n_total,      device=device)
+
+        return n_new
 
     def save_geo_ply(self, path):
         mkdir_p(os.path.dirname(path))
@@ -801,6 +881,7 @@ class StructuralGaussianModel:
         normals = normals / (torch.norm(normals, dim=1, keepdim=True) + 1e-9)
 
         self.normals = normals
+        self.vertex_normals = self._compute_vertex_normals(normals)
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -1050,10 +1131,38 @@ class StructuralGaussianModel:
 
         return selected_face_ids
 
+    def densify_and_clone_sg3(self, grads, grad_threshold, scene_extent):
+        """Clone small, high-gradient appearance Gaussians at original size."""
+        n_geo = self.vertices.shape[0]
+        app_grads = grads[n_geo:]                               # gradients for app Gaussians only
+        app_scale_max = self.get_app_scaling.max(dim=1).values  # (N_app,)
+
+        selected = torch.where(app_grads.squeeze() >= grad_threshold, True, False)
+        selected = selected & (app_scale_max <= self.percent_dense * scene_extent)
+
+        if selected.sum().item() == 0:
+            return
+
+        new_fid      = self.fid[selected]
+        new_bc       = self._bc[selected].detach().clone()
+        new_distance = self._distance[selected].detach().clone()
+        new_f_dc     = self._added_features_dc[selected]
+        new_f_rest   = self._added_features_rest[selected]
+        new_opacity  = self._added_opacity[selected]
+        new_scaling  = self._added_scaling[selected]
+        new_rotation = self._added_rotation[selected]
+
+        self.fid = torch.cat((self.fid, new_fid), dim=0)
+        self.densification_postfix_sg3(
+            new_bc, new_distance,
+            new_f_dc, new_f_rest, new_opacity, new_scaling, new_rotation
+        )
+
     def densify_and_prune_sg3(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        self.densify_and_clone_sg3(grads, max_grad, extent)
         self.densify_and_split_sg3(grads, max_grad, extent)
 
         # Prune low-opacity app Gaussians (mirrors Stage-2 densify_and_prune)
@@ -1083,15 +1192,11 @@ class StructuralGaussianModel:
         selected_vertex_mask = selected_pts_mask[:self.vertices.shape[0]]
         selected_added_mask = selected_pts_mask[self.vertices.shape[0]:]
 
-        num_vertices = selected_vertex_mask.shape[0]
-        vertex_face_count = torch.bincount(self.face_idx.flatten(), minlength=num_vertices)
-
-        # 取出 mask == True 的頂點的面數
-        masked_face_counts = vertex_face_count[selected_vertex_mask].unsqueeze(1) 
-
+        # P3 fix: shrink geometry Gaussian by standard 1/(0.8*N)=1/1.6, not by face count
         with torch.no_grad():
+            geo_scale_before = self.get_geo_scaling[selected_vertex_mask].clone()
             self._scaling[selected_vertex_mask] = self.scaling_inverse_activation(
-                self.get_geo_scaling[selected_vertex_mask] / (masked_face_counts * 0.8)
+                geo_scale_before / (0.8 * N)
             )
 
         # Split from geometry gaussians
@@ -1103,23 +1208,30 @@ class StructuralGaussianModel:
         new_fid = selected_fid.unsqueeze(1).long().cuda()
 
         selected_vertex = selected_faces[:, 0]
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_vertex])
-        new_rotation = _normals_to_quaternions(self.normals[selected_fid])
+        # P4 fix: use the PRE-reduction scale so appearance Gaussians inherit the
+        # original size, not the already-shrunk geometry Gaussian size.
+        vertex_scale_lookup = torch.zeros(self.vertices.shape[0], 3, device="cuda")
+        vertex_scale_lookup[selected_vertex_mask] = geo_scale_before
+        new_scaling = self.scaling_inverse_activation(vertex_scale_lookup[selected_vertex])
+        new_rotation = _normals_to_quaternions(self._smooth_face_normal(selected_fid))
         new_features_dc = self._features_dc[selected_vertex]
         new_features_rest = self._features_rest[selected_vertex]
         new_opacity = self._opacity[selected_vertex]
 
         vertex_num = selected_vertex.shape[0]
-            
+
         # Split from appearance gaussians
-        bc = self._bc[selected_added_mask].unsqueeze(1).repeat(1, N, 1).view(-1, 3)
-        new_added_bc = torch.ones_like(bc) / 3
+        # P1 fix: perturb bc around parent position instead of resetting to centroid
+        parent_bc = self._bc[selected_added_mask]                           # (M, 3)
+        parent_bc_rep = parent_bc.unsqueeze(1).repeat(1, N, 1).view(-1, 3) # (M*N, 3)
+        noise = torch.randn_like(parent_bc_rep) * 0.05
+        new_added_bc = (parent_bc_rep + noise).clamp(min=1e-3)
+        new_added_bc = new_added_bc / new_added_bc.sum(dim=1, keepdim=True)
         distance = self._distance[selected_added_mask].unsqueeze(1).repeat(1, N, 1).view(-1, 1)
-        new_added_distance = torch.full_like(distance, _DIST_INIT_LOGIT)
+        new_added_distance = distance.clone()
         new_added_scaling = self.scaling_inverse_activation(self.get_app_scaling[selected_added_mask].repeat(N,1) / (0.8*N))
-        # Use face-aligned rotations so split children also lie flat on the mesh.
         parent_face_ids = self.fid[selected_added_mask, 0]
-        new_added_rotation = _normals_to_quaternions(self.normals[parent_face_ids]).repeat(N, 1)
+        new_added_rotation = _normals_to_quaternions(self._smooth_face_normal(parent_face_ids)).repeat(N, 1)
         new_added_features_dc = self._added_features_dc[selected_added_mask].repeat(N,1,1)
         new_added_features_rest = self._added_features_rest[selected_added_mask].repeat(N,1,1)
         new_added_opacity = self._added_opacity[selected_added_mask].repeat(N,1)

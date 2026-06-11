@@ -288,7 +288,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")   
 
-    gaussians.find_closet_faces()
     gaussians.training_s3_setup(opt)
     # Stage 3
     progress_bar = tqdm(range(third_iter, opt.iterations), desc="Stage 3 Training progress")

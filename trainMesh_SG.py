@@ -10,6 +10,7 @@
 #
 
 import os
+import math
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, mesh_vertex_restrict_loss
@@ -314,6 +315,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")   
 
+    gaussians.find_closet_faces()
+    with torch.no_grad():
+        n_filled = gaussians.fill_empty_faces(min_app_scale_logit=math.log(opt.min_app_scale))
+    print(f"[Stage 3] fill_empty_faces: added {n_filled} seed Gaussians to empty faces")
     gaussians.training_s3_setup(opt)
     # Stage 3
     progress_bar = tqdm(range(third_iter, opt.iterations), desc="Stage 3 Training progress")
@@ -432,11 +437,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
+                # Hard clamp on scales in log-space (scaling_activation = exp).
+                # Geometry Gaussians at joints get repeatedly shrunk by densification;
+                # clamp both to prevent them from collapsing to invisible specks.
+                # Guard is `_added_scaling is not None` = Stage 3 only.
+                if gaussians._added_scaling is not None:
+                    with torch.no_grad():
+                        min_logscale = math.log(opt.min_app_scale)
+                        gaussians._added_scaling.clamp_(min=min_logscale)
+                        gaussians._scaling.clamp_(min=min_logscale)
+
                 #gaussians._opacity.clamp_(max=0.25)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")   
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 
 def prepare_output_and_logger(args):    
