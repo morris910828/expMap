@@ -374,7 +374,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dis_loss = torch.mean(torch.clamp(gaussians.get_distance - opt.distance_threshold, min=0) ** 2)
 
         app_vertex_r = gaussians.get_app_vertex_radius
-        mrloss = mesh_vertex_restrict_loss(gaussians.get_app_scaling, app_vertex_r, weight=1.0)
+        mrloss = mesh_vertex_restrict_loss(gaussians.get_app_scaling, app_vertex_r, weight=0.3)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + dis_loss + aniso_loss + mrloss
 
@@ -423,9 +423,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune_sg3(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
