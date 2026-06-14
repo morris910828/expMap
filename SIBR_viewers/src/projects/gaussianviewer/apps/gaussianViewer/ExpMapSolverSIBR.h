@@ -128,10 +128,11 @@ public:
     }
     void ResetSurfaceBlend() { _surfaceBlend = 0.0f; _surfaceBlendDirty = true; }
 
-    float GetSurfDistThreshold() const { return _surfDistThreshold; }
-    bool ConsumeSurfDistThresholdDirty() {
-        bool d = _surfDistThresholdDirty;
-        _surfDistThresholdDirty = false;
+    float GetSurfDistMin() const { return _surfDistMin; }
+    float GetSurfDistMax() const { return _surfDistMax; }
+    bool ConsumeSurfDistRangeDirty() {
+        bool d = _surfDistRangeDirty;
+        _surfDistRangeDirty = false;
         return d;
     }
 
@@ -215,9 +216,10 @@ public:
         _liveDirty = true;
         _suppressedUVs.clear();
 
-        _surfDistThreshold      = 1e9f;
-        _computedMaxSurfDist    = 1.0f;
-        _surfDistThresholdDirty = false;
+        _surfDistMin         = 0.0f;
+        _surfDistMax         = 1e9f;
+        _computedMaxSurfDist = 1.0f;
+        _surfDistRangeDirty  = false;
     }
     
     void OnRaycastHit(const sibr::Vector3f& hitPos, float radius, int hitTriID) {
@@ -598,21 +600,68 @@ public:
             ImGui::Checkbox("Show Suppressed", &_showSuppressedPoints);
 
             {
-                float prev = _surfaceBlend;
-                ImGui::PushItemWidth(-1.f);
-                ImGui::SliderFloat("Surface Blend##sb", &_surfaceBlend, 0.0f, 1.0f, "Surface Blend %.2f");
-                ImGui::PopItemWidth();
-                if (_surfaceBlend != prev) _surfaceBlendDirty = true;
-            }
+                float rangeMax = (_computedMaxSurfDist > 1e-6f) ? _computedMaxSurfDist : 1.0f;
+                _surfDistMin = std::clamp(_surfDistMin, 0.0f, rangeMax);
+                _surfDistMax = std::clamp(_surfDistMax, _surfDistMin, rangeMax);
+                float prevMin = _surfDistMin, prevMax = _surfDistMax;
 
-            {
-                float sliderMax = (_computedMaxSurfDist > 1e-6f) ? _computedMaxSurfDist : 1.0f;
-                _surfDistThreshold = std::min(_surfDistThreshold, sliderMax);
-                float prev = _surfDistThreshold;
-                ImGui::PushItemWidth(-1.f);
-                ImGui::SliderFloat("Dist Cutoff##sdc", &_surfDistThreshold, 0.0f, sliderMax, "Dist Cutoff %.4f");
-                ImGui::PopItemWidth();
-                if (_surfDistThreshold != prev) _surfDistThresholdDirty = true;
+                ImDrawList* dlUi  = ImGui::GetWindowDrawList();
+                ImVec2 basePos    = ImGui::GetCursorScreenPos();
+                float  availW     = ImGui::GetContentRegionAvail().x;
+                float  w          = availW * (2.f / 3.f);
+                if (w < 20.f) w = 20.f;
+                float  offsetX    = (availW - w) * 0.5f;
+                ImVec2 sp         = { basePos.x + offsetX, basePos.y };
+                const float H = 20.f, R = 7.f, trackH = 4.f;
+                float midY = sp.y + H * 0.5f;
+                float minX = sp.x + (_surfDistMin / rangeMax) * w;
+                float maxX = sp.x + (_surfDistMax / rangeMax) * w;
+                ImVec2 mouse = ImGui::GetIO().MousePos;
+
+                // Invisible button centred over the track
+                ImGui::SetCursorScreenPos(sp);
+                ImGui::InvisibleButton("##distrange_track", {w, H});
+                if (ImGui::IsItemClicked()) {
+                    float dMin = std::abs(mouse.x - minX);
+                    float dMax = std::abs(mouse.x - maxX);
+                    _draggingMin = (dMin <= dMax);
+                    _draggingMax = !_draggingMin;
+                }
+                if (!ImGui::IsMouseDown(0)) { _draggingMin = false; _draggingMax = false; }
+                if (ImGui::IsItemActive()) {
+                    float frac = std::clamp((mouse.x - sp.x) / w, 0.f, 1.f);
+                    float val  = frac * rangeMax;
+                    if      (_draggingMin) _surfDistMin = std::clamp(val, 0.f, _surfDistMax);
+                    else if (_draggingMax) _surfDistMax = std::clamp(val, _surfDistMin, rangeMax);
+                    minX = sp.x + (_surfDistMin / rangeMax) * w;
+                    maxX = sp.x + (_surfDistMax / rangeMax) * w;
+                }
+
+                // Draw track background and selected range
+                dlUi->AddRectFilled({sp.x, midY-trackH*.5f}, {sp.x+w, midY+trackH*.5f}, IM_COL32(60,60,60,255), trackH*.5f);
+                dlUi->AddRectFilled({minX, midY-trackH*.5f}, {maxX,   midY+trackH*.5f}, IM_COL32(100,160,255,200), trackH*.5f);
+                // Min handle (red)
+                bool minHov = _draggingMin || ImGui::IsMouseHoveringRect({minX-R, midY-R}, {minX+R, midY+R});
+                dlUi->AddCircleFilled({minX, midY}, R, IM_COL32(255, minHov?140:80, 80, 255));
+                dlUi->AddCircle({minX, midY}, R, IM_COL32(255,255,255,160), 16, 1.5f);
+                // Max handle (blue)
+                bool maxHov = _draggingMax || ImGui::IsMouseHoveringRect({maxX-R, midY-R}, {maxX+R, midY+R});
+                dlUi->AddCircleFilled({maxX, midY}, R, IM_COL32(80, maxHov?140:80, 255, 255));
+                dlUi->AddCircle({maxX, midY}, R, IM_COL32(255,255,255,160), 16, 1.5f);
+
+                // Value labels below the bar
+                float lblH = ImGui::GetTextLineHeight();
+                char lblMin[32], lblMax[32];
+                snprintf(lblMin, sizeof(lblMin), "%.4f", _surfDistMin);
+                snprintf(lblMax, sizeof(lblMax), "%.4f", _surfDistMax);
+                dlUi->AddText({sp.x, sp.y+H+1.f}, IM_COL32(255,100,100,255), lblMin);
+                dlUi->AddText({sp.x+w-ImGui::CalcTextSize(lblMax).x, sp.y+H+1.f}, IM_COL32(100,100,255,255), lblMax);
+
+                // Advance cursor past bar + label row
+                ImGui::SetCursorScreenPos({basePos.x, sp.y + H + lblH + 4.f});
+                ImGui::Dummy({availW, 2.f});
+
+                if (_surfDistMin != prevMin || _surfDistMax != prevMax) _surfDistRangeDirty = true;
             }
 
             ImVec2 p = ImGui::GetCursorScreenPos();
@@ -774,7 +823,7 @@ public:
                     glm::vec3 sExp = glm::exp(pt.scale);
                     if (std::max({sExp.x, sExp.y, sExp.z}) > maxScale3DExp) return false;
                     float surfDist = glm::length(pt.originalPos - pt.position);
-                    if (surfDist > _surfDistThreshold) return false;
+                    if (surfDist < _surfDistMin || surfDist > _surfDistMax) return false;
                     return true;
                 };
 
@@ -901,11 +950,14 @@ public:
 
                     for (int ei = 0; ei < (int)nonSelEntries.size(); ei++) {
                         const GEntry& e = nonSelEntries[ei];
-                        float d = glm::length(e.pg->originalPos - e.pg->position) * (1.0f - _surfaceBlend);
-                        float t = glm::clamp(powf(d / autoDepthMax, 0.3f), 0.f, 1.f);
-                        int r = (int)(255.f * (1.f - t));
-                        int b = (int)(255.f * t);
-                        drawEllipse(e, IM_COL32(r, 0, b, 150), IM_COL32(r, 0, b, 255), false);
+                        float d = glm::length(e.pg->originalPos - e.pg->position);
+                        float globalMax = (_computedMaxSurfDist > 1e-6f) ? _computedMaxSurfDist : 1.f;
+                        float t = glm::clamp(d / globalMax, 0.f, 1.f);
+                        int r = (int)(80.f + 150.f * (1.f - t));
+                        int g = 70;
+                        int b = (int)(80.f + 150.f * t);
+                        int a = (int)(100.f + 130.f * t);
+                        drawEllipse(e, IM_COL32(r, g, b, a), IM_COL32(r, g, b, 230), false);
                     }
                     for (int ei = 0; ei < (int)selEntries.size(); ei++) {
                         drawEllipse(selEntries[ei], IM_COL32(255, 255, 0, 150), IM_COL32(255, 255, 0, 255));
@@ -1505,7 +1557,8 @@ private:
         for (const auto& pg : _projectedAppPoints)
             maxD = std::max(maxD, glm::length(pg.originalPos - pg.position));
         _computedMaxSurfDist = (maxD > 1e-6f) ? maxD * 1.1f : 1.0f;
-        _surfDistThreshold = _computedMaxSurfDist;  // Default: show all
+        _surfDistMin = 0.0f;
+        _surfDistMax = _computedMaxSurfDist;  // Default: show all
     }
     
     void ComputeExtraNodeCosts() {
@@ -1684,9 +1737,12 @@ private:
     float _surfaceBlend      = 1.0f;
     bool  _surfaceBlendDirty = false;
 
-    float _surfDistThreshold      = 1e9f;
-    float _computedMaxSurfDist    = 1.0f;
-    bool  _surfDistThresholdDirty = false;
+    float _surfDistMin         = 0.0f;
+    float _surfDistMax         = 1e9f;
+    float _computedMaxSurfDist = 1.0f;
+    bool  _surfDistRangeDirty  = false;
+    bool  _draggingMin         = false;
+    bool  _draggingMax         = false;
 };
 
 #endif

@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <unordered_map>
+#include <opencv2/videoio.hpp>
 
 #include <core/graphics/Window.hpp>
 #include <core/view/MultiViewManager.hpp>
@@ -74,15 +75,67 @@ public:
 
     void onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camera& eye) override {
         if (!_gaussianView) return;
-        _gaussianView->onRenderIBR(dst, eye);
-        _viewport = Viewport(0, 0, (float)dst.w(), (float)dst.h());
-        dst.bind();
-        glViewport(0, 0, dst.w(), dst.h());
-        const glm::mat4 mvp = glm::make_mat4(eye.viewproj().data());
-        _pointCloudRenderer.render(mvp, _pointSize, _geoRenderer, _geoColor, _showGeo, _appRenderer, _appColor, _showApp);
-        if (_showGaussianOutlines) renderGaussianOutlines(eye);
-        _wireframeRenderer.render(_mesh, _expMapSolver.GetActiveTriIndices(), mvp, _showMesh);
-        dst.unbind();
+
+        if (_recording360) {
+            constexpr float kPi = 3.14159265358979323846f;
+            float angle    = (2.0f * kPi * _recordFrame) / (float)_recordTotalFrames;
+            float elevRad  = _orbitElevation * kPi / 180.0f;
+            float horizR   = _orbitRadius * std::cos(elevRad);
+            glm::vec3 camPos(
+                _orbitCenter.x + horizR * std::sin(angle),
+                _orbitCenter.y + _orbitRadius * std::sin(elevRad),
+                _orbitCenter.z + horizR * std::cos(angle)
+            );
+            sibr::Camera orbitCam = eye;
+            orbitCam.setLookAt(
+                sibr::Vector3f(camPos.x, camPos.y, camPos.z),
+                sibr::Vector3f(_orbitCenter.x, _orbitCenter.y, _orbitCenter.z),
+                sibr::Vector3f(0.f, 1.f, 0.f)
+            );
+
+            _gaussianView->onRenderIBR(dst, orbitCam);
+            _viewport = Viewport(0, 0, (float)dst.w(), (float)dst.h());
+            dst.bind();
+            glViewport(0, 0, dst.w(), dst.h());
+            const glm::mat4 mvp = glm::make_mat4(orbitCam.viewproj().data());
+            _pointCloudRenderer.render(mvp, _pointSize, _geoRenderer, _geoColor, _showGeo, _appRenderer, _appColor, _showApp);
+            if (_showGaussianOutlines) renderGaussianOutlines(orbitCam);
+            _wireframeRenderer.render(_mesh, _expMapSolver.GetActiveTriIndices(), mvp, _showMesh);
+
+            // Capture frame and write to video
+            int W = dst.w(), H = dst.h();
+            if (!_videoWriter.isOpened()) {
+                std::string videoPath = _videoDir + "/orbit.mp4";
+                _videoWriter.open(videoPath,
+                    cv::VideoWriter::fourcc('m','p','4','v'), 30.0, cv::Size(W, H));
+                if (!_videoWriter.isOpened())
+                    std::cerr << "[Record360] Failed to open VideoWriter: " << videoPath << "\n";
+            }
+            cv::Mat frame(H, W, CV_8UC3);
+            glReadPixels(0, 0, W, H, GL_BGR, GL_UNSIGNED_BYTE, frame.data);
+            dst.unbind();
+            cv::flip(frame, frame, 0);
+            if (_videoWriter.isOpened())
+                _videoWriter.write(frame);
+
+            _recordFrame++;
+            if (_recordFrame >= _recordTotalFrames) {
+                _recording360 = false;
+                _videoWriter.release();
+                std::cout << "[Record360] Done. Video saved to: "
+                          << _videoDir << "/orbit.mp4\n";
+            }
+        } else {
+            _gaussianView->onRenderIBR(dst, eye);
+            _viewport = Viewport(0, 0, (float)dst.w(), (float)dst.h());
+            dst.bind();
+            glViewport(0, 0, dst.w(), dst.h());
+            const glm::mat4 mvp = glm::make_mat4(eye.viewproj().data());
+            _pointCloudRenderer.render(mvp, _pointSize, _geoRenderer, _geoColor, _showGeo, _appRenderer, _appColor, _showApp);
+            if (_showGaussianOutlines) renderGaussianOutlines(eye);
+            _wireframeRenderer.render(_mesh, _expMapSolver.GetActiveTriIndices(), mvp, _showMesh);
+            dst.unbind();
+        }
     }
 
     void onUpdate(sibr::Input& input) override {
@@ -118,6 +171,44 @@ public:
                     _showTexture ? _texPtr : nullptr
                 );
             }
+        }
+        ImGui::Separator();
+        if (!_recording360) {
+            ImGui::InputInt("360 Frames##360f", &_recordTotalFrames);
+            if (_recordTotalFrames < 1) _recordTotalFrames = 1;
+            ImGui::SliderFloat("Orbit Zoom##oz", &_orbitZoom, 0.1f, 10.0f, "%.2f");
+            ImGui::SliderFloat("Elevation##elev", &_orbitElevation, -89.0f, 89.0f, "%.1f deg");
+            if (ImGui::Button("Record 360\xc2\xb0")) {
+                // Compute orbit center from mesh bounding box
+                if (_mesh && !_mesh->vertices().empty()) {
+                    glm::vec3 mn(1e9f), mx(-1e9f);
+                    for (const auto& v : _mesh->vertices()) {
+                        glm::vec3 gv(v.x(), v.y(), v.z());
+                        mn = glm::min(mn, gv);
+                        mx = glm::max(mx, gv);
+                    }
+                    _orbitCenter = (mn + mx) * 0.5f;
+                } else {
+                    _orbitCenter = {0.f, 0.f, 0.f};
+                }
+                const sibr::Camera& cam = _camHandler->getCamera();
+                glm::vec3 camPos(cam.position().x(), cam.position().y(), cam.position().z());
+                glm::vec2 toXZ(_orbitCenter.x - camPos.x, _orbitCenter.z - camPos.z);
+                float baseRadius = glm::length(toXZ);
+                if (baseRadius < 1e-4f) baseRadius = 1.0f;
+                _orbitRadius = baseRadius * _orbitZoom;
+                _videoDir = "D:/SGGaussians/SGGaussians/video";
+                std_fs::create_directories(_videoDir);
+                _recordFrame = 0;
+                _recording360 = true;
+                std::cout << "[Record360] Start " << _recordTotalFrames
+                          << " frames, center=(" << _orbitCenter.x << ","
+                          << _orbitCenter.y << "," << _orbitCenter.z
+                          << "), r=" << _orbitRadius << ", elev=" << _orbitElevation << "\n";
+            }
+        } else {
+            ImGui::Text("Recording %d / %d ...", _recordFrame, _recordTotalFrames);
+            if (ImGui::Button("Cancel##360cancel")) _recording360 = false;
         }
         ImGui::Separator();
         if (ImGui::Button("Clear ExpMap")) {
@@ -354,14 +445,17 @@ void main() { fragColor = uColor; }
         std::vector<DrawItem> items;
         items.reserve(geoPoints.size() + appPoints.size());
 
-        const float surfDistThreshold = _expMapSolver.GetSurfDistThreshold();
+        const float surfDistMin = _expMapSolver.GetSurfDistMin();
+        const float surfDistMax = _expMapSolver.GetSurfDistMax();
         for (const auto& pg : geoPoints) {
-            if (glm::length(pg.originalPos - pg.position) > surfDistThreshold) continue;
+            float d = glm::length(pg.originalPos - pg.position);
+            if (d < surfDistMin || d > surfDistMax) continue;
             float depth = glm::dot(blendedCenter(pg) - camPos, camFwd);
             items.push_back({&pg, true, depth});
         }
         for (const auto& pg : appPoints) {
-            if (glm::length(pg.originalPos - pg.position) > surfDistThreshold) continue;
+            float d = glm::length(pg.originalPos - pg.position);
+            if (d < surfDistMin || d > surfDistMax) continue;
             float depth = glm::dot(blendedCenter(pg) - camPos, camFwd);
             items.push_back({&pg, false, depth});
         }
@@ -656,6 +750,17 @@ void main() { fragColor = uColor; }
     std::vector<float>              _lastAllSurfDists;
     sibr::Vector3f                  _lastHitPos   = sibr::Vector3f(0,0,0);
     float                           _lastExpRadius = 0.5f;
+
+    // 360° orbit recording
+    bool             _recording360      = false;
+    int              _recordFrame       = 0;
+    int              _recordTotalFrames = 120;
+    float            _orbitZoom         = 2.5f;
+    float            _orbitElevation    = 0.0f;
+    glm::vec3        _orbitCenter       = {0.f, 0.f, 0.f};
+    float            _orbitRadius       = 1.0f;
+    std::string      _videoDir;
+    cv::VideoWriter  _videoWriter;
 };
 
 // =============================================================================
