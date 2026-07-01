@@ -97,8 +97,6 @@ public:
         if (_liveSSBO) glDeleteBuffers(1, &_liveSSBO);
     }
 
-    const std::vector<int>& GetDijkstraPath() const { return _dijkstraPath; }
-
     const std::vector<sibr::Vector3u>& GetActiveTris() const { return _validTriangles; }
     const std::set<int>& GetActiveTriIndices() const { return _validTriangleIndicesSet; }
     
@@ -140,6 +138,22 @@ public:
 
     void SetMainGaussiansForNextSave(const std::vector<ProjectedGaussian>& g) {
         _pendingMainGaussians = g;
+    }
+
+    // For the new unified format: directly supply pre-projected Gaussians so the
+    // UV result window can display them without going through RegisterGeoPointCloud.
+    void SetProjectedGeoPoints(const std::vector<ProjectedGaussian>& pts) {
+        _projectedGeoPoints = pts;
+        _projectionStats.geoTotal     = (int)pts.size();
+        _projectionStats.geoProjected = (int)pts.size();
+        float maxD = 0.f;
+        for (const auto& pg : pts)
+            maxD = std::max(maxD, glm::length(pg.originalPos - pg.position));
+        if (maxD > 1e-6f) {
+            _computedMaxSurfDist = maxD * 1.1f;
+            _surfDistMax = _computedMaxSurfDist;
+        }
+        _liveDirty = true;
     }
 
     void SetSuppressedUVs(const std::vector<glm::vec2>& uvs) {
@@ -580,10 +594,6 @@ public:
                             _projectionStats.geoTotal);
                 
                 
-                if (_dijkstraPath.size() > 0) {
-                    ImGui::TextColored(ImVec4(0,1,0,1), "Path Length: %lu hops", _dijkstraPath.size());
-                }
-
                 ImGui::SameLine();
                 if (ImGui::Button("Reset View")) { _viewScale = 1.0f; _viewOffset = ImVec2(0,0); }
             }
@@ -717,41 +727,6 @@ public:
                 _isSelecting = false;
             }
 
-            if (isHovered && ImGui::IsMouseClicked(0) && ImGui::GetIO().KeyCtrl) {
-                float lx = mousePos.x - (p.x + sz.x * 0.5f + _viewOffset.x);
-                float ly = mousePos.y - (p.y + sz.y * 0.5f + _viewOffset.y);
-                float sc = dim * _viewScale;
-                float uvX = 0.5f - ly / sc;
-                float uvY = 0.5f - lx / sc;
-                glm::vec2 mouseUV(uvX, uvY);
-
-                int closestID = -1;
-                float minPickDist = 0.05f / _viewScale; 
-                size_t meshSize = _mesh->vertices().size();
-
-                for (auto const& [id, uv] : _displayUVs) {
-                    float d = glm::distance(mouseUV, uv);
-                    float priority = (id >= (int)meshSize) ? 0.5f : 1.0f;
-                    if (d * priority < minPickDist) {
-                        minPickDist = d * priority;
-                        closestID = id;
-                    }
-                }
-
-                if (closestID != -1) {
-                    if (_startNode == -1) {
-                        _startNode = closestID;
-                        _dijkstraPath.clear();
-                    } else if (_endNode == -1) {
-                        _endNode = closestID;
-                        ComputeDijkstra(_startNode, _endNode);
-                    } else {
-                        _startNode = closestID;
-                        _endNode = -1;
-                        _dijkstraPath.clear();
-                    }
-                }
-            }
 
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(p, ImVec2(p.x + sz.x, p.y + sz.y), true);
@@ -1009,16 +984,6 @@ public:
                 }
             }
 
-            if (_dijkstraPath.size() > 1) {
-                for (size_t i = 0; i < _dijkstraPath.size() - 1; ++i) {
-                    int idA = _dijkstraPath[i];
-                    int idB = _dijkstraPath[i+1];
-                    if (_displayUVs.count(idA) && _displayUVs.count(idB)) {
-                        dl->AddLine(TransformUV(_displayUVs[idA]), TransformUV(_displayUVs[idB]), IM_COL32(0, 255, 0, 255), 3.0f);
-                    }
-                }
-            }
-
             if (_isSelecting) {
                 ImVec2 rect_min = TransformUV(_selectionStart);
                 ImVec2 rect_max = TransformUV(_selectionEnd);
@@ -1027,9 +992,6 @@ public:
                 dl->AddRect(rect_min, rect_max, IM_COL32(255, 255, 0, 255), 0.0f, 0, 2.0f);
                 dl->AddRectFilled(rect_min, rect_max, IM_COL32(255, 255, 0, 50));
             }
-
-            if (_startNode != -1 && _displayUVs.count(_startNode)) dl->AddCircleFilled(TransformUV(_displayUVs[_startNode]), 5.0f, IM_COL32(0, 255, 0, 255)); 
-            if (_endNode != -1 && _displayUVs.count(_endNode)) dl->AddCircleFilled(TransformUV(_displayUVs[_endNode]), 5.0f, IM_COL32(255, 0, 0, 255)); 
 
             dl->PopClipRect();
         }
@@ -1601,79 +1563,6 @@ private:
         }
     }
 
-    void ComputeDijkstra(int startIdx, int endIdx) {
-        _dijkstraPath.clear();
-        if (startIdx == -1 || endIdx == -1) return;
-        if (!_displayUVs.count(startIdx) || !_displayUVs.count(endIdx)) return;
-
-        std::map<int, float> minDist;
-        std::map<int, int> prev;
-        
-        for (auto const& [id, uv] : _displayUVs) {
-            minDist[id] = std::numeric_limits<float>::max();
-        }
-
-        minDist[startIdx] = 0.0f;
-        
-        using PElement = std::pair<float, int>;
-        std::priority_queue<PElement, std::vector<PElement>, std::greater<PElement>> pq;
-        pq.push({0.0f, startIdx});
-
-        size_t meshVertCount = _mesh->vertices().size();
-
-        while (!pq.empty()) {
-            float d = pq.top().first;
-            int u = pq.top().second;
-            pq.pop();
-
-            if (u == endIdx) break; 
-            if (d > minDist[u]) continue;
-            if (u >= _adj.size()) continue;
-
-            for (int v : _adj[u]) {
-                if (minDist.find(v) == minDist.end()) continue;
-                bool isVExtra = (v >= meshVertCount);
-                if (isVExtra && v != endIdx) {
-                    continue; 
-                }
-
-                float dist = glm::distance(getPos(u), getPos(v));
-                
-                glm::vec3 uN = getNormal(u);
-                glm::vec3 vN = getNormal(v);
-                float dotNormal = glm::dot(uN, vN);
-                
-                if (dotNormal < 0.5f) continue; 
-
-                bool isUExtra = (u >= meshVertCount);
-
-                if (!isUExtra && !isVExtra) {
-                    float maxEdgeLength = 0.25f; 
-                    if (dist > maxEdgeLength) continue;
-                }
-
-                float penalty = 1.0f + 20.0f * (1.0f - dotNormal);
-                float weight = dist * penalty;
-                
-                if (minDist[u] + weight < minDist[v]) {
-                    minDist[v] = minDist[u] + weight;
-                    prev[v] = u;
-                    pq.push({minDist[v], v});
-                }
-            }
-        }
-
-        if (prev.find(endIdx) != prev.end()) {
-            int curr = endIdx;
-            while (curr != startIdx) {
-                _dijkstraPath.push_back(curr);
-                curr = prev[curr];
-            }
-            _dijkstraPath.push_back(startIdx);
-            std::reverse(_dijkstraPath.begin(), _dijkstraPath.end());
-        }
-    }
-
     const sibr::Mesh* _mesh = nullptr;
     std::vector<std::vector<int>> _baseAdj;
     std::vector<std::vector<int>> _adj;
@@ -1703,10 +1592,6 @@ private:
     std::vector<int> _selectedGeoIndices;
     std::vector<int> _selectedAppIndices;
     
-    std::vector<int> _dijkstraPath;
-    int _startNode = -1;
-    int _endNode = -1;
-
     std::map<int, glm::vec2> _displayUVs;
     std::vector<sibr::Vector3u> _selectedTriangles;
     glm::vec2 _selectionStart, _selectionEnd;

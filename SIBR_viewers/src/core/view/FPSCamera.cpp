@@ -191,7 +191,8 @@ namespace sibr {
 
 	void FPSCamera::moveUsingMousePan( const sibr::Input& input, float deltaTime )
 	{
-		
+		if (input.key().isActivated(sibr::Key::LeftShift)) { return; }
+
 		float speed = 0.05f*deltaTime;
 		sibr::Vector3f move(
 			input.mouseButton().isActivated(sibr::Mouse::Left)? input.mouseDeltaPosition().x()*speed : 0.f,

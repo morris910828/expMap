@@ -50,7 +50,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # stage 2 iterations
     second_iter = 7000 
     # stage 3 iterations
-    third_iter = 20_000
+    third_iter = 15_000
 
     tb_writer = prepare_output_and_logger(dataset)
     mesh_path = dataset.source_path + '/mesh.obj'
@@ -374,7 +374,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dis_loss = torch.mean(torch.clamp(gaussians.get_distance - opt.distance_threshold, min=0) ** 2)
 
         app_vertex_r = gaussians.get_app_vertex_radius
-        mrloss = mesh_vertex_restrict_loss(gaussians.get_app_scaling, app_vertex_r, weight=0.3)
+        mrloss = mesh_vertex_restrict_loss(gaussians.get_app_scaling, app_vertex_r, weight=0.5)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + dis_loss + aniso_loss + mrloss
 
@@ -523,8 +523,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 20_000, 30_000, 50_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 20_000, 30_000, 50_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 15_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

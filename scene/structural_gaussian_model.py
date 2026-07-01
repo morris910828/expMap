@@ -327,16 +327,20 @@ class StructuralGaussianModel:
         self.vertex_radius = compute_vertex_radii_approx(self.vertices, self.face_idx)
 
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
+
+        # Geo Gaussians are placed 1-to-1 at mesh vertices
+        fused_point_cloud = self.vertices.clone()   # (V, 3)
+
+        # No SfM colour available; initialise with neutral grey in SH space
+        default_rgb = RGB2SH(torch.full((fused_point_cloud.shape[0], 3), 0.5, device="cuda"))
+        features = torch.zeros((fused_point_cloud.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = default_rgb
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        # Initial scale = log(vertex_radius), consistent with neighbourhood size
+        scales = torch.log(self.vertex_radius.clamp(min=1e-6)).unsqueeze(1).repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 

@@ -27,6 +27,59 @@
 namespace std_fs = std::filesystem;
 using namespace sibr;
 
+// Load mesh_face_idx from a new-format splat PLY (vertex element with mesh_face_idx property).
+// Returns true and fills |fids| if the property is found, false otherwise.
+static bool loadFidsFromSgPly(const std::string& plyPath, std::vector<int>& fids)
+{
+    std::ifstream f(plyPath, std::ios::binary);
+    if (!f.good()) return false;
+
+    auto propBytes = [](const std::string& t) -> size_t {
+        if (t == "float" || t == "int" || t == "uint") return 4;
+        if (t == "double" || t == "int64" || t == "uint64") return 8;
+        if (t == "short"  || t == "ushort") return 2;
+        return 1;
+    };
+
+    int vertCount  = 0;
+    size_t stride  = 0;
+    size_t fidOff  = 0;
+    bool hasFid    = false;
+    bool inVertex  = false;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line == "end_header") break;
+        std::stringstream ss(line);
+        std::string tok; ss >> tok;
+        if (tok == "element") {
+            std::string name; int cnt; ss >> name >> cnt;
+            inVertex = (name == "vertex");
+            if (inVertex) { vertCount = cnt; stride = 0; fidOff = 0; hasFid = false; }
+        } else if (tok == "property" && inVertex) {
+            std::string type, name; ss >> type >> name;
+            if (type != "list") {
+                if (name == "mesh_face_idx") { fidOff = stride; hasFid = true; }
+                stride += propBytes(type);
+            }
+        }
+    }
+
+    if (!hasFid || vertCount == 0) return false;
+
+    fids.resize(vertCount);
+    std::vector<char> buf(stride);
+    for (int i = 0; i < vertCount; i++) {
+        f.read(buf.data(), (std::streamsize)stride);
+        int32_t fid = -1;
+        std::memcpy(&fid, buf.data() + fidOff, sizeof(int32_t));
+        fids[i] = (int)fid;
+    }
+    std::cout << "Loaded " << vertCount << " mesh_face_idx from: " << plyPath << "\n";
+    return true;
+}
+
 class MeshGaussianView : public sibr::ViewBase {
 public:
     using Ptr = std::shared_ptr<MeshGaussianView>;
@@ -36,7 +89,8 @@ public:
         const sibr::Mesh* mesh,
         const std::string&                  geoPath,
         const std::string&                  appPath,
-        sibr::InteractiveCameraHandler::Ptr camHandler
+        sibr::InteractiveCameraHandler::Ptr camHandler,
+        const std::string&                  splatPath = ""
     )   : ViewBase(gaussianView->getResolution().x(), gaussianView->getResolution().y()),
           _gaussianView(gaussianView),
           _mesh(mesh),
@@ -52,6 +106,40 @@ public:
             _appRenderer.loadFids(appPath);
             _appRenderer.loadGaussianProps(appPath);
         }
+        // New unified format: load per-Gaussian face IDs from splat PLY
+        if (!splatPath.empty() && _allFids.empty())
+            loadFidsFromSgPly(splatPath, _allFids);
+
+        // Re-sort _allFids from PLY order to GPU Morton-sorted order for backface culling.
+        const auto& plyToSorted = gaussianView->getPlyToSorted();
+        if (!_allFids.empty() && (int)plyToSorted.size() == (int)_allFids.size()) {
+            _sortedFids.resize(_allFids.size(), -1);
+            for (int i = 0; i < (int)_allFids.size(); ++i)
+                _sortedFids[plyToSorted[i]] = _allFids[i];
+        }
+
+        // Download original logit opacities from GPU (used for per-frame restore after culling).
+        if (gaussianView->getCount() > 0) {
+            std::vector<float> dummyRot, dummyScale;
+            gaussianView->downloadGaussianData(dummyRot, dummyScale, _origOpacities);
+            _culledOpacities = _origOpacities;
+        }
+
+        // Precompute world-space face normals for backface culling.
+        if (mesh && !mesh->triangles().empty()) {
+            const auto& verts = mesh->vertices();
+            const auto& tris  = mesh->triangles();
+            _faceNormals.resize(tris.size());
+            for (size_t t = 0; t < tris.size(); ++t) {
+                const auto& tri = tris[t];
+                sibr::Vector3f e1 = verts[tri[1]] - verts[tri[0]];
+                sibr::Vector3f e2 = verts[tri[2]] - verts[tri[0]];
+                sibr::Vector3f n  = e1.cross(e2);
+                float len = n.norm();
+                _faceNormals[t] = (len > 1e-9f) ? (n / len) : sibr::Vector3f(0.f, 0.f, 1.f);
+            }
+        }
+
         if (_mesh) {
             _expMapSolver.Init(_mesh);
             if (_geoRenderer.isLoaded())
@@ -71,6 +159,7 @@ public:
         if (_gaussOutlineVAO)    glDeleteVertexArrays(1, &_gaussOutlineVAO);
         if (_gaussOutlineVBO)    glDeleteBuffers(1, &_gaussOutlineVBO);
         if (_gaussOutlineShader) glDeleteProgram(_gaussOutlineShader);
+        if (_normalMapGLTex)     glDeleteTextures(1, &_normalMapGLTex);
     }
 
     void onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camera& eye) override {
@@ -93,7 +182,9 @@ public:
                 sibr::Vector3f(0.f, 1.f, 0.f)
             );
 
+            applyBackfaceCulling(orbitCam);
             _gaussianView->onRenderIBR(dst, orbitCam);
+            restoreAfterCulling();
             _viewport = Viewport(0, 0, (float)dst.w(), (float)dst.h());
             dst.bind();
             glViewport(0, 0, dst.w(), dst.h());
@@ -126,7 +217,9 @@ public:
                           << _videoDir << "/orbit.mp4\n";
             }
         } else {
+            applyBackfaceCulling(eye);
             _gaussianView->onRenderIBR(dst, eye);
+            restoreAfterCulling();
             _viewport = Viewport(0, 0, (float)dst.w(), (float)dst.h());
             dst.bind();
             glViewport(0, 0, dst.w(), dst.h());
@@ -158,6 +251,7 @@ public:
         ImGui::SliderFloat("ExpMap Radius", &_expMapRadius, 0.05f, 5.0f);
         ImGui::Separator();
         ImGui::Checkbox("Show Gaussian Outlines", &_showGaussianOutlines);
+        ImGui::Checkbox("Backface Culling", &_backfaceCulling);
         ImGui::Separator();
         {
             bool prevShowTex = _showTexture;
@@ -222,9 +316,22 @@ public:
             std::vector<float>          empty_sd(_gaussianView->getCount(), 1e9f);
             std::vector<sibr::Vector3f> empty_sp(_gaussianView->getCount(), sibr::Vector3f(-1.f,-1.f,-1.f));
             _gaussianView->setUVsAndTexture(empty_uvs, empty_dUs, empty_dVs, empty_sd, empty_sp, nullptr);
+            _gaussianView->clearNormalMapTexture();
+            _patchNormalMap.clear();
+            if (_normalMapGLTex) { glDeleteTextures(1, &_normalMapGLTex); _normalMapGLTex = 0; }
         }
         ImGui::End();
         _expMapSolver.RenderUI();
+
+        // Normal map display window
+        if (_normalMapGLTex != 0 && !_patchNormalMap.empty()) {
+            ImGui::Begin("Normal Map");
+            float avail = ImGui::GetContentRegionAvail().x;
+            float aspect = (_normalMapW > 0) ? (float)_normalMapH / (float)_normalMapW : 1.f;
+            ImGui::Image((ImTextureID)(intptr_t)_normalMapGLTex, ImVec2(avail, avail * aspect));
+            ImGui::End();
+        }
+
         // Surface blend slider changed -> update GPU positions with new blend amount
         if (_expMapSolver.ConsumeSurfaceBlendDirty() && !_lastAllUVs.empty() && !_lastAllOrigPos.empty()) {
             auto blended = computeBlendedPos(_expMapSolver.GetSurfaceBlend());
@@ -522,6 +629,28 @@ void main() { fragColor = uColor; }
 
     // -------------------------------------------------------------------------
 
+    void applyBackfaceCulling(const sibr::Camera& cam) {
+        if (!_backfaceCulling || _sortedFids.empty() || _origOpacities.empty()) return;
+        const sibr::Vector3f camPos = cam.position();
+        const auto& cpuPos = _gaussianView->getCpuPositions();
+        const int n = _gaussianView->getCount();
+        _culledOpacities = _origOpacities;
+        for (int k = 0; k < n; ++k) {
+            int fid = _sortedFids[k];
+            if (fid < 0 || fid >= (int)_faceNormals.size()) continue;
+            if (_faceNormals[fid].dot(camPos - cpuPos[k]) < 0.0f)
+                _culledOpacities[k] = -100.0f;
+        }
+        _gaussianView->setOpacityArray(_culledOpacities);
+    }
+
+    void restoreAfterCulling() {
+        if (!_backfaceCulling || _origOpacities.empty()) return;
+        _gaussianView->setOpacityArray(_origOpacities);
+    }
+
+    // -------------------------------------------------------------------------
+
     void performRaycast(const sibr::Input& input) {
         if (!_mesh || !_camHandler) return;
         const auto& cam = _camHandler->getCamera();
@@ -551,7 +680,7 @@ void main() { fragColor = uColor; }
 
         _expMapSolver.OnRaycastHit(hitPos, _expMapRadius, hitTriID);
         _texPtr = _expMapSolver.GetTextureLoader().getTexture();
-        if (!_texPtr) return;
+        // Do NOT early-return on null texture: UV result window still needs Gaussian projection.
 
         // Restore GPU positions to original before reading, so cpuPos is always
         // the true pre-snap positions (needed for correct blend origin).
@@ -590,13 +719,14 @@ void main() { fragColor = uColor; }
             }
         }
 
-        // Determine geo/app split: point_cloud.ply = [geo (N_geo)] ++ [app (N_app)]
-        // App Gaussians have a pre-assigned face ID; use it directly instead of
-        // nearest-triangle search to avoid steeply-inclined triangles stealing them.
-        const int nGeo = _geoRenderer.isLoaded()
+        // New unified format: every Gaussian has a pre-assigned face ID.
+        const bool canUseAllFids = (int)_allFids.size() == nGauss;
+
+        // Old format: split at nGeo; only app Gaussians have a stored face ID.
+        const int nGeo = (!canUseAllFids && _geoRenderer.isLoaded())
                          ? (int)(_geoRenderer.getRawData().size() / 3) : nGauss;
         const auto& appFids = _appRenderer.getFids();
-        const bool canUseFids = _appRenderer.isLoaded() &&
+        const bool canUseFids = !canUseAllFids && _appRenderer.isLoaded() &&
                                 (int)appFids.size() == (nGauss - nGeo);
 
         const float r2 = _expMapRadius * _expMapRadius;
@@ -619,12 +749,21 @@ void main() { fragColor = uColor; }
             float surfDist = 1e9f;
             bool found = false;
 
-            const int appIdx = k - nGeo;
-            const bool isAppWithFid = canUseFids && appIdx >= 0 && appIdx < (int)appFids.size();
+            // Resolve which face ID to use for this Gaussian.
+            // New format: every Gaussian has its own fid via _allFids.
+            // Old format: only app Gaussians (index >= nGeo) have a stored fid.
+            int fidToUse = -1;
+            if (canUseAllFids) {
+                fidToUse = _allFids[k];
+            } else {
+                const int appIdx = k - nGeo;
+                if (canUseFids && appIdx >= 0 && appIdx < (int)appFids.size())
+                    fidToUse = appFids[appIdx];
+            }
 
-            // App Gaussian: try fid-based projection first to avoid inclined-triangle error.
-            if (isAppWithFid) {
-                int fid = appFids[appIdx];
+            // Fid-based projection: avoids inclined-triangle error for anchored Gaussians.
+            if (fidToUse >= 0) {
+                int fid = fidToUse;
                 auto it = triIdxToCache.find(fid);
                 if (it != triIdxToCache.end()) {
                     const TriInfo& ti = triCache[it->second];
@@ -710,10 +849,63 @@ void main() { fragColor = uColor; }
         _lastAllOrigPos.resize(nGauss);
         for (int i = 0; i < nGauss; ++i) _lastAllOrigPos[i] = cpuPos[i];
         _expMapSolver.SetMainGaussiansForNextSave(_texGaussians);
+        // New unified format: supply projected Gaussians directly to the UV result window.
+        if (canUseAllFids) _expMapSolver.SetProjectedGeoPoints(_texGaussians);
         // Reset blend to 0: Gaussians start at their original positions
         _expMapSolver.ResetSurfaceBlend();
-        // Upload UV data; snap target = original positions (blend=0, no movement yet)
-        _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, all_surfDists, _lastAllOrigPos, _texPtr);
+        // Bake flat normal map from face normals into UV (ExpMap) space
+        {
+            const int NM_W = (_texPtr ? _texPtr->w() : 512);
+            const int NM_H = (_texPtr ? _texPtr->h() : 512);
+            _normalMapW = NM_W;
+            _normalMapH = NM_H;
+            _patchNormalMap.assign(NM_W * NM_H * 4, 0);  // alpha=0 → no shading for untriangulated pixels
+            int ci = 0;
+            for (int triID : activeSet) {
+                const TriInfo& ti = triCache[ci++];
+                if (!ti.valid) continue;
+                if (triID >= (int)_faceNormals.size()) continue;
+                const sibr::Vector3f& fn = _faceNormals[triID];
+                uint8_t nr = (uint8_t)std::max(0, std::min(255, (int)(fn.x() * 127.5f + 127.5f)));
+                uint8_t ng = (uint8_t)std::max(0, std::min(255, (int)(fn.y() * 127.5f + 127.5f)));
+                uint8_t nb = (uint8_t)std::max(0, std::min(255, (int)(fn.z() * 127.5f + 127.5f)));
+                glm::vec2 p0 = {ti.uv0.x * NM_W, ti.uv0.y * NM_H};
+                glm::vec2 p1 = {ti.uv1.x * NM_W, ti.uv1.y * NM_H};
+                glm::vec2 p2 = {ti.uv2.x * NM_W, ti.uv2.y * NM_H};
+                int xmin = std::max(0,        (int)std::floor(std::min({p0.x, p1.x, p2.x})));
+                int xmax = std::min(NM_W - 1, (int)std::ceil (std::max({p0.x, p1.x, p2.x})));
+                int ymin = std::max(0,        (int)std::floor(std::min({p0.y, p1.y, p2.y})));
+                int ymax = std::min(NM_H - 1, (int)std::ceil (std::max({p0.y, p1.y, p2.y})));
+                for (int py = ymin; py <= ymax; ++py) {
+                    for (int px = xmin; px <= xmax; ++px) {
+                        float qx = px + 0.5f, qy = py + 0.5f;
+                        float d0 = (p1.x-p0.x)*(qy-p0.y) - (p1.y-p0.y)*(qx-p0.x);
+                        float d1 = (p2.x-p1.x)*(qy-p1.y) - (p2.y-p1.y)*(qx-p1.x);
+                        float d2 = (p0.x-p2.x)*(qy-p2.y) - (p0.y-p2.y)*(qx-p2.x);
+                        bool inside = (d0>=0&&d1>=0&&d2>=0)||(d0<=0&&d1<=0&&d2<=0);
+                        if (!inside) continue;
+                        int pidx = (py * NM_W + px) * 4;
+                        _patchNormalMap[pidx+0] = nr;
+                        _patchNormalMap[pidx+1] = ng;
+                        _patchNormalMap[pidx+2] = nb;
+                        _patchNormalMap[pidx+3] = 255;
+                    }
+                }
+            }
+            _gaussianView->setNormalMapTexture(_patchNormalMap, NM_W, NM_H);
+
+            // Upload to GL texture for ImGui display
+            if (_normalMapGLTex == 0) glGenTextures(1, &_normalMapGLTex);
+            glBindTexture(GL_TEXTURE_2D, _normalMapGLTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, NM_W, NM_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, _patchNormalMap.data());
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+
+        // Upload UV data + texture to 3D view (requires a loaded texture for CUDA rendering).
+        if (_texPtr)
+            _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, all_surfDists, _lastAllOrigPos, _texPtr);
         // record hit position for toggle reuse
         _lastHitPos    = sibr::Vector3f(hitPos.x(), hitPos.y(), hitPos.z());
         _lastExpRadius = _expMapRadius;
@@ -748,6 +940,15 @@ void main() { fragColor = uColor; }
     std::vector<sibr::Vector3f>     _lastAllSurfPos;
     std::vector<sibr::Vector3f>     _lastAllOrigPos;
     std::vector<float>              _lastAllSurfDists;
+    std::vector<int>                _allFids;          // per-Gaussian face IDs (new unified format)
+    std::vector<int>                _sortedFids;       // face IDs in GPU Morton-sorted order
+    std::vector<float>              _origOpacities;    // original logit opacities (GPU sorted order)
+    std::vector<float>              _culledOpacities;  // per-frame culled opacities
+    std::vector<sibr::Vector3f>     _faceNormals;      // precomputed per-face world normals
+    bool                            _backfaceCulling = false;
+    std::vector<uint8_t>            _patchNormalMap;   // RGBA uint8 normal map for current patch
+    int                             _normalMapW = 0, _normalMapH = 0;
+    GLuint                          _normalMapGLTex = 0;
     sibr::Vector3f                  _lastHitPos   = sibr::Vector3f(0,0,0);
     float                           _lastExpRadius = 0.5f;
 
@@ -765,6 +966,78 @@ void main() { fragColor = uColor; }
 
 // =============================================================================
 // Utilities
+// =============================================================================
+// Load mesh_vertex / mesh_face elements from an SG-format PLY file.
+// Returns true if a valid mesh was found and loaded into `mesh`.
+static bool loadMeshFromSgPly(const std::string& plyPath, sibr::Mesh& mesh)
+{
+    std::ifstream f(plyPath, std::ios::binary);
+    if (!f.good()) return false;
+
+    auto propBytes = [](const std::string& t) -> size_t {
+        if (t == "float" || t == "int" || t == "uint") return 4;
+        if (t == "double" || t == "int64" || t == "uint64") return 8;
+        if (t == "short"  || t == "ushort") return 2;
+        return 1;
+    };
+
+    struct ElemInfo { std::string name; int count = 0; size_t stride = 0; bool hasList = false; };
+    std::vector<ElemInfo> elems;
+    ElemInfo* cur = nullptr;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line == "end_header") break;
+        std::stringstream ss(line);
+        std::string tok; ss >> tok;
+        if (tok == "element") {
+            std::string name; int cnt; ss >> name >> cnt;
+            elems.push_back({name, cnt, 0, false});
+            cur = &elems.back();
+        } else if (tok == "property" && cur) {
+            std::string type; ss >> type;
+            if (type == "list") cur->hasList = true;
+            else cur->stride += propBytes(type);
+        }
+    }
+
+    ElemInfo* gaussEl = nullptr, *mvEl = nullptr, *mfEl = nullptr;
+    for (auto& e : elems) {
+        if (e.name == "vertex")      gaussEl = &e;
+        if (e.name == "mesh_vertex") mvEl    = &e;
+        if (e.name == "mesh_face")   mfEl    = &e;
+    }
+    if (!mvEl || !mfEl) return false;
+
+    // Skip Gaussian data
+    if (gaussEl)
+        f.seekg((std::streamoff)gaussEl->count * (std::streamoff)gaussEl->stride, std::ios::cur);
+
+    // Read mesh vertices
+    std::vector<sibr::Vector3f> verts(mvEl->count);
+    f.read((char*)verts.data(), mvEl->count * 3 * sizeof(float));
+
+    // Read mesh faces (format: uchar count, then count × int indices)
+    std::vector<sibr::Vector3u> tris;
+    tris.reserve(mfEl->count);
+    for (int i = 0; i < mfEl->count; i++) {
+        uint8_t n = 0;
+        f.read((char*)&n, 1);
+        int32_t idx[4] = {0, 0, 0, 0};
+        f.read((char*)idx, n * sizeof(int32_t));
+        if (n >= 3)
+            tris.push_back(sibr::Vector3u((uint)idx[0], (uint)idx[1], (uint)idx[2]));
+    }
+
+    if (tris.empty()) return false;
+    mesh.vertices(verts);
+    mesh.triangles(tris);
+    std::cout << "Loaded SG mesh from PLY: " << verts.size() << " verts, "
+              << tris.size() << " faces\n";
+    return true;
+}
+
 // =============================================================================
 static std::string findLargestNumberedSubdirectory(const std::string& dirPath) {
     std_fs::path p(dirPath);
@@ -886,11 +1159,23 @@ int main(int ac, char** av) {
     const std::string geoPath      = plyDir + "geo_point_cloud.ply";
     const std::string appPath      = plyDir + "app_point_cloud.ply";
 
+    // New unified format: splat.ply may live directly in the model root.
+    // Use it as a fallback when the standard point_cloud.ply is absent.
+    std::string modelRoot = myArgs.modelPath.get();
+    if (modelRoot.back() != '/' && modelRoot.back() != '\\') modelRoot += "/";
+    const std::string rootSplatPath = modelRoot + "splat.ply";
+    const bool useRootSplat = !std_fs::exists(finalPlyPath) && std_fs::exists(rootSplatPath);
+    const std::string effectivePlyPath = useRootSplat ? rootSplatPath : finalPlyPath;
+    if (useRootSplat)
+        std::cout << "Using root splat.ply: " << rootSplatPath << "\n";
+
     sibr::Mesh::Ptr geoMesh(new sibr::Mesh());
     const sibr::Mesh* meshToRender = nullptr;
     if (std_fs::exists(geoPath) && geoMesh->load(geoPath) && !geoMesh->triangles().empty()) {
         meshToRender = geoMesh.get();
         std::cout << "Using geo mesh: " << geoMesh->triangles().size() << " faces\n";
+    } else if (loadMeshFromSgPly(effectivePlyPath, *geoMesh)) {
+        meshToRender = geoMesh.get();
     } else if (!scene->proxies()->proxy().vertices().empty()) {
         meshToRender = &scene->proxies()->proxy();
         std::cout << "Fallback: proxy mesh\n";
@@ -910,7 +1195,7 @@ int main(int ac, char** av) {
         scene,
         usedRes.x(),
         usedRes.y(),
-        finalPlyPath.c_str(),
+        effectivePlyPath.c_str(),
         &messageRead,
         sh_degree,
         white_background,
@@ -923,8 +1208,16 @@ int main(int ac, char** av) {
         Viewport(0, 0, (float)usedRes.x(), (float)usedRes.y()),
         nullptr);
 
+    // Detect new unified format (has mesh_face_idx): use effectivePlyPath when
+    // no old-format separate geo/app files are present.
+    std::string splatPath = "";
+    if (!std_fs::exists(geoPath) && !std_fs::exists(appPath) && std_fs::exists(effectivePlyPath)) {
+        splatPath = effectivePlyPath;
+        std::cout << "Unified splat format: loading mesh_face_idx from " << splatPath << "\n";
+    }
+
     MeshGaussianView::Ptr meshView(new MeshGaussianView(
-        gaussianView, meshToRender, geoPath, appPath, generalCamera));
+        gaussianView, meshToRender, geoPath, appPath, generalCamera, splatPath));
 
     MultiViewManager multiViewManager(window, false);
     if (myArgs.rendering_mode == 1)

@@ -65,6 +65,12 @@ namespace sibr {
 			std::vector<float>& outScale,
 			std::vector<float>& outOpacity);
 
+		// Upload a new per-Gaussian opacity array (sigmoid-domain, same order as GPU buffers).
+		void setOpacityArray(const std::vector<float>& opacities);
+
+		// Mapping from PLY-file index to Morton-sorted GPU index (set during loadPly).
+		const std::vector<int>& getPlyToSorted() const { return _plyToSorted; }
+
 		// Upload per-Gaussian UV + dU + dV + surfaceDist + surfacePositions + optional texture
 		void setUVsAndTexture(
 			const std::vector<sibr::Vector2f>& uvs,
@@ -73,6 +79,9 @@ namespace sibr {
 			const std::vector<float>&          surfaceDists,
 			const std::vector<sibr::Vector3f>& surfacePositions,  // NEW: projected point on mesh surface
 			sibr::Texture2DRGBA::Ptr texPtr);
+
+		void setNormalMapTexture(const std::vector<uint8_t>& pixels, int w, int h);
+		void clearNormalMapTexture();
 
 		void suppressGaussiansInRegion(
 			const std::vector<sibr::Vector2f>& uvs,
@@ -122,6 +131,9 @@ namespace sibr {
 		cudaTextureObject_t tex_cuda = 0;
 		cudaArray_t tex_array = nullptr;
 		sibr::Texture2DRGBA::Ptr _current_tex;
+
+		cudaTextureObject_t normal_tex_cuda = 0;
+		cudaArray_t _normal_array = nullptr;
 
 		sibr::Vector3f _uvSurfacePos = sibr::Vector3f(0.f, 0.f, 0.f);
 		bool _hasUVSurface = false;

@@ -53,20 +53,50 @@ int loadPly(const char* filename,
 	if (!infile.good())
 		SIBR_ERR << "Unable to find model's PLY file, attempted:\n" << filename << std::endl;
 
-	std::string buff, dummy;
-	std::getline(infile, buff);
-	std::getline(infile, buff);
-	std::getline(infile, buff);
-	std::stringstream ss(buff);
-	int count;
-	ss >> dummy >> dummy >> count;
+	// Parse header to get vertex count and bytes-per-vertex (handles extra fields like mesh_face_idx)
+	auto propTypeBytes = [](const std::string& t) -> size_t {
+		if (t == "float" || t == "int" || t == "uint") return 4;
+		if (t == "double" || t == "int64" || t == "uint64") return 8;
+		if (t == "short"  || t == "ushort") return 2;
+		return 1; // char, uchar
+	};
+
+	int count = 0;
+	size_t bytes_per_vertex = 0;
+	bool in_vertex = false;
+	std::string buff;
+
+	while (std::getline(infile, buff)) {
+		while (!buff.empty() && (buff.back() == '\r' || buff.back() == '\n')) buff.pop_back();
+		if (buff == "end_header") break;
+		std::stringstream ss(buff);
+		std::string tok; ss >> tok;
+		if (tok == "element") {
+			std::string name; int cnt; ss >> name >> cnt;
+			in_vertex = (name == "vertex");
+			if (in_vertex) { count = cnt; bytes_per_vertex = 0; }
+		} else if (tok == "property" && in_vertex) {
+			std::string type; ss >> type;
+			if (type != "list") bytes_per_vertex += propTypeBytes(type);
+		}
+	}
+
 	SIBR_LOG << "Loading " << count << " Gaussian splats" << std::endl;
 
-	while (std::getline(infile, buff))
-		if (buff.compare("end_header") == 0) break;
+	const size_t std_bytes   = sizeof(RichPoint<D>);
+	const size_t extra_bytes = (bytes_per_vertex > std_bytes) ? (bytes_per_vertex - std_bytes) : 0;
 
 	std::vector<RichPoint<D>> points(count);
-	infile.read((char*)points.data(), count * sizeof(RichPoint<D>));
+	if (extra_bytes == 0) {
+		infile.read((char*)points.data(), count * std_bytes);
+	} else {
+		// Extended format (e.g. SG PLY with mesh_face_idx): read standard fields, skip extras
+		std::vector<char> skip_buf(extra_bytes);
+		for (int i = 0; i < count; i++) {
+			infile.read((char*)&points[i], std_bytes);
+			infile.read(skip_buf.data(), extra_bytes);
+		}
+	}
 
 	pos.resize(count); shs.resize(count); scales.resize(count);
 	rot.resize(count); opacities.resize(count);
@@ -365,7 +395,8 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget& dst, const sibr::Camer
 			false, image_cuda, _antialiasing,
 			nullptr, rects, boxmin, boxmax,
 			uvs_cuda, dU_cuda, dV_cuda, surfaceDist_cuda, tex_cuda,
-			uvFixedDepth
+			uvFixedDepth,
+			normal_tex_cuda
 		);
 
 		if (!_interop_failed) {
@@ -477,6 +508,52 @@ void sibr::GaussianView::downloadGaussianData(
 	cudaMemcpy(outRot.data(),     rot_cuda,     sizeof(float) * count * 4, cudaMemcpyDeviceToHost);
 	cudaMemcpy(outScale.data(),   scale_cuda,   sizeof(float) * count * 3, cudaMemcpyDeviceToHost);
 	cudaMemcpy(outOpacity.data(), opacity_cuda, sizeof(float) * count,     cudaMemcpyDeviceToHost);
+}
+
+void sibr::GaussianView::setOpacityArray(const std::vector<float>& opacities)
+{
+    if ((int)opacities.size() != count) return;
+    cudaMemcpy(opacity_cuda, opacities.data(), sizeof(float) * count, cudaMemcpyHostToDevice);
+}
+
+void sibr::GaussianView::setNormalMapTexture(const std::vector<uint8_t>& pixels, int w, int h)
+{
+    if (normal_tex_cuda) { cudaDestroyTextureObject(normal_tex_cuda); normal_tex_cuda = 0; }
+    if (_normal_array)   { cudaFreeArray(_normal_array); _normal_array = nullptr; }
+    if (pixels.empty() || w <= 0 || h <= 0) return;
+
+    std::vector<float> fp(w * h * 4);
+    for (int i = 0; i < w * h * 4; ++i)
+        fp[i] = pixels[i] / 255.0f;
+
+    cudaChannelFormatDesc cd = cudaCreateChannelDesc(32,32,32,32, cudaChannelFormatKindFloat);
+    CUDA_SAFE_CALL_ALWAYS(cudaMallocArray(&_normal_array, &cd, w, h));
+    CUDA_SAFE_CALL_ALWAYS(cudaMemcpy2DToArray(
+        _normal_array, 0, 0, fp.data(),
+        w * 4 * sizeof(float), w * 4 * sizeof(float), h,
+        cudaMemcpyHostToDevice));
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = _normal_array;
+
+    cudaTextureDesc texDesc{};
+    texDesc.addressMode[0]      = cudaAddressModeClamp;
+    texDesc.addressMode[1]      = cudaAddressModeClamp;
+    texDesc.filterMode          = cudaFilterModeLinear;
+    texDesc.readMode            = cudaReadModeElementType;
+    texDesc.normalizedCoords    = 1;
+    texDesc.maxAnisotropy       = 1;
+    texDesc.mipmapFilterMode    = cudaFilterModePoint;
+    texDesc.maxMipmapLevelClamp = 0;
+
+    CUDA_SAFE_CALL_ALWAYS(cudaCreateTextureObject(&normal_tex_cuda, &resDesc, &texDesc, NULL));
+}
+
+void sibr::GaussianView::clearNormalMapTexture()
+{
+    if (normal_tex_cuda) { cudaDestroyTextureObject(normal_tex_cuda); normal_tex_cuda = 0; }
+    if (_normal_array)   { cudaFreeArray(_normal_array); _normal_array = nullptr; }
 }
 
 void sibr::GaussianView::suppressGaussiansInRegion(
@@ -700,8 +777,10 @@ sibr::GaussianView::~GaussianView()
 	if (dV_cuda)           cudaFree(dV_cuda);
 	if (surfaceDist_cuda)  cudaFree(surfaceDist_cuda);
 
-	if (tex_cuda)  cudaDestroyTextureObject(tex_cuda);
-	if (tex_array) cudaFreeArray(tex_array);
+	if (tex_cuda)      cudaDestroyTextureObject(tex_cuda);
+	if (tex_array)     cudaFreeArray(tex_array);
+	if (normal_tex_cuda) cudaDestroyTextureObject(normal_tex_cuda);
+	if (_normal_array)   cudaFreeArray(_normal_array);
 
 	if (!_interop_failed) cudaGraphicsUnregisterResource(imageBufferCuda);
 	else cudaFree(fallbackBufferCuda);
